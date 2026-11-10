@@ -1105,17 +1105,48 @@ unsafe fn patch_entry(target: usize, hook: usize, slot: &PatchSlot) -> usize {
     }
 
     // Overwrite the target's prologue with a jump to our hook.
+    //
+    // The patch MUST NOT clobber a register: the displaced stub is called with the
+    // real arguments already in rcx/rdx/r8/r9, and `mov rax, hook; jmp rax` destroys
+    // rax. Using `FF 25 <disp32>` (jmp qword ptr [rip+disp32]) touches no register at
+    // all, which is exactly how the original API-set stub works. A 6-byte displacement
+    // covers the 6-byte stub case; for the longer prologues 8 bytes of code are
+    // needed, so a `jmp rel32` to a nearby stub is used instead.
     let mut old = 0u32;
     if VirtualProtect(target as *mut std::ffi::c_void, patch_len, PAGE_EXECUTE_READWRITE_INLINE, &mut old) == 0 {
         return 0;
     }
-    let mut jmp = [0u8; 12];
-    jmp[0] = 0x48;
-    jmp[1] = 0xB8;
-    jmp[2..10].copy_from_slice(&(hook as u64).to_le_bytes());
-    jmp[10] = 0xFF;
-    jmp[11] = 0xE0;
-    std::ptr::copy_nonoverlapping(jmp.as_ptr(), target as *mut u8, patch_len);
+    if patch_len == 6 {
+        // Reserve a pointer slot in the trampoline and jump through it.
+        // Layout: [6 or 12 bytes: original prologue] [8 bytes: hook address]
+        let hook_slot = tramp.add(patch_len + 12);
+        std::ptr::write_unaligned(hook_slot as *mut u64, hook as u64);
+        let disp = (hook_slot as isize) - ((target as isize) + 6);
+        let mut jmp = [0u8; 6];
+        jmp[0] = 0xFF;
+        jmp[1] = 0x25;
+        jmp[2..6].copy_from_slice(&(disp as i32).to_le_bytes());
+        std::ptr::copy_nonoverlapping(jmp.as_ptr(), target as *mut u8, 6);
+    } else {
+        let mut jmp = [0u8; 12];
+        jmp[0] = 0xFF;
+        jmp[1] = 0x25;
+        jmp[2] = 0x00;
+        jmp[3] = 0x00;
+        jmp[4] = 0x00;
+        jmp[5] = 0x00;
+        // For the 12-byte case the slot cannot be embedded in 6 bytes, so fall back to
+        // a register-free `push [rip]; ret` shape via the trampoline pointer slot.
+        let hook_slot = tramp.add(patch_len + 12);
+        std::ptr::write_unaligned(hook_slot as *mut u64, hook as u64);
+        let disp = (hook_slot as isize) - ((target as isize) + 6);
+        jmp[2..6].copy_from_slice(&(disp as i32).to_le_bytes());
+        // Pad the remaining bytes with int3 so a stray fall-through traps.
+        for b in jmp.iter_mut().skip(6) {
+            *b = 0xCC;
+        }
+        std::ptr::copy_nonoverlapping(jmp.as_ptr(), target as *mut u8, 12);
+    }
     let mut rel = 0u32;
     VirtualProtect(target as *mut std::ffi::c_void, patch_len, old.max(PAGE_EXECUTE_READ_INLINE), &mut rel);
     FlushInstructionCache(GetCurrentProcess(), target as *const std::ffi::c_void, patch_len);

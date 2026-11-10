@@ -346,6 +346,21 @@ fn process_exe(pid: u32) -> String {
     s.rsplit('\\').next().unwrap_or(&s).to_string()
 }
 
+/// Current time as a FILETIME (100 ns units since 1601), for "just started" checks.
+fn now_filetime() -> u64 {
+    #[repr(C)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+    extern "system" {
+        fn GetSystemTimeAsFileTime(t: *mut FileTime);
+    }
+    let mut ft = FileTime { low: 0, high: 0 };
+    unsafe { GetSystemTimeAsFileTime(&mut ft) };
+    ((ft.high as u64) << 32) | ft.low as u64
+}
+
 fn process_created(h: *mut std::ffi::c_void) -> u64 {
     let mut creation = 0u64;
     let (mut e, mut k, mut u) = (0u64, 0u64, 0u64);
@@ -873,9 +888,24 @@ impl AutoAttach {
                         .iter()
                         .any(|k| n.contains(k))
                     };
-                    // Only plausible serial clients are injected; everything else is
-                    // recorded and left completely alone.
-                    if !is_plausible_serial_client(&name) {
+                    // Only plausible serial clients are injected by *name*, BUT a
+                    // process that has just started is always a candidate: the whole
+                    // point is to be inside it before it opens its port. Being too
+                    // strict here is what made monitoring a freshly launched tool fail.
+                    let just_started = {
+                        let h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+                        let started = if h.is_null() {
+                            false
+                        } else {
+                            let created = process_created(h);
+                            unsafe { CloseHandle(h) };
+                            // Created within the last ~10 s (FILETIME is 100 ns units).
+                            let now = now_filetime();
+                            created != 0 && now > created && (now - created) < 100_000_000
+                        };
+                        started
+                    };
+                    if !just_started && !is_plausible_serial_client(&name) {
                         let mut g = match a.lock() {
                             Ok(g) => g,
                             Err(poisoned) => poisoned.into_inner(),
