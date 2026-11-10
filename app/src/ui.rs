@@ -22,6 +22,32 @@ const C_FAIL: Color32 = Color32::from_rgb(0xD6, 0x45, 0x45);
 const C_TX: Color32 = Color32::from_rgb(0x35, 0x72, 0xD9);
 const C_RX: Color32 = Color32::from_rgb(0x2D, 0x8A, 0x4B);
 
+/// 发给驱动捕获线程的命令。
+///
+/// 控制设备是独占打开的（CreateFileW 的 share=0），界面手里没有句柄：一旦开始捕获，
+/// 再想 set_target / attach_ports 就会拿到共享冲突错误。所以这些都交给已经持有句柄
+/// 的那个线程去执行，而不是在 UI 线程里另开一个句柄。
+pub enum DrvCmd {
+    SetTarget(u32),
+    /// 重新附加端口，并把新的端口表回传。
+    Rescan,
+    Stop,
+}
+
+/// 捕获线程回传的非数据事件。
+pub enum DrvEvt {
+    /// 端口表：序号 + 设备路径。
+    Ports(Vec<(u32, String)>),
+    /// set_target 已生效。
+    Target(u32),
+}
+
+/// 设备路径转短名：`\Device\VSerial8_2` → `VSerial8_2`。
+fn short_dev(path: &str) -> String {
+    path.rsplit('\\').next().unwrap_or(path).to_string()
+}
+
+
 /// Channel display name. Unresolved ids render as `UNKNOWN(<id>)`, matching the
 /// original's port-name fallback (CommMonitor sub_841a50; fmt "UNKNOWN(%d)" @0x841b74).
 fn chan_label(s: &Session, idx: usize) -> String {
@@ -98,6 +124,23 @@ pub struct MonitorApp {
     pub drv_ports: HashMap<(usize, u32), usize>,
     pub drv_checked: bool,
     pub drv_note: String,
+    /// 端口序号 → 设备路径。start_driver_capture / 重新扫描时一次性取全，
+    /// drain_driver 只查表（见 drain_driver 里的说明）。
+    pub drv_names: HashMap<u32, String>,
+    /// 最近一次可用性检测的结果与错误码（错误码用于给签名/权限问题分类）。
+    pub drv_avail: bool,
+    pub drv_err: u32,
+    /// 上次探测驱动的时间；探测是 CreateFile，不能每帧都做。
+    pub drv_probe_at: Option<std::time::Instant>,
+    /// 捕获线程的三件套：停止标志、线程句柄、命令通道。
+    ///
+    /// 驱动控制设备不支持被同一进程同时打开两次，所以端口重扫和 PID 切换必须交给
+    /// 已经持有句柄的捕获线程执行，而不是在界面上另开一个句柄。
+    pub drv_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    pub drv_thread: Option<std::thread::JoinHandle<()>>,
+    /// 驱动捕获设置对话框。
+    pub dlg_drv: bool,
+    pub drv_pid_text: String,
 
     // new-monitor dialog state (defaults, persisted to config.ini)
     pub chan_kind: usize,
@@ -199,6 +242,14 @@ impl MonitorApp {
             drv_ports: HashMap::new(),
             drv_checked: false,
             drv_note: String::new(),
+            drv_names: HashMap::new(),
+            drv_avail: false,
+            drv_err: 0,
+            drv_probe_at: None,
+            drv_stop: None,
+            drv_thread: None,
+            dlg_drv: false,
+            drv_pid_text: "0".into(),
             chan_kind: 0,
             ports,
             port_sel,
@@ -409,44 +460,197 @@ impl MonitorApp {
     /// The driver is the reliable capture path: it sits on the device stack, so it sees
     /// every process's traffic from the moment it attaches — no injection race.
     pub fn start_driver_capture(&mut self) -> bool {
+        self.stop_driver_capture();
         let Some(h) = crate::driver::DriverHandle::open() else {
-            self.drv_note = "未检测到 UmSerialFilter 驱动（请先安装并启动驱动）".into();
+            // 失败原因决定用户要做什么：没装 → sc create；577 → testsigning；
+            // 5 → 提权。只回一句「未检测到驱动」等于没给答案。
+            let err = crate::driver::last_error();
+            self.drv_avail = false;
+            self.drv_err = err;
+            self.drv_checked = true;
+            self.drv_probe_at = Some(std::time::Instant::now());
+            self.drv_note = crate::driver::open_failure_hint(err);
             return false;
         };
+        self.drv_avail = true;
+        self.drv_err = 0;
+        self.drv_checked = true;
+        self.drv_probe_at = Some(std::time::Instant::now());
+
         let attached = h.attach_ports();
-        let ports = h.port_names(attached);
-        h.set_target(self.drv_pid.unwrap_or(0));
-        self.drv_note = if attached == 0 {
-            "驱动已连接，但没有找到串口设备".to_string()
-        } else {
-            let names: Vec<String> = ports
-                .iter()
-                .map(|p| p.device.rsplit('\\').next().unwrap_or(&p.device).to_string())
-                .collect();
-            format!("驱动已附加 {attached} 个串口: {}", names.join(", "))
-        };
+        // 端口名只在这里取一次：设备路径是静态的，没必要每条新记录都回驱动问一遍。
+        let ports: Vec<(u32, String)> = h
+            .port_names(attached)
+            .into_iter()
+            .map(|p| (p.index, p.device))
+            .collect();
+        let target = self.drv_pid.unwrap_or(0);
+        h.set_target(target);
+        self.drv_names = ports.iter().cloned().collect();
+        self.set_driver_note_for_ports(attached, &ports);
 
         // Move the handle into a capture thread and stream records back over a channel.
         // The handle lives in the thread; the UI only keeps the receiving end. (An Arc
         // would require Sync, and DriverHandle is deliberately only Send — the kernel
         // device object serialises its own IOCTLs.)
         let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || loop {
-            match h.next_record() {
-                Some(rec) => {
-                    if tx.send(rec).is_err() {
-                        break;
+        let (ctx, crx) = std::sync::mpsc::channel::<DrvCmd>();
+        let (etx, erx) = std::sync::mpsc::channel::<DrvEvt>();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop2 = stop.clone();
+        self.drv_thread = Some(std::thread::spawn(move || {
+            loop {
+                // 命令先于取记录处理：set_target 之后紧接着到来的记录才对得上新过滤条件。
+                loop {
+                    match crx.try_recv() {
+                        Ok(DrvCmd::SetTarget(pid)) => {
+                            h.set_target(pid);
+                            let _ = etx.send(DrvEvt::Target(pid));
+                        }
+                        Ok(DrvCmd::Rescan) => {
+                            let n = h.attach_ports();
+                            let names = h
+                                .port_names(n)
+                                .into_iter()
+                                .map(|p| (p.index, p.device))
+                                .collect();
+                            let _ = etx.send(DrvEvt::Ports(names));
+                        }
+                        Ok(DrvCmd::Stop) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            return;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
                     }
                 }
-                None => std::thread::sleep(std::time::Duration::from_millis(15)),
+                if stop2.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
+                match h.next_record() {
+                    Some(rec) => {
+                        if tx.send(rec).is_err() {
+                            return; // UI dropped the receiver — nobody wants the data
+                        }
+                    }
+                    None => std::thread::sleep(std::time::Duration::from_millis(15)),
+                }
             }
-        });
+        }));
+        self.drv = None; // the handle lives in the thread now
         self.drv_rx = Some(rx);
+        self.drv_cmd = Some(ctx);
+        self.drv_evt = Some(erx);
+        self.drv_stop = Some(stop);
         true
+    }
+
+    /// Stop the capture thread and forget everything tied to that connection.
+    pub fn stop_driver_capture(&mut self) {
+        if let Some(tx) = self.drv_cmd.take() {
+            let _ = tx.send(DrvCmd::Stop);
+        }
+        if let Some(stop) = self.drv_stop.take() {
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        // join 会等到线程真正退出；如果它正卡在 IOCTL 里，这里的等待也只是毫秒级，
+        // 因为驱动对空队列的 GET_RECORD 是立即返回而不是挂起等待。
+        if let Some(t) = self.drv_thread.take() {
+            let _ = t.join();
+        }
+        self.drv_rx = None;
+        self.drv_evt = None;
+        self.drv_ports.clear();
+    }
+
+    /// Format the "attached N ports" note shared by start and rescan.
+    fn set_driver_note_for_ports(&mut self, attached: u32, ports: &[(u32, String)]) {
+        self.drv_note = if attached == 0 || ports.is_empty() {
+            "驱动已连接，但没有找到串口设备（检查设备管理器里是否存在 COM 端口）".to_string()
+        } else {
+            let names: Vec<String> = ports.iter().map(|(_, d)| short_dev(d)).collect();
+            format!("驱动已附加 {attached} 个串口: {}", names.join(", "))
+        };
+    }
+
+    /// 重新扫描端口。捕获中必须走线程命令（设备已被线程独占打开）。
+    fn rescan_driver_ports(&mut self) {
+        if let Some(tx) = &self.drv_cmd {
+            let _ = tx.send(DrvCmd::Rescan);
+            return;
+        }
+        // 未在捕获：可以自己打开设备问一次，问到就关掉。
+        if let Some(h) = crate::driver::DriverHandle::open() {
+            let n = h.attach_ports();
+            let ports: Vec<(u32, String)> = h
+                .port_names(n)
+                .into_iter()
+                .map(|p| (p.index, p.device))
+                .collect();
+            self.drv_avail = true;
+            self.drv_err = 0;
+            self.drv_checked = true;
+            self.drv_names = ports.iter().cloned().collect();
+            self.set_driver_note_for_ports(n, &ports);
+            self.toast(self.drv_note.clone());
+        } else {
+            let err = crate::driver::last_error();
+            self.drv_avail = false;
+            self.drv_err = err;
+            self.drv_checked = true;
+            self.drv_note = crate::driver::open_failure_hint(err);
+            self.toast("驱动不可用，无法扫描端口");
+        }
+    }
+
+    /// 探测驱动是否可用。
+    ///
+    /// CreateFileW 对控制设备来说不算便宜（驱动不响应时要等 SCM 超时），所以结果缓存
+    /// 一段时间；`force` 用于用户主动点击「重新检测」的场景。
+    fn probe_driver_availability(&mut self, force: bool) {
+        const TTL: std::time::Duration = std::time::Duration::from_secs(3);
+        if !force {
+            if let Some(at) = self.drv_probe_at {
+                if at.elapsed() < TTL {
+                    return;
+                }
+            }
+        }
+        self.drv_probe_at = Some(std::time::Instant::now());
+        // 已经在捕获时不要另开句柄——设备被线程独占，这里必然失败，
+        // 复用已知状态即可。
+        if self.drv_rx.is_some() {
+            self.drv_avail = true;
+            self.drv_checked = true;
+            return;
+        }
+        self.drv_avail = crate::driver::DriverHandle::is_available();
+        self.drv_err = if self.drv_avail { 0 } else { crate::driver::last_error() };
+        self.drv_checked = true;
     }
 
     /// Drain driver records into the active session, creating a channel per port.
     fn drain_driver(&mut self) {
+        // 先把捕获线程的事件收掉（端口表 / 目标 PID），它们决定了下面查表的内容。
+        if let Some(evt) = &self.drv_evt {
+            while let Ok(e) = evt.try_recv() {
+                match e {
+                    DrvEvt::Ports(list) => {
+                        let n = list.len() as u32;
+                        self.drv_names = list.iter().cloned().collect();
+                        let shown: Vec<(u32, String)> = list;
+                        self.set_driver_note_for_ports(n, &shown);
+                        self.toast(self.drv_note.clone());
+                    }
+                    DrvEvt::Target(pid) => {
+                        self.drv_pid = if pid == 0 { None } else { Some(pid) };
+                        self.toast(if pid == 0 {
+                            "驱动捕获目标: 所有进程".to_string()
+                        } else {
+                            format!("驱动捕获目标: PID {pid}")
+                        });
+                    }
+                }
+            }
+        }
         let Some(rx) = &self.drv_rx else { return };
         let mut batch: Vec<crate::driver::Record> = Vec::new();
         while let Ok(rec) = rx.try_recv() {
@@ -476,11 +680,14 @@ impl MonitorApp {
             let chan = match self.drv_ports.get(&key) {
                 Some(&c) => c,
                 None => {
+                    // 名字来自 start_driver_capture 一次性取好的表。以前这里每遇到一个
+                    // 新端口就要重新查询整张端口表（O(N) 次 IOCTL），在 8 口以上、
+                    // 每帧都有新端口时会把 UI 线程拖住；而端口名在驱动的生命周期内
+                    // 不会变，查一次就够。
                     let name = self
-                        .drv
-                        .as_ref()
-                        .and_then(|h| h.port_names(rec.port_index + 1).into_iter().find(|p| p.index == rec.port_index))
-                        .map(|p| p.device.rsplit('\\').next().unwrap_or(&p.device).to_string())
+                        .drv_names
+                        .get(&rec.port_index)
+                        .map(|d| short_dev(d))
                         .unwrap_or_else(|| format!("端口{}", rec.port_index));
                     let s = &mut self.sessions[sess_idx];
                     let idx = s.channels.len();
@@ -652,7 +859,7 @@ impl MonitorApp {
                     // it sees every process from the moment it attaches.
                     if self.drv_rx.is_some() {
                         if ui.button("停止驱动捕获").clicked() {
-                            self.drv_rx = None;
+                            self.stop_driver_capture();
                             self.drv_note = "驱动捕获已停止".into();
                             self.toast("已停止驱动捕获");
                         }
@@ -661,8 +868,14 @@ impl MonitorApp {
                         if self.start_driver_capture() {
                             self.toast("驱动捕获已启动");
                         } else {
-                            self.toast(self.drv_note.clone());
+                            // 失败时把完整指引塞进对话框，状态栏只放一句摘要。
+                            self.dlg_drv = true;
+                            self.toast("驱动不可用，已打开设置对话框查看原因");
                         }
+                    }
+                    if ui.button("驱动捕获设置…").clicked() {
+                        self.dlg_drv = true;
+                        self.probe_driver_availability(true);
                     }
                 });
                 ui.menu_button("编辑", |ui| {
@@ -764,6 +977,21 @@ impl MonitorApp {
             if self.frame_count < self.toast_until && !self.toast_msg.is_empty() {
                 ui.separator();
                 ui.label(RichText::new(&self.toast_msg).color(C_REQ));
+            }
+            // Driver state decides whether capture works without attaching to anything,
+            // so it belongs in the always-visible status bar.
+            ui.separator();
+            if self.drv_rx.is_some() {
+                let n = self.drv_ports.len().max(1);
+                ui.label(
+                    RichText::new(format!("驱动：捕获中（{n} 个端口）"))
+                        .color(C_RX)
+                        .strong(),
+                );
+            } else if crate::driver::DriverHandle::is_available() {
+                ui.label(RichText::new("驱动：已安装（未启用）").color(C_REQ));
+            } else {
+                ui.label(RichText::new("驱动：未安装").color(Color32::GRAY));
             }
         });
     }
