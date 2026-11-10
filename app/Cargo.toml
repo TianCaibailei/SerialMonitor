@@ -13,6 +13,11 @@ encoding_rs = "0.8"
 
 [profile.release]
 opt-level = 2
+# The injected hook DLL must not depend on dbghelp.dll (Rust's default backtrace
+# support pulls it in). dbghelp is present system-wide, but a 32-bit target can resolve
+# it only through SysWOW64, and a failed load there makes LoadLibrary return NULL —
+# measured as the reason 32-bit injection failed. abort keeps the DLL dependency-free.
+panic = "abort"
 
 [workspace]
 members = ["hook"]

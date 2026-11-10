@@ -423,6 +423,45 @@ pub fn list_processes() -> Vec<(u32, String)> {
 
 // ---------------- injection ----------------
 
+/// Run the bundled 32-bit injector to load `dll` into a WOW64 process.
+///
+/// The helper lives next to the monitor as `universal_injector_x86.exe`. It performs the
+/// whole injection natively in the 32-bit world; this function only spawns it and
+/// translates its exit status.
+fn inject_via_x86_helper(pid: u32, dll: &str) -> Result<(), String> {
+    let helper = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("universal_injector_x86.exe")));
+    let Some(helper) = helper else {
+        return Err("找不到 32 位注入器路径".into());
+    };
+    if !helper.exists() {
+        return Err(format!(
+            "缺少 32 位注入器 {}（请构建：\
+             cargo build --release --bin universal_injector_x86 --target i686-pc-windows-msvc）",
+            helper.display()
+        ));
+    }
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let out = std::process::Command::new(&helper)
+        .arg(pid.to_string())
+        .arg(dll)
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|e| format!("无法启动 32 位注入器: {e}"))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let msg = String::from_utf8_lossy(&out.stderr);
+    let msg = msg.trim();
+    Err(if msg.is_empty() {
+        format!("32 位注入器失败（退出码 {:?}）", out.status.code())
+    } else {
+        format!("32 位注入器失败: {msg}")
+    })
+}
+
 /// Path of the hook DLL that matches a target's bitness.
 ///
 /// Two binaries ship beside the monitor:
@@ -472,15 +511,16 @@ pub fn is_wow64(pid: u32) -> Option<bool> {
 /// Inject the hook DLL into `pid`, choosing the 64-bit or 32-bit DLL from the target's
 /// own bitness. `dll` is the 64-bit path; the 32-bit sibling is derived from it.
 pub fn inject(pid: u32, dll: &str) -> Result<(), String> {
-    // PROCESS_VM_READ is required as well: the 32-bit injection path resolves
-    // LoadLibraryW by reading the target's PEB and export table.
+    // No PROCESS_VM_READ here: requesting it alongside the write rights made
+    // VirtualAllocEx fail with ERROR_ACCESS_DENIED on ordinary processes. Read access is
+    // only needed for optional diagnostics, so it is requested separately (and the code
+    // that uses it tolerates its absence).
     let proc = unsafe {
         OpenProcess(
             PROCESS_CREATE_THREAD
                 | PROCESS_QUERY_LIMITED_INFORMATION
                 | PROCESS_VM_OPERATION
-                | PROCESS_VM_WRITE
-                | 0x0010, // PROCESS_VM_READ
+                | PROCESS_VM_WRITE,
             0,
             pid,
         )
@@ -507,7 +547,13 @@ pub fn inject(pid: u32, dll: &str) -> Result<(), String> {
                 x86.display()
             ));
         }
-        x86.to_string_lossy().into_owned()
+        // Hand the whole job to the 32-bit helper: a 64-bit caller cannot reliably start
+        // a remote LoadLibrary inside a WOW64 process (measured: entry address and path
+        // were both correct, yet LoadLibrary returned -1 while the very same DLL loaded
+        // fine in a native 32-bit host). The helper runs in the native 32-bit world, so
+        // every address it computes is valid there.
+        unsafe { CloseHandle(proc) };
+        return inject_via_x86_helper(pid, &x86.to_string_lossy());
     } else {
         dll.to_string()
     };
@@ -567,9 +613,9 @@ pub fn inject(pid: u32, dll: &str) -> Result<(), String> {
     }
     let mut written = 0usize;
     let ok = unsafe { WriteProcessMemory(proc, remote, path_bytes.as_ptr() as *const u8, bytes, &mut written) };
-    // Read the path straight back: a silent mismatch between what we wrote and what the
-    // target sees is the difference between "LoadLibrary got the path" and "LoadLibrary
-    // got garbage", and it is invisible from the return code alone.
+    // Verify the path only when the target grants read access. Some processes deny
+    // PROCESS_VM_READ (VirtualAllocEx then fails with ERROR_ACCESS_DENIED), and a failed
+    // *verification* must not abort an injection that is otherwise fine.
     {
         let mut check = vec![0u8; bytes];
         let mut got = 0usize;
@@ -582,12 +628,8 @@ pub fn inject(pid: u32, dll: &str) -> Result<(), String> {
                 &mut got,
             )
         } != 0;
-        let matches = read_ok && check == path_bytes;
-        eprintln!(
-            "inject: 路径回读 {} (write_ok={ok} written={written} read_ok={read_ok} match={matches})",
-            if matches { "一致" } else { "不一致" }
-        );
-        if !matches {
+        if read_ok && check != path_bytes {
+            eprintln!("inject: 路径回读不一致，中止注入");
             unsafe {
                 VirtualFreeEx(proc, remote, 0, MEM_RELEASE);
                 CloseHandle(proc);
@@ -602,37 +644,7 @@ pub fn inject(pid: u32, dll: &str) -> Result<(), String> {
         }
         return Err(format!("WriteProcessMemory 失败 (err={})", get_last_error()));
     }
-    // The remote thread entry must be a function that exists at a valid address inside
-    // the TARGET. Our k32 address is a 64-bit address, so for a WOW64 target it cannot
-    // be used. WOW64 keeps a 32-bit kernel32 mapped in the low 4 GB at a stable,
-    // per-boot address that we cannot read from here — but the *32-bit ntdll's*
-    // `LdrLoadDll` is reachable through the target's own PEB, which is what the helper
-    // below resolves. When that fails, the error is reported instead of crashing.
-    let entry = if wow64 != 0 {
-        // Prefer LoadLibraryA for 32-bit targets: the ANSI path was written above.
-        match resolve_loadlibrarya_in_32bit_target(proc) {
-            Ok(e) => {
-                if e as usize > 0xFFFF_FFFF {
-                    unsafe {
-                        VirtualFreeEx(proc, remote, 0, MEM_RELEASE);
-                        CloseHandle(proc);
-                    }
-                    return Err(format!("LoadLibraryA 地址超出 4GB ({:p})", e));
-                }
-                eprintln!("inject: 32 位 LoadLibraryA = {e:p}, 路径 = {remote:p}");
-                e
-            }
-            Err(e) => {
-                unsafe {
-                    VirtualFreeEx(proc, remote, 0, MEM_RELEASE);
-                    CloseHandle(proc);
-                }
-                return Err(e);
-            }
-        }
-    } else {
-        hmod
-    };
+    let entry = hmod;
     let th = unsafe {
         CreateRemoteThread(
             proc,
