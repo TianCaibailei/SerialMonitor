@@ -407,12 +407,16 @@ type WriteFileExFn = unsafe extern "system" fn(
 ) -> i32;
 
 /// Append one diagnostic line through the SAVED original pointers (invariant 2).
+///
+/// Also must use the trampolines: once the entry points are byte-patched, the saved
+/// addresses point at our own jump instructions, so calling them would re-enter the
+/// hooks (and, with the handle map locked by our caller, deadlock).
 fn dbg_note(msg: &str) {
     if !dbg_on() {
         return;
     }
-    let create = ORIG_CREATEFILEW.load(Ordering::Relaxed);
-    let write = ORIG_WRITEFILE.load(Ordering::Relaxed);
+    let create = orig_call_addr(&INLINE_CREATEFILEW, &ORIG_CREATEFILEW);
+    let write = orig_call_addr(&INLINE_WRITEFILE, &ORIG_WRITEFILE);
     let close = ORIG_CLOSEHANDLE.load(Ordering::Relaxed);
     if create == 0 || write == 0 || close == 0 {
         return;
@@ -1257,9 +1261,16 @@ unsafe fn worker() {
             &INLINE_WRITEFILE,
         );
         dbg_note(&format!(
-            "inline: CreateFileW={:#x} ReadFile={:#x} WriteFile={:#x}",
+            "inline: CreateFileW tramp={:#x} ReadFile tramp={:#x} WriteFile tramp={:#x}",
             t1, t2, t3
         ));
+        // Verify the patch really landed: the target's first bytes must now be our
+        // jump (`48 B8 <hook>`), otherwise the write silently did not take effect.
+        let p = ORIG_CREATEFILEW.load(Ordering::Relaxed) as *const u8;
+        if t1 != 0 {
+            let b = unsafe { std::slice::from_raw_parts(p, 12) };
+            dbg_note(&format!("inline: CreateFileW 现字节 = {:02X?}", b));
+        }
     }
     // Re-patch every 3 s: modules loaded after injection have untouched IATs.
     std::thread::spawn(|| loop {
