@@ -197,6 +197,71 @@ fn is_module_loaded(pid: u32, prefix: &str) -> bool {
     found
 }
 
+/// --driver-test [seconds] — check the kernel driver: open it, attach ports, print what
+/// it reports, then collect records for a while. Quickest way to see whether the filter
+/// is loaded and whether it found any serial devices.
+pub fn driver_test(seconds: u64) -> i32 {
+    let Some(h) = crate::driver::DriverHandle::open() else {
+        println!("driver-test: 无法打开 \\\\.\\UmSerialFilter");
+        println!("driver-test: 驱动未加载。请以管理员身份执行:");
+        println!("driver-test:   sc create UmSerialFilter type= kernel binPath= <驱动路径>");
+        println!("driver-test:   sc start UmSerialFilter");
+        return 1;
+    };
+    println!("driver-test: 已连接驱动");
+
+    let attached = h.attach_ports();
+    println!("driver-test: 附加到 {attached} 个串口设备");
+    let ports = h.port_names(attached);
+    for p in &ports {
+        println!("driver-test:   [{}] {}", p.index, p.device);
+    }
+    if ports.is_empty() {
+        println!("driver-test: 未找到任何串口设备（驱动附加失败或系统无串口）");
+    }
+    h.set_target(0);
+
+    println!("driver-test: 收集 {seconds} 秒…");
+    let start = std::time::Instant::now();
+    let mut n = 0usize;
+    let mut rx = 0usize;
+    let mut tx = 0usize;
+    while start.elapsed().as_secs() < seconds {
+        match h.next_record() {
+            Some(rec) => {
+                n += 1;
+                if rec.dir_tx {
+                    tx += rec.data.len();
+                } else {
+                    rx += rec.data.len();
+                }
+                let preview: String = rec
+                    .data
+                    .iter()
+                    .take(40)
+                    .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' })
+                    .collect();
+                println!(
+                    "driver-test: [{}] pid={} port={} {} 字节: {preview}",
+                    if rec.dir_tx { "TX" } else { "RX" },
+                    rec.pid,
+                    rec.port_index,
+                    rec.data.len()
+                );
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(20)),
+        }
+    }
+    println!("driver-test: 记录 {n} 条, RX {rx} 字节, TX {tx} 字节");
+    if n > 0 {
+        println!("driver-test: PASS 驱动捕获到数据");
+        0
+    } else {
+        println!("driver-test: FAIL 未捕获到数据（收集期间请用串口工具收发）");
+        1
+    }
+}
+
 /// --holders <COMx>... — which processes hold these serial ports.
 pub fn holders(ports: &[String]) -> i32 {
     let (list, note) = crate::portowners::find_port_holders(ports);

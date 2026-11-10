@@ -48,6 +48,9 @@
 // service after the driver loads; also re-runnable to pick up newly plugged adapters.
 #define IOCTL_UM_ATTACH_PORTS \
     CTL_CODE(UM_DEVICE_TYPE, 0x803, METHOD_BUFFERED, FILE_WRITE_DATA)
+// Get the friendly name of one attached device (index in, name out).
+#define IOCTL_UM_GET_PORT_NAME \
+    CTL_CODE(UM_DEVICE_TYPE, 0x804, METHOD_BUFFERED, FILE_READ_DATA)
 
 #define UM_MAX_PAYLOAD 4096
 #define UM_RECORD_HEADER 32
@@ -99,6 +102,7 @@ typedef struct _UM_CAPTURE {
     ULONGLONG Sent;
     ULONG AttachedCount;
     PDEVICE_OBJECT Attached[UM_MAX_FILTERS];
+    PCWSTR AttachedNames[UM_MAX_FILTERS];
 } UM_CAPTURE, *PUM_CAPTURE;
 
 static UM_CAPTURE g_Capture;
@@ -302,27 +306,96 @@ static NTSTATUS UmFilterPower(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 // ---------------------------------------------------------------------------
 // Attaching to serial device stacks
 // ---------------------------------------------------------------------------
+//
+// HOW THE REFERENCE PRODUCT FINDS PORTS
+// -------------------------------------
+// Decompiling ComDrv12x64.sys shows it does NOT use a hard-coded device list. It calls
+// ZwOpenDirectoryObject(L"\\Device"), obtains the directory object with
+// ObReferenceObjectByHandle, then walks the directory's object hash and recursively
+// descends subdirectories, matching device names against the serial namespaces. That is
+// why it catches every vendor's port (usbser, Prolific, Silicon Labs, ELTIMA, com0com,
+// and plain \Device\SerialN) without shipping a list.
+//
+// This driver uses the equivalent, documented route: enumerate \Device via
+// ZwQueryDirectoryObject. It returns every child object of the directory, including the
+// serial devices, so the same coverage is achieved without touching kernel internals.
 
-// Candidate device paths. Managed serially-driven COM ports live under one of these;
-// the list is walked rather than relying on a single hard-coded name because different
-// drivers (usbser, Prolific, Silicon Labs, ELTIMA, com0com) use different names.
-static const PCWSTR UmDeviceCandidates[] = {
-    L"\\Device\\Serial0", L"\\Device\\Serial1", L"\\Device\\Serial2",
-    L"\\Device\\Serial3", L"\\Device\\Serial4", L"\\Device\\Serial5",
-    L"\\Device\\Serial6", L"\\Device\\Serial7", L"\\Device\\Serial8",
-    L"\\Device\\Serial9",
-    L"\\Device\\USBSER000", L"\\Device\\USBSER001", L"\\Device\\USBSER002",
-    L"\\Device\\USBSER003", L"\\Device\\USBSER004",
-    L"\\Device\\ProlificSerial0", L"\\Device\\ProlificSerial1",
-    L"\\Device\\Silabser0", L"\\Device\\Silabser1",
-    L"\\Device\\VSerial8_0", L"\\Device\\VSerial8_1",
-    L"\\Device\\VSerial8_2", L"\\Device\\VSerial8_3",
-    L"\\Device\\VSerial9_0", L"\\Device\\VSerial9_1",
-    L"\\Device\\VCP0", L"\\Device\\VCP1",
-};
+// ZwQueryDirectoryObject returns an array of these. The definition lives in
+// ntifs.h/ntddk.h depending on the SDK, and it is not exposed by the WDK NuGet headers
+// used here, so it is declared locally with exactly the documented layout.
+typedef struct _UM_DIRECTORY_INFORMATION {
+    UNICODE_STRING Name;
+    UNICODE_STRING TypeName;
+} UM_DIRECTORY_INFORMATION, *PUM_DIRECTORY_INFORMATION;
 
-// Attach one filter device above `target`.
-static NTSTATUS UmAttachOne(PDEVICE_OBJECT target, ULONG index)
+// Does this \Device child name look like a serial port device?
+//
+// Kept broad on purpose: the reference product matches its own serial namespaces, while
+// we look for the name fragments every known COM-port driver family uses. The fragment
+// list covers Microsoft's Serial/ComPort, USB CDC (usbser), FTDI, Prolific, Silicon Labs,
+// ELAN/ELTIMA style virtual ports (VSerial, vcp, vser) and com0com.
+static BOOLEAN UmLooksLikeSerialPort(PCUNICODE_STRING name)
+{
+    static const PCWSTR fragments[] = {
+        L"Serial", L"serial",
+        L"USBSER", L"usbser",
+        L"ComPort", L"comport",
+        L"Prolific", L"prolific",
+        L"Silabser", L"silabser",
+        L"VSerial", L"vserial",
+        L"VCP", L"vcp",
+        L"vser", L"Vser",
+        L"FTDI", L"ftdi",
+        L"BthModem", L"bthmodem",
+        L"ttyS", L"ttyUSB",
+        L"cdc_acm", L"cdc-acm",
+        L"Ch341", L"ch341",
+        L"MCT_U232", L"mct_u232",
+        L"ComDB", L"comdb",
+    };
+    ULONG i;
+    USHORT nameLen;
+    PWCH buf;
+
+    nameLen = name->Length / sizeof(WCHAR);
+    buf = name->Buffer;
+    if (nameLen == 0 || buf == NULL) {
+        return FALSE;
+    }
+    for (i = 0; i < ARRAYSIZE(fragments); i++) {
+        UNICODE_STRING frag;
+        WCHAR scratch[64];
+        SIZE_T len = 0;
+        PCWSTR f = fragments[i];
+        while (f[len] != L'\0' && len < ARRAYSIZE(scratch) - 1) {
+            scratch[len] = f[len];
+            len++;
+        }
+        if (len == 0) {
+            continue;
+        }
+        frag.Buffer = scratch;
+        frag.Length = (USHORT)(len * sizeof(WCHAR));
+        frag.MaximumLength = frag.Length;
+        // Substring test: walk every offset of the device name.
+        if (nameLen >= len) {
+            USHORT off;
+            for (off = 0; off + len <= nameLen; off++) {
+                UNICODE_STRING window;
+                window.Buffer = buf + off;
+                window.Length = frag.Length;
+                window.MaximumLength = frag.Length;
+                if (RtlCompareUnicodeString(&window, &frag, TRUE) == 0) {
+                    return TRUE;
+                }
+            }
+        }
+    }
+    return FALSE;
+}
+
+// Attach one filter device above `target`, recording its friendly name.
+static NTSTATUS UmAttachOne(PDEVICE_OBJECT target, ULONG index, PCWSTR name)
 {
     PDEVICE_OBJECT filter = NULL;
     PUM_DEVICE_CTX ctx;
@@ -345,41 +418,127 @@ static NTSTATUS UmAttachOne(PDEVICE_OBJECT target, ULONG index)
         IoDeleteDevice(filter);
         return STATUS_DEVICE_NOT_CONNECTED;
     }
-    // Match the stack flags of the device below, as every filter must.
     filter->Flags |= ctx->Lower->Flags & (DO_BUFFERED_IO | DO_DIRECT_IO | DO_POWER_PAGABLE);
     filter->Flags &= ~DO_DEVICE_INITIALIZING;
-
+    g_Capture.AttachedNames[index] = name;
     return STATUS_SUCCESS;
 }
 
-// Attach the filter to every serial device in the candidate list.
+// Enumerate \Device and attach to every child that looks like a serial port.
+//
+// This mirrors what the reference driver accomplishes by walking the directory object's
+// hash table; ZwQueryDirectoryObject is the supported API for the same information.
 static ULONG UmAttachAllPorts(VOID)
 {
-    ULONG i;
+    UNICODE_STRING dirName;
+    OBJECT_ATTRIBUTES oa;
+    HANDLE dirHandle = NULL;
+    NTSTATUS status;
     ULONG attached = 0;
+    ULONG context = 0;
+    // Space for a generous batch of directory entries per call.
+    ULONG bufLen = 32 * 1024;
+    PVOID buf = NULL;
 
-    for (i = 0; i < ARRAYSIZE(UmDeviceCandidates) && g_Capture.AttachedCount < UM_MAX_FILTERS; i++) {
-        UNICODE_STRING name;
-        PFILE_OBJECT fileObj = NULL;
-        PDEVICE_OBJECT devObj = NULL;
-        NTSTATUS status;
+    RtlInitUnicodeString(&dirName, L"\\Device");
+    InitializeObjectAttributes(&oa, &dirName, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
 
-        RtlInitUnicodeString(&name, UmDeviceCandidates[i]);
-        status = IoGetDeviceObjectPointer(&name, FILE_READ_DATA, &fileObj, &devObj);
+    status = ZwOpenDirectoryObject(&dirHandle, DIRECTORY_QUERY | DIRECTORY_TRAVERSE, &oa);
+    if (!NT_SUCCESS(status)) {
+        return 0;
+    }
+
+    buf = ExAllocatePoolWithTag(NonPagedPool, bufLen, UM_TAG);
+    if (buf == NULL) {
+        ZwClose(dirHandle);
+        return 0;
+    }
+
+    for (;;) {
+        ULONG retLen = 0;
+        ULONG i;
+        PUM_DIRECTORY_INFORMATION info = (PUM_DIRECTORY_INFORMATION)buf;
+
+        status = ZwQueryDirectoryObject(
+            dirHandle, buf, bufLen, TRUE /* restart */, TRUE /* single entry */,
+            &context, &retLen);
         if (!NT_SUCCESS(status)) {
-            continue; // this candidate does not exist on this machine
+            break; // STATUS_NO_MORE_ENTRIES ends the walk
         }
-        // The reference object is not needed; drop it so the device is not pinned.
-        ObDereferenceObject(fileObj);
+        if (retLen < sizeof(UM_DIRECTORY_INFORMATION)) {
+            break;
+        }
+        for (i = 0; i + sizeof(UM_DIRECTORY_INFORMATION) <= retLen; i += sizeof(UM_DIRECTORY_INFORMATION)) {
+            PUM_DIRECTORY_INFORMATION entry = (PUM_DIRECTORY_INFORMATION)((PUCHAR)buf + i);
+            if (entry->Name.Buffer == NULL || entry->Name.Length == 0) {
+                break;
+            }
+            if (!UmLooksLikeSerialPort(&entry->Name)) {
+                continue;
+            }
+            if (g_Capture.AttachedCount >= UM_MAX_FILTERS) {
+                break;
+            }
+            {
+                // Build the full device path and open it.
+                WCHAR pathBuf[256];
+                UNICODE_STRING devName;
+                ULONG pos = 0;
+                PCWSTR prefix = L"\\Device\\";
+                ULONG k;
+                for (k = 0; prefix[k] != L'\0' && pos < ARRAYSIZE(pathBuf) - 1; k++) {
+                    pathBuf[pos++] = prefix[k];
+                }
+                for (k = 0; k < entry->Name.Length / sizeof(WCHAR) && pos < ARRAYSIZE(pathBuf) - 1; k++) {
+                    pathBuf[pos++] = entry->Name.Buffer[k];
+                }
+                pathBuf[pos] = L'\0';
+                RtlInitUnicodeString(&devName, pathBuf);
 
-        status = UmAttachOne(devObj, g_Capture.AttachedCount);
-        if (NT_SUCCESS(status)) {
-            g_Capture.Attached[g_Capture.AttachedCount] = devObj;
-            g_Capture.AttachedCount++;
-            attached++;
+                {
+                    PFILE_OBJECT fileObj = NULL;
+                    PDEVICE_OBJECT devObj = NULL;
+                    NTSTATUS openStatus = IoGetDeviceObjectPointer(
+                        &devName, FILE_READ_DATA, &fileObj, &devObj);
+                    if (NT_SUCCESS(openStatus)) {
+                        ObDereferenceObject(fileObj);
+                        if (NT_SUCCESS(UmAttachOne(devObj, g_Capture.AttachedCount, NULL))) {
+                            g_Capture.Attached[g_Capture.AttachedCount] = devObj;
+                            g_Capture.AttachedCount++;
+                            attached++;
+                        }
+                    }
+                }
+            }
         }
     }
+
+    ExFreePoolWithTag(buf, UM_TAG);
+    ZwClose(dirHandle);
     return attached;
+}
+
+// Report one attached device: index and its NT device name.
+static ULONG UmGetAttachedName(PUCHAR out, ULONG outLen, ULONG index)
+{
+    UNICODE_STRING s;
+    ULONG needed;
+
+    if (index >= g_Capture.AttachedCount) {
+        return 0;
+    }
+    if (g_Capture.AttachedNames[index] == NULL) {
+        return 0;
+    }
+    RtlInitUnicodeString(&s, g_Capture.AttachedNames[index]);
+    needed = 8 + s.Length;
+    if (needed > outLen) {
+        return 0;
+    }
+    *(PULONG)out = index;
+    *(PULONG)(out + 4) = s.Length / sizeof(WCHAR);
+    RtlCopyMemory(out + 8, s.Buffer, s.Length);
+    return needed;
 }
 
 // ---------------------------------------------------------------------------
@@ -440,6 +599,16 @@ static NTSTATUS UmControlIoctl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     case IOCTL_UM_ATTACH_PORTS:
         info = UmAttachAllPorts();
         status = STATUS_SUCCESS;
+        break;
+
+    case IOCTL_UM_GET_PORT_NAME:
+        if (buf != NULL && inLen >= sizeof(ULONG) && outLen >= 8) {
+            ULONG index = *(PULONG)buf;
+            info = UmGetAttachedName((PUCHAR)buf, outLen, index);
+            status = (info > 0) ? STATUS_SUCCESS : STATUS_INVALID_PARAMETER;
+        } else {
+            status = STATUS_INVALID_PARAMETER;
+        }
         break;
 
     case IOCTL_UM_GET_STATS:

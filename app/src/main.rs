@@ -4,6 +4,7 @@
 mod autoattach;
 mod capture;
 mod diag;
+mod driver;
 mod e2e;
 mod headless;
 mod inject;
@@ -56,6 +57,11 @@ fn parse_args() -> Option<String> {
         // --handles-self — verify the handle snapshot contains our own handles
         if args[i] == "--handles-self" {
             std::process::exit(diag::handles_self());
+        }
+        // --driver-test [seconds] — verify the kernel filter driver end to end
+        if args[i] == "--driver-test" {
+            let secs: u64 = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(15);
+            std::process::exit(diag::driver_test(secs));
         }
         // --holders <COMx>... — which processes hold these serial ports
         if args[i] == "--holders" {

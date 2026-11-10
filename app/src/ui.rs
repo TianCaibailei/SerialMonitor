@@ -89,6 +89,15 @@ pub struct MonitorApp {
     /// Background service that injects the hook DLL into whatever program holds a
     /// watched port, so the user only opens a session and never picks processes.
     pub auto: Option<crate::autoattach::AutoAttach>,
+    /// Kernel driver capture (when UmSerialFilter is loaded). Records arrive on a
+    /// background thread; per-port channels are created on demand.
+    pub drv: Option<crate::driver::DriverHandle>,
+    pub drv_pid: Option<u32>,
+    pub drv_rx: Option<Receiver<crate::driver::Record>>,
+    /// Driver port index → session channel index, per session.
+    pub drv_ports: HashMap<(usize, u32), usize>,
+    pub drv_checked: bool,
+    pub drv_note: String,
 
     // new-monitor dialog state (defaults, persisted to config.ini)
     pub chan_kind: usize,
@@ -184,6 +193,12 @@ impl MonitorApp {
             holders_at: 0,
             hook_ports: HashMap::new(),
             auto: None,
+            drv: None,
+            drv_pid: None,
+            drv_rx: None,
+            drv_ports: HashMap::new(),
+            drv_checked: false,
+            drv_note: String::new(),
             chan_kind: 0,
             ports,
             port_sel,
@@ -389,6 +404,112 @@ impl MonitorApp {
         self.toast("会话已创建");
     }
 
+    /// Start capturing through the kernel filter driver, if it is loaded.
+    ///
+    /// The driver is the reliable capture path: it sits on the device stack, so it sees
+    /// every process's traffic from the moment it attaches — no injection race.
+    pub fn start_driver_capture(&mut self) -> bool {
+        let Some(h) = crate::driver::DriverHandle::open() else {
+            self.drv_note = "未检测到 UmSerialFilter 驱动（请先安装并启动驱动）".into();
+            return false;
+        };
+        let attached = h.attach_ports();
+        let ports = h.port_names(attached);
+        h.set_target(self.drv_pid.unwrap_or(0));
+        self.drv_note = if attached == 0 {
+            "驱动已连接，但没有找到串口设备".to_string()
+        } else {
+            let names: Vec<String> = ports
+                .iter()
+                .map(|p| p.device.rsplit('\\').next().unwrap_or(&p.device).to_string())
+                .collect();
+            format!("驱动已附加 {attached} 个串口: {}", names.join(", "))
+        };
+
+        // Move the handle into a capture thread and stream records back over a channel.
+        // The handle lives in the thread; the UI only keeps the receiving end. (An Arc
+        // would require Sync, and DriverHandle is deliberately only Send — the kernel
+        // device object serialises its own IOCTLs.)
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || loop {
+            match h.next_record() {
+                Some(rec) => {
+                    if tx.send(rec).is_err() {
+                        break;
+                    }
+                }
+                None => std::thread::sleep(std::time::Duration::from_millis(15)),
+            }
+        });
+        self.drv_rx = Some(rx);
+        true
+    }
+
+    /// Drain driver records into the active session, creating a channel per port.
+    fn drain_driver(&mut self) {
+        let Some(rx) = &self.drv_rx else { return };
+        let mut batch: Vec<crate::driver::Record> = Vec::new();
+        while let Ok(rec) = rx.try_recv() {
+            batch.push(rec);
+            if batch.len() >= 256 {
+                break; // keep the UI responsive under heavy traffic
+            }
+        }
+        if batch.is_empty() {
+            return;
+        }
+        // Which session receives driver data? The active passive-monitor session, or a
+        // dedicated one created on first record.
+        if self.sessions.is_empty() {
+            let s = Session::new(
+                "驱动捕获".into(),
+                Vec::new(),
+                ProtoType::None,
+                ViewToggles { table: true, terminal: true, dump: true, line: true, modbus: false },
+            );
+            self.sessions.push(s);
+            self.active = 0;
+        }
+        let sess_idx = self.active.min(self.sessions.len() - 1);
+        for rec in batch {
+            let key = (sess_idx, rec.port_index);
+            let chan = match self.drv_ports.get(&key) {
+                Some(&c) => c,
+                None => {
+                    let name = self
+                        .drv
+                        .as_ref()
+                        .and_then(|h| h.port_names(rec.port_index + 1).into_iter().find(|p| p.index == rec.port_index))
+                        .map(|p| p.device.rsplit('\\').next().unwrap_or(&p.device).to_string())
+                        .unwrap_or_else(|| format!("端口{}", rec.port_index));
+                    let s = &mut self.sessions[sess_idx];
+                    let idx = s.channels.len();
+                    s.channels.push(ChannelCfg {
+                        kind: ChanKind::HookSerial,
+                        name: name.clone(),
+                        baud: 0,
+                        data_bits: 8,
+                        parity: 0,
+                        stop_bits: 1,
+                    });
+                    s.notices.push(format!("驱动捕获端口: {name}"));
+                    self.drv_ports.insert(key, idx);
+                    idx
+                }
+            };
+            // FILETIME (100 ns since 1601) → seconds/millis since midnight.
+            let secs = rec.timestamp / 10_000_000 % 86_400;
+            let millis = (rec.timestamp / 10_000) % 1000;
+            self.sessions[sess_idx].ingest(
+                chan,
+                rec.data,
+                secs,
+                millis as u32,
+                rec.dir_tx,
+            );
+        }
+    }
+
     /// Point the auto-attach service at the ports of every passive (串口监听)
     /// channel. Called whenever sessions change.
     fn sync_auto_attach(&mut self) {
@@ -525,6 +646,23 @@ impl MonitorApp {
                         self.procs = inject::list_processes();
                         self.attach_sel = None;
                         self.dlg_attach = true;
+                    }
+                    ui.separator();
+                    // Kernel-driver capture: the reliable path — no injection race, and
+                    // it sees every process from the moment it attaches.
+                    if self.drv_rx.is_some() {
+                        if ui.button("停止驱动捕获").clicked() {
+                            self.drv_rx = None;
+                            self.drv_note = "驱动捕获已停止".into();
+                            self.toast("已停止驱动捕获");
+                        }
+                        ui.label("  驱动捕获运行中");
+                    } else if ui.button("启用驱动捕获(推荐)").clicked() {
+                        if self.start_driver_capture() {
+                            self.toast("驱动捕获已启动");
+                        } else {
+                            self.toast(self.drv_note.clone());
+                        }
                     }
                 });
                 ui.menu_button("编辑", |ui| {
@@ -1766,11 +1904,12 @@ impl MonitorApp {
     /// True while any session is actively collecting. A passive (串口监听) channel
     /// counts as live even when idle, because a row can arrive at any moment.
     fn monitoring_live(&self) -> bool {
-        self.sessions.iter().any(|s| {
-            s.running
-                || s.channels.iter().any(|c| c.kind == ChanKind::HookSerial)
-                || s.cap_pid.is_some()
-        })
+        self.drv_rx.is_some()
+            || self.sessions.iter().any(|s| {
+                s.running
+                    || s.channels.iter().any(|c| c.kind == ChanKind::HookSerial)
+                    || s.cap_pid.is_some()
+            })
     }
 
     /// Show auto-attach events (which programs got hooked) without a dialog.
@@ -1815,6 +1954,7 @@ impl eframe::App for MonitorApp {
             }
         }
         self.drain_capture();
+        self.drain_driver();
         self.drain_auto_attach();
         for s in self.sessions.iter_mut() {
             s.poll();
