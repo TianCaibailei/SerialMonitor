@@ -79,6 +79,26 @@ pub struct DriverStats {
     pub attached: u32,
 }
 
+impl DriverStats {
+    /// 一行摘要，给设置对话框用。
+    pub fn summary(&self) -> String {
+        format!(
+            "{} · 已附加 {} 个端口 · 队列 {} 条 · 丢弃 {} 条 · 收 {} / 发 {} 字节 · 目标 PID {}",
+            if self.enabled != 0 { "采集已启用" } else { "采集已停用" },
+            self.attached,
+            self.records,
+            self.dropped,
+            self.received,
+            self.sent,
+            if self.target_pid == 0 {
+                "全部".to_string()
+            } else {
+                self.target_pid.to_string()
+            }
+        )
+    }
+}
+
 /// One captured chunk, decoded from the driver's wire format.
 #[derive(Clone, Debug)]
 pub struct Record {
@@ -289,8 +309,9 @@ impl Drop for DriverHandle {
 pub fn open_failure_hint(err: u32) -> String {
     let mut s = String::new();
     match err {
-        0 => {
-            s.push_str("驱动未安装：控制设备 \\\\.\\UmSerialFilter 不存在。\n");
+        0 | ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND => {
+            // 控制设备不存在 = 服务没建或没起，这是最常见的一种。
+            s.push_str("驱动未安装：控制设备 \\\\.\\UmSerialFilter 不存在（错误码 2/3）。\n");
         }
         ERROR_ACCESS_DENIED => {
             s.push_str("拒绝访问：驱动可能已加载，但当前进程没有打开控制设备的权限。\n");

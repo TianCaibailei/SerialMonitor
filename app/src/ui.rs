@@ -138,6 +138,8 @@ pub struct MonitorApp {
     /// 已经持有句柄的捕获线程执行，而不是在界面上另开一个句柄。
     pub drv_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     pub drv_thread: Option<std::thread::JoinHandle<()>>,
+    pub drv_cmd: Option<std::sync::mpsc::Sender<DrvCmd>>,
+    pub drv_evt: Option<Receiver<DrvEvt>>,
     /// 驱动捕获设置对话框。
     pub dlg_drv: bool,
     pub drv_pid_text: String,
@@ -248,6 +250,8 @@ impl MonitorApp {
             drv_probe_at: None,
             drv_stop: None,
             drv_thread: None,
+            drv_cmd: None,
+            drv_evt: None,
             dlg_drv: false,
             drv_pid_text: "0".into(),
             chan_kind: 0,
@@ -299,6 +303,15 @@ impl MonitorApp {
                 app.dlg_attach = true;
                 app.procs = inject::list_processes();
                 app.attach_filter = String::new();
+            }
+            // 同理，UM_SHOW_DRIVER 让截图跑的是「驱动捕获设置」对话框，
+            // 否则这个对话框的排版没人验证得了（它平时要先点菜单才会出来）。
+            if std::env::var("UM_SHOW_DRIVER").is_ok() {
+                app.dlg_drv = true;
+                app.probe_driver_availability(true);
+                if !app.drv_avail {
+                    app.drv_note = crate::driver::open_failure_hint(app.drv_err);
+                }
             }
         }
         app
@@ -630,24 +643,28 @@ impl MonitorApp {
     /// Drain driver records into the active session, creating a channel per port.
     fn drain_driver(&mut self) {
         // 先把捕获线程的事件收掉（端口表 / 目标 PID），它们决定了下面查表的内容。
+        // 事件先收集到 Vec 里再处理：Receiver 借用了 self，直接在处理时改 self 会冲突。
+        let mut evts: Vec<DrvEvt> = Vec::new();
         if let Some(evt) = &self.drv_evt {
             while let Ok(e) = evt.try_recv() {
-                match e {
-                    DrvEvt::Ports(list) => {
-                        let n = list.len() as u32;
-                        self.drv_names = list.iter().cloned().collect();
-                        let shown: Vec<(u32, String)> = list;
-                        self.set_driver_note_for_ports(n, &shown);
-                        self.toast(self.drv_note.clone());
-                    }
-                    DrvEvt::Target(pid) => {
-                        self.drv_pid = if pid == 0 { None } else { Some(pid) };
-                        self.toast(if pid == 0 {
-                            "驱动捕获目标: 所有进程".to_string()
-                        } else {
-                            format!("驱动捕获目标: PID {pid}")
-                        });
-                    }
+                evts.push(e);
+            }
+        }
+        for e in evts {
+            match e {
+                DrvEvt::Ports(list) => {
+                    let n = list.len() as u32;
+                    self.drv_names = list.iter().cloned().collect();
+                    self.set_driver_note_for_ports(n, &list);
+                    self.toast(self.drv_note.clone());
+                }
+                DrvEvt::Target(pid) => {
+                    self.drv_pid = if pid == 0 { None } else { Some(pid) };
+                    self.toast(if pid == 0 {
+                        "驱动捕获目标: 所有进程".to_string()
+                    } else {
+                        format!("驱动捕获目标: PID {pid}")
+                    });
                 }
             }
         }
@@ -701,6 +718,9 @@ impl MonitorApp {
                     });
                     s.notices.push(format!("驱动捕获端口: {name}"));
                     self.drv_ports.insert(key, idx);
+                    // 驱动自己在记录里带有句柄，但通道是按端口聚合的：同一端口上不同
+                    // 进程的读写都进这一路，和「串口监听」会话的行为保持一致。
+                    let _ = rec.handle;
                     idx
                 }
             };
@@ -1608,6 +1628,15 @@ impl MonitorApp {
                 .small()
                 .color(Color32::GRAY),
         );
+        // 捕获中驱动句柄在后台线程，UI 侧问不到 stats；未捕获时顺手读一次，
+        // 让用户看清驱动自己认为附加了几个端口（可用于和上面的端口表对照）。
+        if !capturing && self.drv_avail {
+            if let Some(h) = crate::driver::DriverHandle::open() {
+                if let Some(st) = h.stats() {
+                    ui.label(RichText::new(st.summary()).small().color(Color32::GRAY));
+                }
+            }
+        }
 
         // --- 不可用时的可操作指引 ---
         if !self.drv_avail && !capturing {
@@ -1648,9 +1677,13 @@ impl MonitorApp {
             }
         });
         if self.drv_names.is_empty() {
-            ui.label(
-                RichText::new("(没有端口) 驱动已加载但没有找到串口设备，插拔一次串口设备后再扫描").weak(),
-            );
+            // 两种「空」含义不同：驱动没起来时端口表本来就取不到，不能说成「已加载」。
+            let msg = if self.drv_avail {
+                "(没有端口) 驱动已加载但没有找到串口设备，插拔一次串口设备后再扫描"
+            } else {
+                "(没有端口) 驱动未就绪，先按上面的指引加载驱动"
+            };
+            ui.label(RichText::new(msg).weak());
         } else {
             let mut rows: Vec<(u32, String)> = self
                 .drv_names
@@ -1728,18 +1761,21 @@ impl MonitorApp {
                 .add_enabled(self.drv_avail, egui::Button::new("开始捕获"))
                 .clicked()
             {
+                // 失败时 start_driver_capture 已经把 drv_avail/drv_err/drv_note 更新成
+                // 真实原因，这里不要再覆盖成一句泛泛的提示。
                 if self.start_driver_capture() {
                     self.toast("驱动捕获已启动");
                 } else {
-                    self.probe_driver_availability(true);
-                    self.toast("驱动不可用，请按上面的指引安装");
+                    self.toast("驱动不可用，原因见下方说明");
                 }
             }
             if ui.button("关闭").clicked() {
                 self.dlg_drv = false;
             }
         });
-        if !self.drv_note.is_empty() {
+        // 驱动不可用时上面已经完整显示过 open_failure_hint，底部不再重复一遍；
+        // 这里只负责「已可用」或「捕获中」的操作结果回显。
+        if !self.drv_note.is_empty() && (capturing || self.drv_avail) {
             ui.add_space(4.0);
             ScrollArea::vertical().id_source("drv_note").max_height(90.0).show(ui, |ui| {
                 ui.label(RichText::new(&self.drv_note).small());
@@ -2409,6 +2445,11 @@ impl eframe::App for MonitorApp {
         self.drain_capture();
         self.drain_driver();
         self.drain_auto_attach();
+        // 状态栏要区分「未启用」和「未安装」，而驱动可能在本程序启动之后才装上
+        // （用户照着提示执行 sc create），所以低频重探一次，而不是只在启动时判一次。
+        if self.frame_count % 60 == 0 {
+            self.probe_driver_availability(false);
+        }
         for s in self.sessions.iter_mut() {
             s.poll();
         }
