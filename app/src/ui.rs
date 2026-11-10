@@ -36,7 +36,18 @@ const FCS: [u8; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 0x0B, 0x0C, 0x0F, 0x10, 0x11, 0x1
 const VIEW_NAMES: [&str; 5] = ["Table视图", "终端视图", "Dump视图", "Line曲线图", "Modbus视图"];
 const ENCS: [&str; 3] = ["UTF-8", "ANSI(GBK)", "Unicode(UTF-16LE)"];
 const SPLITS: [&str; 3] = ["单个文件不分割", "按时间范围分割", "强制文件大小，超过将覆盖"];
-const CHAN_KINDS: [&str; 5] = ["串口", "TCP客户端", "TCP服务端", "UDP", "串口监听(钩子)"];
+// Order matters: index 0 is the DEFAULT when the New Monitor dialog opens.
+//
+// A serial monitor exists to watch OTHER software's traffic, so the passive
+// (hook) mode is the default and owning the port is the explicit exception. The
+// original CommMonitor behaves the same way: its driver never opens the device.
+const CHAN_KINDS: [&str; 5] = [
+    "串口监听(不占用)",
+    "TCP客户端",
+    "TCP服务端",
+    "UDP",
+    "串口独占用(本软件占用)",
+];
 
 pub struct MonitorApp {
     pub sessions: Vec<Session>,
@@ -238,11 +249,13 @@ impl MonitorApp {
     fn new_session(&mut self) {
         let mut chans: Vec<ChannelCfg> = Vec::new();
         let kind = match self.chan_kind {
+            // 0 = 串口监听(不占用) — the default and the only mode that never
+            // opens the device. 4 = 串口独占 (the monitor itself owns the port).
             1 => ChanKind::TcpClient,
             2 => ChanKind::TcpServer,
             3 => ChanKind::Udp,
-            4 => ChanKind::HookSerial,
-            _ => ChanKind::Serial,
+            4 => ChanKind::Serial,
+            _ => ChanKind::HookSerial,
         };
         if kind == ChanKind::Serial || kind == ChanKind::HookSerial {
             for (i, on) in self.port_sel.iter().enumerate() {
@@ -1285,8 +1298,17 @@ impl MonitorApp {
                 }
             });
         if self.chan_kind == 0 || self.chan_kind == 4 {
-            if self.chan_kind == 4 {
-                ui.label("监听模式：不打开串口，由注入的进程提供数据（需 附加到进程(拦截)）。");
+            if self.chan_kind == 0 {
+                ui.colored_label(
+                    egui::Color32::from_rgb(0x2e, 0x7d, 0x32),
+                    "被动监听：本软件不会打开串口，只读取被监控程序收到的数据。",
+                );
+                ui.label("下一步：菜单 → 监控 → 附加到进程(拦截)…，把钩子注入到使用该串口的程序。");
+            } else {
+                ui.colored_label(
+                    egui::Color32::from_rgb(0xc6, 0x28, 0x28),
+                    "独占模式：本软件会打开串口，其他程序将无法再使用它（仅在需要主动收发时使用）。",
+                );
             }
             ui.label("串口 (可多选):");
             ScrollArea::vertical().max_height(120.0).show(ui, |ui| {
@@ -1303,8 +1325,9 @@ impl MonitorApp {
                     ui.label("(未发现串口)");
                 }
             });
-            if self.chan_kind == 4 {
-                // hook watch: no baud/line params needed (the other process owns the port)
+            if self.chan_kind == 0 {
+                // Passive listening: baud/line settings belong to the program that
+                // owns the port, not to us — nothing to configure here.
             } else {
             ComboBox::from_label("波特率")
                 .selected_text(format!("{}", BAUDS[self.baud_i]))
