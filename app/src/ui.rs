@@ -1592,6 +1592,10 @@ impl MonitorApp {
                 .collapsible(false)
                 .resizable(true)
                 .default_width(560.0)
+                // Without an explicit position egui can place the window partly off-screen
+                // on the first frame, which clipped the left edge of every label. Anchoring
+                // it near the top-left keeps the whole dialog visible at any window size.
+                .default_pos(egui::pos2(60.0, 80.0))
                 .show(ctx, |ui| {
                     self.dlg_driver_ui(ui);
                 });
