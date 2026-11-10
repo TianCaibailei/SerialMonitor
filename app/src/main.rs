@@ -2,6 +2,7 @@
 // CLI: --screenshot <file.png>  render ~110 frames, save a PNG, exit 0.
 
 mod capture;
+mod e2e;
 mod inject;
 mod protocol;
 mod session;
@@ -20,6 +21,12 @@ fn parse_args() -> Option<String> {
             let port = args.get(i + 1).cloned().unwrap_or_else(|| "COM1".into());
             let peer = args.get(i + 2).cloned().unwrap_or_else(|| "COM2".into());
             std::process::exit(inject::comtest_inject(&port, &peer));
+        }
+        // --hook-e2e <COMx> <COMy> — full chain: hook DLL -> pipe -> session rows
+        if args[i] == "--hook-e2e" {
+            let port = args.get(i + 1).cloned().unwrap_or_else(|| "COM6".into());
+            let peer = args.get(i + 2).cloned().unwrap_or_else(|| "COM7".into());
+            std::process::exit(e2e::hook_e2e(&port, &peer));
         }
         if args[i] == "--screenshot" {
             return args.get(i + 1).cloned();
