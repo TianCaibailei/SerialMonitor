@@ -136,11 +136,23 @@ pub fn headless_watch(port: &str, result_path: &str) -> i32 {
     }
 
     let rows = session.rows.len();
-    // Every string field goes through the same escaper: process exe names can contain
-    // characters that break JSON (and a naive format! produced invalid output before).
+    // `attached` is a string in the schema; emit it as a string, escaped.
+    let attached_json = {
+        let mut s = String::from("\"");
+        for c in attached.join(", ").chars() {
+            match c {
+                '"' => s.push_str("\\\""),
+                '\\' => s.push_str("\\\\"),
+                '\n' => s.push_str("\\n"),
+                '\r' => {}
+                c => s.push(c),
+            }
+        }
+        s.push('"');
+        s
+    };
     let json = format!(
-        "{{\"sessions\":1,\"rows\":{rows},\"tx\":{tx},\"rx\":{rxc},\"attached\":{},\"notices\":{}}}",
-        serde_like(&[attached.join(", ")]),
+        "{{\"sessions\":1,\"rows\":{rows},\"tx\":{tx},\"rx\":{rxc},\"attached\":{attached_json},\"notices\":{}}}",
         serde_like(&notices)
     );
     if let Err(e) = std::fs::write(result_path, json) {

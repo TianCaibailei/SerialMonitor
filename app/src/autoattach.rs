@@ -816,12 +816,26 @@ impl AutoAttach {
                         }
                     }
                     if ticks % 10 == 1 || !fresh.is_empty() {
+                        // Log a compact summary: dumping every process name made the
+                        // result JSON unwieldy and hard to read.
+                        let names: Vec<String> = fresh
+                            .iter()
+                            .take(6)
+                            .map(|(p, n)| format!("{n}:{p}"))
+                            .collect();
                         push_log(
                             &l,
-                            format!("已知={} 候选={} 新进程={:?}",
+                            format!(
+                                "已知={} 候选={} 新进程={}{}",
                                 known.len(),
                                 candidates.len(),
-                                fresh.iter().map(|(p, n)| format!("{n}:{p}")).collect::<Vec<_>>()),
+                                names.join(", "),
+                                if fresh.len() > 6 {
+                                    format!(" …共{}", fresh.len())
+                                } else {
+                                    String::new()
+                                }
+                            ),
                         );
                     }
                 }
