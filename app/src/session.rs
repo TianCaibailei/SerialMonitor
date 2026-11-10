@@ -390,7 +390,29 @@ impl Session {
                     });
                 }
             }
-            Err(e) => self.notices.push(format!("打开 {} 失败: {}", ch.name, e)),
+            Err(e) => {
+                // A busy port is the single most common surprise here: another
+                // program already owns it. serialport reports this as a
+                // communication error whose text carries the OS message, so match
+                // on the text and point at the mode built for exactly this case.
+                let text = e.to_string();
+                let busy = text.contains("denied")
+                    || text.contains("拒绝")
+                    || text.contains("occupied")
+                    || text.contains("busy")
+                    || text.contains("正在使用")
+                    || text.contains("Access is denied");
+                let msg = if busy {
+                    format!(
+                        "打开 {} 失败: 端口已被其他程序占用。\
+                         若只想观察该程序的通信，请改用「串口监听(不占用)」通道并附加到该进程。",
+                        ch.name
+                    )
+                } else {
+                    format!("打开 {} 失败: {}", ch.name, text)
+                };
+                self.notices.push(msg);
+            }
         }
     }
 
