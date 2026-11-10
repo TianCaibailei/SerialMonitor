@@ -9,6 +9,7 @@ mod headless;
 mod inject;
 mod layout_probe;
 mod native_serial;
+mod native_serial_delayed;
 mod portowners;
 mod protocol;
 mod session;
@@ -69,12 +70,16 @@ fn parse_args() -> Option<String> {
         if args[i] == "--probe-layout" {
             std::process::exit(layout_probe::probe_layout());
         }
-        // --native-serial <COMx> <ms> — a native (non-.NET) serial tool, used to test
-        // whether the hook works for programs that call the Win32 API directly.
-        if args[i] == "--native-serial" {
+        // --native-serial-delayed <COMx> <ms> <marker> — waits for a marker file, then
+        // opens the port. Lets a test inject BEFORE the port is opened.
+        if args[i] == "--native-serial-delayed" {
             let com = args.get(i + 1).cloned().unwrap_or_else(|| "COM6".into());
             let ms: u64 = args.get(i + 2).and_then(|s| s.parse().ok()).unwrap_or(8000);
-            std::process::exit(native_serial::run(&com, ms));
+            let marker = args
+                .get(i + 3)
+                .cloned()
+                .unwrap_or_else(|| std::env::temp_dir().join("um_go.txt").to_string_lossy().into_owned());
+            std::process::exit(native_serial_delayed::run(&com, ms, &marker));
         }
         // --find-owners <COMx> — who holds this port right now (auto-attach diagnostic)
         if args[i] == "--find-owners" {
