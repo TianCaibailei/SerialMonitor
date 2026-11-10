@@ -526,12 +526,20 @@ pub fn inject(pid: u32, dll: &str) -> Result<(), String> {
         unsafe { CloseHandle(proc) };
         return Err("GetProcAddress(LoadLibraryW) 失败".into());
     }
-    let path = wide(dll);
-    let bytes = path.len() * 2;
-    // For a 32-bit (WOW64) target the allocation must land in the low 4 GB, and some
-    // 32-bit loaders are picky about where the path buffer lives. Allocating near the
-    // top of the process's address space is what a remote-thread LoadLibraryW stub
-    // expects, so the flag MEM_TOP_DOWN is used for 32-bit targets.
+    // 32-bit targets get an ANSI path + LoadLibraryA. The DLL loads correctly when a
+    // 32-bit host (rundll32) opens it, so the failure is specific to running
+    // LoadLibraryW remotely from a 64-bit injector; the ANSI entry point with a byte
+    // path avoids the wide-string type question entirely.
+    let (path_bytes, is_wide) = if wow64 != 0 {
+        let mut v = dll.as_bytes().to_vec();
+        v.push(0);
+        (v, false)
+    } else {
+        (wide(dll).iter().flat_map(|u| u.to_le_bytes()).collect(), true)
+    };
+    let bytes = path_bytes.len();
+    let _ = is_wide;
+    // For a 32-bit (WOW64) target the allocation must land in the low 4 GB.
     let alloc_flags = if wow64 != 0 {
         MEM_COMMIT | MEM_RESERVE | 0x0010_0000 // MEM_TOP_DOWN
     } else {
@@ -544,8 +552,49 @@ pub fn inject(pid: u32, dll: &str) -> Result<(), String> {
         unsafe { CloseHandle(proc) };
         return Err(format!("VirtualAllocEx 失败 (err={})", get_last_error()));
     }
+    // A 32-bit target can only address the low 4 GB: the buffer holding the DLL path
+    // must live there, otherwise the remote LoadLibraryW receives a truncated pointer
+    // and returns NULL.
+    if wow64 != 0 && remote as usize > 0xFFFF_FFFF {
+        unsafe {
+            VirtualFreeEx(proc, remote, 0, MEM_RELEASE);
+            CloseHandle(proc);
+        }
+        return Err(format!(
+            "32 位目标的分配地址超出 4GB 范围 ({:p})",
+            remote
+        ));
+    }
     let mut written = 0usize;
-    let ok = unsafe { WriteProcessMemory(proc, remote, path.as_ptr() as *const u8, bytes, &mut written) };
+    let ok = unsafe { WriteProcessMemory(proc, remote, path_bytes.as_ptr() as *const u8, bytes, &mut written) };
+    // Read the path straight back: a silent mismatch between what we wrote and what the
+    // target sees is the difference between "LoadLibrary got the path" and "LoadLibrary
+    // got garbage", and it is invisible from the return code alone.
+    {
+        let mut check = vec![0u8; bytes];
+        let mut got = 0usize;
+        let read_ok = unsafe {
+            ReadProcessMemory(
+                proc,
+                remote as *const std::ffi::c_void,
+                check.as_mut_ptr() as *mut std::ffi::c_void,
+                bytes,
+                &mut got,
+            )
+        } != 0;
+        let matches = read_ok && check == path_bytes;
+        eprintln!(
+            "inject: 路径回读 {} (write_ok={ok} written={written} read_ok={read_ok} match={matches})",
+            if matches { "一致" } else { "不一致" }
+        );
+        if !matches {
+            unsafe {
+                VirtualFreeEx(proc, remote, 0, MEM_RELEASE);
+                CloseHandle(proc);
+            }
+            return Err("写入目标进程的 DLL 路径无法正确回读".into());
+        }
+    }
     if ok == 0 || written != bytes {
         unsafe {
             VirtualFreeEx(proc, remote, 0, MEM_RELEASE);
@@ -560,8 +609,19 @@ pub fn inject(pid: u32, dll: &str) -> Result<(), String> {
     // `LdrLoadDll` is reachable through the target's own PEB, which is what the helper
     // below resolves. When that fails, the error is reported instead of crashing.
     let entry = if wow64 != 0 {
-        match resolve_loadlibrary_in_32bit_target(proc) {
-            Ok(e) => e,
+        // Prefer LoadLibraryA for 32-bit targets: the ANSI path was written above.
+        match resolve_loadlibrarya_in_32bit_target(proc) {
+            Ok(e) => {
+                if e as usize > 0xFFFF_FFFF {
+                    unsafe {
+                        VirtualFreeEx(proc, remote, 0, MEM_RELEASE);
+                        CloseHandle(proc);
+                    }
+                    return Err(format!("LoadLibraryA 地址超出 4GB ({:p})", e));
+                }
+                eprintln!("inject: 32 位 LoadLibraryA = {e:p}, 路径 = {remote:p}");
+                e
+            }
             Err(e) => {
                 unsafe {
                     VirtualFreeEx(proc, remote, 0, MEM_RELEASE);
@@ -591,19 +651,51 @@ pub fn inject(pid: u32, dll: &str) -> Result<(), String> {
         }
         return Err("CreateRemoteThread 失败".into());
     }
-    unsafe { WaitForSingleObject(th, 10_000) };
+    let waited = unsafe { WaitForSingleObject(th, 10_000) };
     let mut code = 0u32;
     unsafe { GetExitCodeThread(th, &mut code) };
     unsafe { CloseHandle(th) };
     unsafe { VirtualFreeEx(proc, remote, 0, MEM_RELEASE) };
     unsafe { CloseHandle(proc) };
-    if code == 0 {
-        // LoadLibraryW returned NULL — the DLL could not be loaded in the target.
-        // Report the most likely causes instead of a bare failure.
+    // STILL_ACTIVE (259) means the remote thread never finished: the wait timed out, so
+    // `code` is not a module handle and must not be treated as success.
+    const STILL_ACTIVE: u32 = 259;
+    const WAIT_TIMEOUT: u32 = 0x102;
+    if waited == WAIT_TIMEOUT || code == STILL_ACTIVE {
         return Err(format!(
-            "LoadLibraryW 返回 NULL — 无法在目标进程加载 {dll}。\
+            "远程线程未在 10 秒内完成（可能被注入到正在关闭的进程，或 LoadLibrary 卡住）"
+        ));
+    }
+    if code == 0 {
+        return Err(format!(
+            "LoadLibrary 返回 NULL — 无法在目标进程加载 {dll}。\
              常见原因：DLL 架构不匹配、缺少 VC 运行时、或路径不可访问。"
         ));
+    }
+    // The thread exit code is a machine word. In a WOW64 target the WOW64 layer may
+    // sign-extend or truncate the returned HMODULE, so a non-zero value here is only
+    // weak evidence. For 32-bit targets, confirm the DLL really is loaded by
+    // enumerating the target's modules (architecture-aware) and looking for it by name.
+    if wow64 != 0 {
+        let leaf = std::path::Path::new(dll)
+            .file_name()
+            .map(|s| s.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        let verify_proc =
+            unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | 0x0010, 0, pid) };
+        let loaded = if verify_proc.is_null() {
+            false
+        } else {
+            let mods = wow64_module_bases(verify_proc);
+            let hit = mods.iter().any(|(_, p)| p.to_lowercase().ends_with(&leaf));
+            unsafe { CloseHandle(verify_proc) };
+            hit
+        };
+        if !loaded {
+            return Err(format!(
+                "目标进程里没有加载 {leaf}（远程线程返回 {code:#x}，但模块列表中没有它）"
+            ));
+        }
     }
     Ok(())
 }
@@ -635,12 +727,28 @@ pub fn inject(pid: u32, dll: &str) -> Result<(), String> {
 fn resolve_loadlibrary_in_32bit_target(
     proc: *mut std::ffi::c_void,
 ) -> Result<*mut std::ffi::c_void, String> {
-    let base = peb32_module_base(proc, "kernel32.dll")?;
-    if base == 0 {
-        return Err("32 位目标中找不到 kernel32.dll".into());
+    // kernel32 is large and always maps kernelbase; LoadLibraryW is exported by
+    // kernel32 itself on every supported Windows version.
+    if let Ok(a) = wow64_export_address(proc, "kernel32.dll", "LoadLibraryW") {
+        return Ok(a);
     }
-    let addr = export_rva_of(proc, base, "LoadLibraryW")?;
-    Ok((base + addr as u64) as *mut std::ffi::c_void)
+    // kernelbase also exports it on Windows 10/11; fall back there.
+    wow64_export_address(proc, "kernelbase.dll", "LoadLibraryW")
+}
+
+/// `LoadLibraryA` inside a WOW64 target, used when the wide version fails.
+///
+/// The DLL was verified to load correctly when a 32-bit process (rundll32) is pointed
+/// at it, so the failure is specific to the remote call. Some 32-bit targets refuse a
+/// wchar_t* path written by a 64-bit writer; the ANSI entry point with a plain byte
+/// path avoids the type question entirely.
+fn resolve_loadlibrarya_in_32bit_target(
+    proc: *mut std::ffi::c_void,
+) -> Result<*mut std::ffi::c_void, String> {
+    if let Ok(a) = wow64_export_address(proc, "kernel32.dll", "LoadLibraryA") {
+        return Ok(a);
+    }
+    wow64_export_address(proc, "kernelbase.dll", "LoadLibraryA")
 }
 
 extern "system" {
@@ -684,6 +792,209 @@ fn read_remote_u32(proc: *mut std::ffi::c_void, addr: u64) -> Option<u32> {
     } else {
         None
     }
+}
+
+extern "system" {
+    fn EnumProcessModulesEx(
+        process: *mut std::ffi::c_void,
+        modules: *mut *mut std::ffi::c_void,
+        size: u32,
+        needed: *mut u32,
+        filter: u32,
+    ) -> i32;
+    fn GetModuleFileNameExW(
+        process: *mut std::ffi::c_void,
+        module: *mut std::ffi::c_void,
+        name: *mut u16,
+        size: u32,
+    ) -> u32;
+}
+
+/// Is a module whose file name starts with `prefix` loaded in `pid`?
+///
+/// Uses EnumProcessModulesEx with the architecture filter that matches the target, so it
+/// works for both 64-bit and WOW64 processes. (A Toolhelp-based version reported "not
+/// loaded" even for successful injections because it guessed the struct offset wrong.)
+pub fn is_dll_loaded(pid: u32, prefix: &str) -> bool {
+    let proc = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | 0x0010, 0, pid) };
+    if proc.is_null() {
+        return false;
+    }
+    let wow = unsafe {
+        let mut w = 0i32;
+        IsWow64Process(proc, &mut w) != 0 && w != 0
+    };
+    let mods = if wow {
+        wow64_module_bases(proc)
+    } else {
+        native_module_bases(proc)
+    };
+    unsafe { CloseHandle(proc) };
+    let needle = prefix.to_lowercase();
+    mods.iter().any(|(_, p)| {
+        p.rsplit(['\\', '/'])
+            .next()
+            .unwrap_or(p)
+            .to_lowercase()
+            .starts_with(&needle)
+    })
+}
+
+/// Module list of a 64-bit process.
+fn native_module_bases(proc: *mut std::ffi::c_void) -> Vec<(*mut std::ffi::c_void, String)> {
+    extern "system" {
+        fn EnumProcessModulesEx(
+            process: *mut std::ffi::c_void,
+            modules: *mut *mut std::ffi::c_void,
+            size: u32,
+            needed: *mut u32,
+            filter: u32,
+        ) -> i32;
+        fn GetModuleFileNameExW(
+            process: *mut std::ffi::c_void,
+            module: *mut std::ffi::c_void,
+            name: *mut u16,
+            size: u32,
+        ) -> u32;
+    }
+    const LIST_MODULES_ALL: u32 = 0x03;
+    let mut out = Vec::new();
+    let mut needed: u32 = 0;
+    unsafe {
+        EnumProcessModulesEx(proc, std::ptr::null_mut(), 0, &mut needed, LIST_MODULES_ALL)
+    };
+    if needed == 0 {
+        return out;
+    }
+    let count = needed as usize / std::mem::size_of::<*mut std::ffi::c_void>();
+    if count == 0 || count > 8192 {
+        return out;
+    }
+    let mut mods: Vec<*mut std::ffi::c_void> = vec![std::ptr::null_mut(); count];
+    let mut needed2: u32 = 0;
+    let ok = unsafe {
+        EnumProcessModulesEx(
+            proc,
+            mods.as_mut_ptr(),
+            (count * std::mem::size_of::<*mut std::ffi::c_void>()) as u32,
+            &mut needed2,
+            LIST_MODULES_ALL,
+        )
+    };
+    if ok == 0 {
+        return out;
+    }
+    for m in mods {
+        if m.is_null() {
+            continue;
+        }
+        let mut buf = [0u16; 512];
+        let n = unsafe { GetModuleFileNameExW(proc, m, buf.as_mut_ptr(), buf.len() as u32) };
+        if n == 0 {
+            continue;
+        }
+        out.push((m, String::from_utf16_lossy(&buf[..n as usize])));
+    }
+    out
+}
+
+
+/// Module bases of a 32-bit (WOW64) process, via EnumProcessModulesEx.
+///
+/// This is far more robust than walking the target's PEB loader list from a 64-bit
+/// process: the API performs the WOW64 translation itself, so it returns the *32-bit*
+/// module handles even though the caller is 64-bit. The previous PEB walk intermittently
+/// read an unreadable list entry and stopped after a handful of modules, which is why
+/// kernel32 was often never reached.
+fn wow64_module_bases(proc: *mut std::ffi::c_void) -> Vec<(*mut std::ffi::c_void, String)> {
+    const LIST_MODULES_32BIT: u32 = 0x01;
+    let mut out = Vec::new();
+    let mut needed: u32 = 0;
+    // First call sizes the array.
+    unsafe {
+        EnumProcessModulesEx(
+            proc,
+            std::ptr::null_mut(),
+            0,
+            &mut needed,
+            LIST_MODULES_32BIT,
+        )
+    };
+    if needed == 0 {
+        return out;
+    }
+    let count = needed as usize / std::mem::size_of::<*mut std::ffi::c_void>();
+    if count == 0 || count > 4096 {
+        return out;
+    }
+    let mut mods: Vec<*mut std::ffi::c_void> = vec![std::ptr::null_mut(); count];
+    let mut needed2: u32 = 0;
+    let ok = unsafe {
+        EnumProcessModulesEx(
+            proc,
+            mods.as_mut_ptr(),
+            (count * std::mem::size_of::<*mut std::ffi::c_void>()) as u32,
+            &mut needed2,
+            LIST_MODULES_32BIT,
+        )
+    };
+    if ok == 0 {
+        return out;
+    }
+    for m in mods {
+        if m.is_null() {
+            continue;
+        }
+        let mut buf = [0u16; 512];
+        let n = unsafe { GetModuleFileNameExW(proc, m, buf.as_mut_ptr(), buf.len() as u32) };
+        if n == 0 {
+            continue;
+        }
+        let full = String::from_utf16_lossy(&buf[..n as usize]);
+        out.push((m, full));
+    }
+    out
+}
+
+/// Address of an export in a WOW64 target: pick the module by name from the
+/// architecture-aware module list, then parse that image's export directory.
+fn wow64_export_address(
+    proc: *mut std::ffi::c_void,
+    module: &str,
+    symbol: &str,
+) -> Result<*mut std::ffi::c_void, String> {
+    let mods = wow64_module_bases(proc);
+    if mods.is_empty() {
+        return Err("无法枚举 32 位目标的模块".into());
+    }
+    let want = module.to_lowercase();
+    let mut hit_base: u64 = 0;
+    for (base, path) in &mods {
+        let leaf = path
+            .rsplit(['\\', '/'])
+            .next()
+            .unwrap_or(path)
+            .to_lowercase();
+        if leaf == want {
+            hit_base = *base as u64;
+            break;
+        }
+    }
+    if hit_base == 0 {
+        let names: Vec<String> = mods
+            .iter()
+            .filter_map(|(_, p)| p.rsplit(['\\', '/']).next().map(|s| s.to_string()))
+            .take(8)
+            .collect();
+        return Err(format!(
+            "32 位目标中未找到 {module}（可见模块: {}）",
+            names.join(", ")
+        ));
+    }
+    eprintln!("inject: {module} 基址 = {hit_base:#x}");
+    let addr = export_rva_of(proc, hit_base, symbol)?;
+    eprintln!("inject: {symbol} RVA = {addr:#x} → 绝对地址 {:#x}", hit_base + addr as u64);
+    Ok((hit_base + addr as u64) as *mut std::ffi::c_void)
 }
 
 /// Base address of a module loaded in a WOW64 target, found through the 32-bit PEB.
@@ -818,7 +1129,10 @@ fn peb32_module_base(proc: *mut std::ffi::c_void, want: &str) -> Result<u64, Str
                 }
             }
         }
-        link = read_remote_u32(proc, link).unwrap_or(0) as u64;
+        link = match read_remote_u32(proc, link) {
+            Some(next) => next as u64,
+            None => break, // unreadable entry: stop rather than spin
+        };
     }
     eprintln!("inject: 模块链遍历 {seen} 个条目仍未匹配 {want}");
     Err(format!("32 位目标中未找到 {want}"))

@@ -125,7 +125,10 @@ pub fn inject_test(pid: u32) -> i32 {
         Ok(()) => {
             println!("inject-test: 注入成功");
             std::thread::sleep(std::time::Duration::from_millis(800));
-            let loaded = is_module_loaded(pid, "monitor_hook");
+            // Verify through the API that also works for WOW64 targets: the previous
+            // Toolhelp-based check reported "not loaded" even for a successful 64-bit
+            // injection, so it was measuring its own offset bug, not the injection.
+            let loaded = crate::inject::is_dll_loaded(pid, "monitor_hook");
             println!("inject-test: 模块已加载 = {loaded}");
             if loaded {
                 0

@@ -1,0 +1,11 @@
+﻿# Static CRT for the injected hook DLLs.
+#
+# The hook DLL is loaded into other programs' processes. Those processes may not have
+# the Visual C++ redistributable visible, so a DLL importing VCRUNTIME140.dll can fail
+# to load there even when it loads fine in ours (measured: LoadLibraryW returned NULL
+# in the target while rundll32 loaded the same DLL successfully).
+[target.i686-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

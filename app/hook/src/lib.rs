@@ -1308,6 +1308,7 @@ unsafe fn worker() {
         std::thread::sleep(std::time::Duration::from_millis(3000));
         unsafe { patch_all() };
     });
+    dbg_note("worker ready");
 }
 
 #[no_mangle]
@@ -1317,10 +1318,44 @@ extern "system" fn DllMain(
     _reserved: *mut std::ffi::c_void,
 ) -> i32 {
     if reason == 1 {
-        // DLL_PROCESS_ATTACH: do nothing heavy under the loader lock; the worker
-        // thread resolves the API addresses and patches the IATs.
+        // DLL_PROCESS_ATTACH.
+        //
+        // Nothing here may allocate or format: the loader holds the loader lock, and a
+        // statically linked CRT has not finished its own initialisation for this module.
+        // A fault here makes LoadLibrary return NULL, which is exactly the failure seen
+        // when the DLL was force-loaded into a WOW64 target ("LoadLibraryA 返回 -1").
+        //
+        // So: store the base, start the worker with the raw CreateThread API, and return.
+        // Everything that allocates, formats or takes locks runs in the worker.
         DLL_BASE.store(dll_base as usize, Ordering::Relaxed);
-        std::thread::spawn(|| unsafe { worker() });
+        unsafe {
+            extern "system" {
+                fn CreateThread(
+                    sa: *mut std::ffi::c_void,
+                    stack: usize,
+                    start: unsafe extern "system" fn(*mut std::ffi::c_void) -> u32,
+                    param: *mut std::ffi::c_void,
+                    flags: u32,
+                    tid: *mut u32,
+                ) -> *mut std::ffi::c_void;
+                fn CloseHandle(h: *mut std::ffi::c_void) -> i32;
+            }
+            unsafe extern "system" fn thread_main(_: *mut std::ffi::c_void) -> u32 {
+                worker();
+                0
+            }
+            let h = CreateThread(
+                std::ptr::null_mut(),
+                0,
+                thread_main,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+            );
+            if !h.is_null() {
+                CloseHandle(h);
+            }
+        }
     }
     1
 }
