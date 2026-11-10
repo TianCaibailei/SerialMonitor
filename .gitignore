@@ -1,0 +1,26 @@
+# Build output — never versioned
+target/
+app/target/
+*.exe
+*.dll
+*.pdb
+*.lib
+*.rlib
+*.rmeta
+*.obj
+*.exp
+*.ilk
+*.lastbuildstate
+*.tlog
+*.idb
+
+# Craft Anything session / run artefacts
+agent-session.jsonl
+build-activity.log
+feed.json
+usage.json
+
+# Local scratch
+*.log
+*.tmp
+.um_hook_debug

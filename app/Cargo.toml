@@ -1,0 +1,19 @@
+[package]
+name = "universal_monitor"
+version = "1.0.0"
+edition = "2021"
+
+[dependencies]
+eframe = "0.28"
+egui = "0.28"
+egui_extras = "0.28"
+egui_plot = "0.28"
+serialport = "4.2"
+encoding_rs = "0.8"
+
+[profile.release]
+opt-level = 2
+
+[workspace]
+members = ["hook"]
+
