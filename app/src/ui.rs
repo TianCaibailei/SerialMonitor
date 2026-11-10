@@ -982,16 +982,26 @@ impl MonitorApp {
             // so it belongs in the always-visible status bar.
             ui.separator();
             if self.drv_rx.is_some() {
-                let n = self.drv_ports.len().max(1);
+                // 端口数用已建立的通道数而不是端口表长度：用户关心的是「能看到几个端口的
+                // 数据」，表里可能包含还没有任何流量的端口。
+                let n = self.drv_ports.len().max(self.drv_names.len());
                 ui.label(
                     RichText::new(format!("驱动：捕获中（{n} 个端口）"))
                         .color(C_RX)
                         .strong(),
                 );
-            } else if crate::driver::DriverHandle::is_available() {
-                ui.label(RichText::new("驱动：已安装（未启用）").color(C_REQ));
+            } else if !self.drv_checked {
+                ui.label(RichText::new("驱动：未启用").color(Color32::GRAY));
+            } else if self.drv_avail {
+                ui.label(RichText::new("驱动：未启用").color(C_REQ));
             } else {
-                ui.label(RichText::new("驱动：未安装").color(Color32::GRAY));
+                // 红色 + 明确指路：驱动没加载时，菜单里的「启用驱动捕获」是唯一的下一步。
+                ui.label(RichText::new("驱动：未安装").color(C_FAIL).strong());
+                ui.label(
+                    RichText::new("（菜单 监控 → 启用驱动捕获，或看「驱动捕获设置…」）")
+                        .small()
+                        .color(Color32::GRAY),
+                );
             }
         });
     }
@@ -1556,6 +1566,221 @@ impl MonitorApp {
                 .show(ctx, |ui| {
                     self.dlg_attach_ui(ui);
                 });
+        }
+        if self.dlg_drv {
+            Window::new("驱动捕获设置")
+                .collapsible(false)
+                .resizable(true)
+                .default_width(560.0)
+                .show(ctx, |ui| {
+                    self.dlg_driver_ui(ui);
+                });
+        }
+    }
+
+    /// 驱动捕获设置对话框。
+    ///
+    /// 为什么要有这个对话框：驱动捕获的失败模式（没装、签名被拒、无端口、PID 填错）
+    /// 各不相同，而菜单里的一键启用只能给出「成功/失败」。这里把驱动状态、端口表、
+    /// PID 过滤和启停放在同一处，用户不用去翻文档就知道下一步该做什么。
+    fn dlg_driver_ui(&mut self, ui: &mut Ui) {
+        // 首帧或用户手动刷新后重新探测；对话框打开时探测失败不会影响已开始的捕获。
+        if !self.drv_checked {
+            self.probe_driver_availability(true);
+        }
+        let capturing = self.drv_rx.is_some();
+
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("驱动状态:").strong());
+            if capturing {
+                ui.label(RichText::new("捕获已启动").color(C_RX).strong());
+            } else if self.drv_avail {
+                ui.label(RichText::new("可用（未启动捕获）").color(C_REQ).strong());
+            } else {
+                ui.label(RichText::new("不可用").color(C_FAIL).strong());
+            }
+            if ui.button("重新检测").clicked() {
+                self.probe_driver_availability(true);
+            }
+        });
+        ui.label(
+            RichText::new(format!("控制设备: {}", crate::driver::CHANNEL_NAME))
+                .small()
+                .color(Color32::GRAY),
+        );
+
+        // --- 不可用时的可操作指引 ---
+        if !self.drv_avail && !capturing {
+            let err = self.drv_err;
+            let hint = crate::driver::open_failure_hint(err);
+            ui.separator();
+            ui.label(RichText::new("如何让它可用：").strong());
+            ScrollArea::vertical().id_source("drv_hint").max_height(170.0).show(ui, |ui| {
+                // 文案里带命令，用等宽字体才对得上复制粘贴时的空格。
+                ui.monospace(hint);
+            });
+            if ui.button("复制安装命令").clicked() {
+                let cmd = "sc create UmSerialFilter type= kernel binPath= <umserialfilter.sys 完整路径>\r\nsc start UmSerialFilter\r\nsc query UmSerialFilter";
+                ui.output_mut(|o| o.copied_text = cmd.to_string());
+            }
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(
+                    "提示：加载内核驱动必须管理员权限；本软件不需要自己提权，\
+                     只需以管理员身份启动本程序或手动执行上面的命令。",
+                )
+                .small()
+                .weak(),
+            );
+        }
+
+        // --- 端口表 ---
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("已附加端口:").strong());
+            ui.label(
+                RichText::new(format!("{} 个", self.drv_names.len()))
+                    .small()
+                    .color(Color32::GRAY),
+            );
+            if ui.button("重新扫描端口").clicked() {
+                self.rescan_driver_ports();
+            }
+        });
+        if self.drv_names.is_empty() {
+            ui.label(
+                RichText::new("(没有端口) 驱动已加载但没有找到串口设备，插拔一次串口设备后再扫描").weak(),
+            );
+        } else {
+            let mut rows: Vec<(u32, String)> = self
+                .drv_names
+                .iter()
+                .map(|(i, d)| (*i, d.clone()))
+                .collect();
+            rows.sort_by_key(|(i, _)| *i);
+            ScrollArea::vertical().id_source("drv_ports").max_height(130.0).show(ui, |ui| {
+                egui::Grid::new("drv_port_grid").striped(true).show(ui, |ui| {
+                    ui.strong("序号");
+                    ui.strong("设备路径");
+                    ui.strong("短名");
+                    ui.strong("会话通道");
+                    ui.end_row();
+                    for (idx, dev) in rows {
+                        ui.monospace(idx.to_string());
+                        ui.monospace(&dev);
+                        ui.label(short_dev(&dev));
+                        let linked = self.drv_ports.iter().any(|((_, pi), _)| *pi == idx);
+                        if linked {
+                            ui.label(RichText::new("已接入").color(C_RX));
+                        } else {
+                            ui.label(RichText::new("等待数据").weak());
+                        }
+                        ui.end_row();
+                    }
+                });
+            });
+        }
+
+        // --- PID 过滤 ---
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label("PID 过滤:");
+            ui.add(
+                TextEdit::singleline(&mut self.drv_pid_text)
+                    .hint_text("0 = 捕获所有进程")
+                    .desired_width(120.0),
+            );
+            if ui.button("应用").clicked() {
+                let pid: u32 = self.drv_pid_text.trim().parse().unwrap_or(0);
+                self.apply_driver_pid(pid);
+            }
+            if ui.button("所有进程").clicked() {
+                self.drv_pid_text = "0".into();
+                self.apply_driver_pid(0);
+            }
+            let cur = self.drv_pid.unwrap_or(0);
+            ui.label(
+                RichText::new(if cur == 0 {
+                    "当前: 所有进程".to_string()
+                } else {
+                    format!("当前: PID {cur}")
+                })
+                .small()
+                .color(Color32::GRAY),
+            );
+        });
+        ui.label(
+            RichText::new("PID 过滤只影响驱动捕获；改成某个 PID 后，其它进程的串口流量不再入库。")
+                .small()
+                .weak(),
+        );
+
+        // --- 启停 ---
+        ui.separator();
+        ui.horizontal(|ui| {
+            if capturing {
+                if ui.button("停止捕获").clicked() {
+                    self.stop_driver_capture();
+                    self.drv_note = "驱动捕获已停止".into();
+                    self.toast("已停止驱动捕获");
+                }
+            } else if ui
+                .add_enabled(self.drv_avail, egui::Button::new("开始捕获"))
+                .clicked()
+            {
+                if self.start_driver_capture() {
+                    self.toast("驱动捕获已启动");
+                } else {
+                    self.probe_driver_availability(true);
+                    self.toast("驱动不可用，请按上面的指引安装");
+                }
+            }
+            if ui.button("关闭").clicked() {
+                self.dlg_drv = false;
+            }
+        });
+        if !self.drv_note.is_empty() {
+            ui.add_space(4.0);
+            ScrollArea::vertical().id_source("drv_note").max_height(90.0).show(ui, |ui| {
+                ui.label(RichText::new(&self.drv_note).small());
+            });
+        }
+    }
+
+    /// 应用 PID 过滤。捕获中走线程命令（设备被线程独占，UI 侧没有句柄）。
+    fn apply_driver_pid(&mut self, pid: u32) {
+        self.drv_pid = if pid == 0 { None } else { Some(pid) };
+        if let Some(tx) = &self.drv_cmd {
+            let _ = tx.send(DrvCmd::SetTarget(pid));
+            self.drv_note = if pid == 0 {
+                "已切换为捕获所有进程".into()
+            } else {
+                format!("已把驱动捕获目标设为 PID {pid}")
+            };
+            self.toast(self.drv_note.clone());
+            return;
+        }
+        // 未捕获：直接设一次，让下一次 start 之前驱动就按新条件工作。
+        match crate::driver::DriverHandle::open() {
+            Some(h) => {
+                h.set_target(pid);
+                self.drv_avail = true;
+                self.drv_err = 0;
+                self.drv_note = if pid == 0 {
+                    "已设置：捕获所有进程".into()
+                } else {
+                    format!("已设置：仅捕获 PID {pid}")
+                };
+                self.toast(self.drv_note.clone());
+            }
+            None => {
+                let err = crate::driver::last_error();
+                self.drv_avail = false;
+                self.drv_err = err;
+                self.drv_checked = true;
+                self.drv_note = crate::driver::open_failure_hint(err);
+                self.toast("驱动不可用，PID 设置未生效");
+            }
         }
     }
 
