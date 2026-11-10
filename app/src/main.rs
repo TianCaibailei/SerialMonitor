@@ -47,6 +47,11 @@ fn parse_args() -> Option<String> {
             }
             std::process::exit(headless::headless_watch(&port, &result));
         }
+        // --inject-test <pid> — inject the architecture-correct hook DLL and verify
+        if args[i] == "--inject-test" {
+            let pid: u32 = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(0);
+            std::process::exit(diag::inject_test(pid));
+        }
         // --handles-self — verify the handle snapshot contains our own handles
         if args[i] == "--handles-self" {
             std::process::exit(diag::handles_self());

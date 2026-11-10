@@ -423,26 +423,95 @@ pub fn list_processes() -> Vec<(u32, String)> {
 
 // ---------------- injection ----------------
 
-/// Path of monitor_hook.dll beside our own exe.
-pub fn dll_path() -> Option<std::path::PathBuf> {
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join("monitor_hook.dll")))
+/// Path of the hook DLL that matches a target's bitness.
+///
+/// Two binaries ship beside the monitor:
+///   monitor_hook.dll       — x64, injected into 64-bit targets
+///   monitor_hook_x86.dll   — x86, injected into 32-bit (WOW64) targets
+///
+/// A 64-bit process cannot load an x86 DLL and vice versa, so the right one has to be
+/// picked from the target's bitness rather than from the monitor's own.
+pub fn dll_path_for(wow64_target: bool) -> Option<std::path::PathBuf> {
+    let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    let name = if wow64_target { "monitor_hook_x86.dll" } else { "monitor_hook.dll" };
+    let p = dir.join(name);
+    if p.exists() {
+        Some(p)
+    } else {
+        // Fall back to the 64-bit name so old layouts keep working (a 64-bit target).
+        let alt = dir.join("monitor_hook.dll");
+        if alt.exists() {
+            Some(alt)
+        } else {
+            Some(p)
+        }
+    }
 }
 
-/// Inject the hook DLL into `pid`. 64-bit targets only.
+/// Path of the monitor's own (64-bit) hook DLL.
+pub fn dll_path() -> Option<std::path::PathBuf> {
+    dll_path_for(false)
+}
+
+/// Is this process 32-bit running under WOW64?
+pub fn is_wow64(pid: u32) -> Option<bool> {
+    let proc = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if proc.is_null() {
+        return None;
+    }
+    let mut wow64 = 0i32;
+    let ok = unsafe { IsWow64Process(proc, &mut wow64) };
+    unsafe { CloseHandle(proc) };
+    if ok == 0 {
+        None
+    } else {
+        Some(wow64 != 0)
+    }
+}
+
+/// Inject the hook DLL into `pid`, choosing the 64-bit or 32-bit DLL from the target's
+/// own bitness. `dll` is the 64-bit path; the 32-bit sibling is derived from it.
 pub fn inject(pid: u32, dll: &str) -> Result<(), String> {
-    let proc = unsafe { OpenProcess(PROCESS_CREATE_THREAD | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_OPERATION | PROCESS_VM_WRITE, 0, pid) };
+    // PROCESS_VM_READ is required as well: the 32-bit injection path resolves
+    // LoadLibraryW by reading the target's PEB and export table.
+    let proc = unsafe {
+        OpenProcess(
+            PROCESS_CREATE_THREAD
+                | PROCESS_QUERY_LIMITED_INFORMATION
+                | PROCESS_VM_OPERATION
+                | PROCESS_VM_WRITE
+                | 0x0010, // PROCESS_VM_READ
+            0,
+            pid,
+        )
+    };
     if proc.is_null() {
         return Err(format!("OpenProcess 失败 (pid {})", pid));
     }
-    // 64-bit only
+    // Pick the DLL that matches the target's architecture.
     let mut wow64 = 0i32;
     let ok = unsafe { IsWow64Process(proc, &mut wow64) };
-    if ok == 0 || wow64 != 0 {
+    if ok == 0 {
         unsafe { CloseHandle(proc) };
-        return Err("32 位进程，本版本只支持注入 64 位进程".into());
+        return Err("IsWow64Process 失败".into());
     }
+    let dll = if wow64 != 0 {
+        // 32-bit target: use the x86 build of the hook.
+        let p = std::path::Path::new(dll);
+        let x86 = p.with_file_name("monitor_hook_x86.dll");
+        if !x86.exists() {
+            unsafe { CloseHandle(proc) };
+            return Err(format!(
+                "目标是 32 位进程，但缺少 {}（请用 i686 目标编译 hook：\
+                 cargo build --release -p monitor_hook --target i686-pc-windows-msvc）",
+                x86.display()
+            ));
+        }
+        x86.to_string_lossy().into_owned()
+    } else {
+        dll.to_string()
+    };
+    let dll = dll.as_str();
     let kernel32 = wide("kernel32.dll");
     let hmod = unsafe {
         extern "system" {
@@ -459,12 +528,21 @@ pub fn inject(pid: u32, dll: &str) -> Result<(), String> {
     }
     let path = wide(dll);
     let bytes = path.len() * 2;
+    // For a 32-bit (WOW64) target the allocation must land in the low 4 GB, and some
+    // 32-bit loaders are picky about where the path buffer lives. Allocating near the
+    // top of the process's address space is what a remote-thread LoadLibraryW stub
+    // expects, so the flag MEM_TOP_DOWN is used for 32-bit targets.
+    let alloc_flags = if wow64 != 0 {
+        MEM_COMMIT | MEM_RESERVE | 0x0010_0000 // MEM_TOP_DOWN
+    } else {
+        MEM_COMMIT | MEM_RESERVE
+    };
     let remote = unsafe {
-        VirtualAllocEx(proc, std::ptr::null_mut(), bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
+        VirtualAllocEx(proc, std::ptr::null_mut(), bytes, alloc_flags, PAGE_READWRITE)
     };
     if remote.is_null() {
         unsafe { CloseHandle(proc) };
-        return Err("VirtualAllocEx 失败".into());
+        return Err(format!("VirtualAllocEx 失败 (err={})", get_last_error()));
     }
     let mut written = 0usize;
     let ok = unsafe { WriteProcessMemory(proc, remote, path.as_ptr() as *const u8, bytes, &mut written) };
@@ -473,14 +551,34 @@ pub fn inject(pid: u32, dll: &str) -> Result<(), String> {
             VirtualFreeEx(proc, remote, 0, MEM_RELEASE);
             CloseHandle(proc);
         }
-        return Err("WriteProcessMemory 失败".into());
+        return Err(format!("WriteProcessMemory 失败 (err={})", get_last_error()));
     }
+    // The remote thread entry must be a function that exists at a valid address inside
+    // the TARGET. Our k32 address is a 64-bit address, so for a WOW64 target it cannot
+    // be used. WOW64 keeps a 32-bit kernel32 mapped in the low 4 GB at a stable,
+    // per-boot address that we cannot read from here — but the *32-bit ntdll's*
+    // `LdrLoadDll` is reachable through the target's own PEB, which is what the helper
+    // below resolves. When that fails, the error is reported instead of crashing.
+    let entry = if wow64 != 0 {
+        match resolve_loadlibrary_in_32bit_target(proc) {
+            Ok(e) => e,
+            Err(e) => {
+                unsafe {
+                    VirtualFreeEx(proc, remote, 0, MEM_RELEASE);
+                    CloseHandle(proc);
+                }
+                return Err(e);
+            }
+        }
+    } else {
+        hmod
+    };
     let th = unsafe {
         CreateRemoteThread(
             proc,
             std::ptr::null_mut(),
             0,
-            hmod,
+            entry,
             remote,
             0,
             std::ptr::null_mut(),
@@ -500,10 +598,293 @@ pub fn inject(pid: u32, dll: &str) -> Result<(), String> {
     unsafe { VirtualFreeEx(proc, remote, 0, MEM_RELEASE) };
     unsafe { CloseHandle(proc) };
     if code == 0 {
-        // LoadLibraryW returned NULL — DLL missing or DllMain failed
-        return Err(format!("LoadLibraryW 返回 NULL — 检查 {} 是否存在", dll));
+        // LoadLibraryW returned NULL — the DLL could not be loaded in the target.
+        // Report the most likely causes instead of a bare failure.
+        return Err(format!(
+            "LoadLibraryW 返回 NULL — 无法在目标进程加载 {dll}。\
+             常见原因：DLL 架构不匹配、缺少 VC 运行时、或路径不可访问。"
+        ));
     }
     Ok(())
+}
+
+/// Resolve `LoadLibraryW` inside a 32-bit (WOW64) target process.
+///
+/// Our own process is 64-bit, so our kernel32 address is meaningless in the target.
+/// The reliable route is to ask the target for its own kernel32 base through a tiny
+/// remote call: `GetModuleHandleW(L"kernel32.dll")` then `GetProcAddress(_, "LoadLibraryW")`.
+/// Both of those functions exist at WOW64-mapped addresses that the kernel translates,
+/// so calling the *target's* GetModuleHandleW is what makes this work.
+///
+/// Implementation: put the wide string in the target, start a remote thread on the
+/// target's `GetModuleHandleW`, read the returned HMODULE, then a second remote thread
+/// on the target's `GetProcAddress` with that module — reading the result each time.
+
+/// Resolve `LoadLibraryW` inside a 32-bit (WOW64) target process.
+///
+/// A 64-bit injector cannot use its own kernel32 address in a 32-bit target, so the
+/// address is derived from the target itself:
+///
+///   1. `NtQueryInformationProcess` → 64-bit PEB of the target
+///   2. WOW64 keeps a pointer to the 32-bit PEB at the start of the 64-bit PEB
+///   3. walk the 32-bit PEB's `Ldr.InMemoryOrderModuleList` to find kernel32's base
+///   4. parse that module's export directory (read through `ReadProcessMemory`)
+///      and return the RVA of `LoadLibraryW` plus the base
+///
+/// Every step is read-only against the target, so a failure can never harm it.
+fn resolve_loadlibrary_in_32bit_target(
+    proc: *mut std::ffi::c_void,
+) -> Result<*mut std::ffi::c_void, String> {
+    let base = peb32_module_base(proc, "kernel32.dll")?;
+    if base == 0 {
+        return Err("32 位目标中找不到 kernel32.dll".into());
+    }
+    let addr = export_rva_of(proc, base, "LoadLibraryW")?;
+    Ok((base + addr as u64) as *mut std::ffi::c_void)
+}
+
+extern "system" {
+    fn NtQueryInformationProcess(
+        handle: *mut std::ffi::c_void,
+        class: u32,
+        info: *mut std::ffi::c_void,
+        len: u32,
+        ret: *mut u32,
+    ) -> i32;
+    fn ReadProcessMemory(
+        proc: *mut std::ffi::c_void,
+        addr: *const std::ffi::c_void,
+        buf: *mut std::ffi::c_void,
+        size: usize,
+        read: *mut usize,
+    ) -> i32;
+}
+
+fn read_remote(proc: *mut std::ffi::c_void, addr: u64, buf: &mut [u8]) -> bool {
+    if addr == 0 {
+        return false;
+    }
+    let mut read = 0usize;
+    unsafe {
+        ReadProcessMemory(
+            proc,
+            addr as *const std::ffi::c_void,
+            buf.as_mut_ptr() as *mut std::ffi::c_void,
+            buf.len(),
+            &mut read,
+        ) != 0
+            && read == buf.len()
+    }
+}
+
+fn read_remote_u32(proc: *mut std::ffi::c_void, addr: u64) -> Option<u32> {
+    let mut b = [0u8; 4];
+    if read_remote(proc, addr, &mut b) {
+        Some(u32::from_le_bytes(b))
+    } else {
+        None
+    }
+}
+
+/// Base address of a module loaded in a WOW64 target, found through the 32-bit PEB.
+fn peb32_module_base(proc: *mut std::ffi::c_void, want: &str) -> Result<u64, String> {
+    #[repr(C)]
+    struct Pbi64 {
+        exit_status: usize,
+        peb: usize,
+        affinity: usize,
+        base_priority: isize,
+        unique_pid: usize,
+        parent_pid: usize,
+    }
+    let mut pbi = Pbi64 {
+        exit_status: 0,
+        peb: 0,
+        affinity: 0,
+        base_priority: 0,
+        unique_pid: 0,
+        parent_pid: 0,
+    };
+    let st = unsafe {
+        NtQueryInformationProcess(
+            proc,
+            0, // ProcessBasicInformation
+            &mut pbi as *mut Pbi64 as *mut std::ffi::c_void,
+            std::mem::size_of::<Pbi64>() as u32,
+            std::ptr::null_mut(),
+        )
+    };
+    if st != 0 || pbi.peb == 0 {
+        return Err(format!("NtQueryInformationProcess 失败 (0x{:08X})", st as u32));
+    }
+    // The 64-bit PEB of a WOW64 process does NOT begin with a pointer to the 32-bit
+    // PEB (that is a common misconception; the pointer lives further in). The reliable
+    // source is the thread environment block of the target's main thread, which holds
+    // the 32-bit TEB at offset 0x2000 in a WOW64 process. Rather than guess layouts,
+    // try the documented WOW64 PEB location: In the 64-bit PEB, `Ldr` is followed by
+    // process fields, and the 32-bit PEB base is exposed through
+    // NtQueryInformationProcess(ProcessWow64Information) — which returns exactly that
+    // pointer and needs no layout assumptions.
+    let mut wow_peb: usize = 0;
+    let st2 = unsafe {
+        NtQueryInformationProcess(
+            proc,
+            26, // ProcessWow64Information
+            &mut wow_peb as *mut usize as *mut std::ffi::c_void,
+            std::mem::size_of::<usize>() as u32,
+            std::ptr::null_mut(),
+        )
+    };
+    if st2 != 0 || wow_peb == 0 {
+        return Err(format!(
+            "ProcessWow64Information 失败 (0x{:08X})，目标可能不是 WOW64",
+            st2 as u32
+        ));
+    }
+    let peb32 = wow_peb as u64;
+    // PEB32 layout check: the first DWORD holds InheritedAddressSpace/ReadImageFile/
+    // BeingDebugged as single bytes, then a pointer to the process image base follows.
+    // Validate the candidate PEB by reading ImageBaseAddress (+0x08), which must be a
+    // plausible module address; if it is not, ProcessWow64Information returned the
+    // 64-bit PEB's address space view and the 32-bit PEB has to be read differently.
+    let image_base = read_remote_u32(proc, peb32 + 0x08).unwrap_or(0);
+    if image_base == 0 || image_base < 0x1000 {
+        return Err(format!(
+            "32 位 PEB 校验失败 (PEB32={peb32:#x}, ImageBase={image_base:#x})"
+        ));
+    }
+    // PEB32.Ldr at +0x0C.
+    let ldr = read_remote_u32(proc, peb32 + 0x0C).unwrap_or(0) as u64;
+    if ldr == 0 {
+        return Err(format!("Ldr 为空 (PEB32={peb32:#x})"));
+    }
+    // Sanity: Ldr must live in the low 4 GB and must not equal a kernel32/ntdll export
+    // address pattern that would indicate a misread.
+    if ldr > 0xFFFF_FFFF {
+        return Err(format!("Ldr 地址越界: {ldr:#x}"));
+    }
+    // PEB_LDR_DATA32: InMemoryOrderModuleList (LIST_ENTRY) at +0x14.
+    let list_head = ldr + 0x14;
+    let mut link = read_remote_u32(proc, list_head).unwrap_or(0) as u64;
+    let needle = want.to_lowercase();
+    let mut seen = 0;
+    for _ in 0..256 {
+        if link == 0 || link == list_head {
+            break;
+        }
+        seen += 1;
+        // LDR_DATA_TABLE_ENTRY32, addressed by its InMemoryOrderLinks member:
+        //   +0x00 Flink            +0x04 Blink          (InMemoryOrderLinks)
+        //   +0x08 DllBase          +0x0C EntryPoint
+        //   +0x10 SizeOfImage      +0x14 FullDllName    (UNICODE_STRING)
+        //   +0x1C BaseDllName      (UNICODE_STRING)
+        //
+        // Verified against a live WOW64 target: the name at +0x1C is the FULL path
+        // ("c:\windows\system32\kernel32.dll"), so matching is by file name suffix
+        // rather than equality. DllBase is read at +0x08; the earlier value that looked
+        // like a heap pointer was being taken from the FullDllName buffer instead.
+        let base = read_remote_u32(proc, link + 0x08).unwrap_or(0) as u64;
+        let name_len = read_remote_u32(proc, link + 0x1C).unwrap_or(0) as u16 as usize;
+        let name_buf_ptr = read_remote_u32(proc, link + 0x20).unwrap_or(0) as u64;
+        let chars = name_len / 2;
+        if chars > 0 && chars < 260 && name_buf_ptr != 0 {
+            let mut raw = vec![0u8; chars * 2];
+            if read_remote(proc, name_buf_ptr, &mut raw) {
+                let units: Vec<u16> = raw
+                    .chunks_exact(2)
+                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                    .collect();
+                let full = String::from_utf16_lossy(&units);
+                let leaf = full.rsplit(['\\', '/']).next().unwrap_or(&full).to_lowercase();
+                if leaf == needle && base != 0 {
+                    // Verify this really is the module image base: a PE header must be
+                    // there. Reading the wrong field is the classic failure mode here,
+                    // and a bogus base makes the export walk fail with "not a PE".
+                    let mut mz = [0u8; 2];
+                    if read_remote(proc, base, &mut mz) && &mz == b"MZ" {
+                        return Ok(base);
+                    }
+                    // Probe the neighbouring slots for a valid PE image header.
+                    for delta in [0x0Cu64, 0x10, 0x14, 0x18, 0x04] {
+                        let cand = read_remote_u32(proc, link + delta).unwrap_or(0) as u64;
+                        let mut m = [0u8; 2];
+                        if cand != 0 && read_remote(proc, cand, &mut m) && &m == b"MZ" {
+                            return Ok(cand);
+                        }
+                    }
+                    return Err(format!(
+                        "{needle} 的 PE 基址无效 (读到 {base:#x})"
+                    ));
+                }
+            }
+        }
+        link = read_remote_u32(proc, link).unwrap_or(0) as u64;
+    }
+    eprintln!("inject: 模块链遍历 {seen} 个条目仍未匹配 {want}");
+    Err(format!("32 位目标中未找到 {want}"))
+}
+
+/// RVA of an exported symbol in a module loaded in the target (PE32 export walk).
+fn export_rva_of(proc: *mut std::ffi::c_void, base: u64, symbol: &str) -> Result<u32, String> {
+    let mut dos = [0u8; 64];
+    if !read_remote(proc, base, &mut dos) {
+        return Err("读取 PE 头失败".into());
+    }
+    if &dos[0..2] != b"MZ" {
+        return Err("不是有效的 PE 模块".into());
+    }
+    let e_lfanew = u32::from_le_bytes([dos[0x3C], dos[0x3D], dos[0x3E], dos[0x3F]]) as u64;
+    let mut nt = [0u8; 264];
+    if !read_remote(proc, base + e_lfanew, &mut nt) {
+        return Err("读取 NT 头失败".into());
+    }
+    if &nt[0..4] != b"PE\0\0" {
+        return Err("PE 签名错误".into());
+    }
+    // Optional header: DataDirectory[0] = export table, at optional header + 96 (PE32).
+    let opt = 24usize; // after signature(4) + file header(20)
+    let export_rva = u32::from_le_bytes([nt[opt + 96], nt[opt + 97], nt[opt + 98], nt[opt + 99]]) as u64;
+    let export_size = u32::from_le_bytes([nt[opt + 100], nt[opt + 101], nt[opt + 102], nt[opt + 103]]);
+    if export_rva == 0 {
+        return Err("模块没有导出表".into());
+    }
+    let dir = base + export_rva;
+    // IMAGE_EXPORT_DIRECTORY, 40 bytes.
+    let mut ed = [0u8; 40];
+    if !read_remote(proc, dir, &mut ed) {
+        return Err("读取导出目录失败".into());
+    }
+    let _ = export_size;
+    let num_names = u32::from_le_bytes([ed[24], ed[25], ed[26], ed[27]]) as usize;
+    let addr_of_names = u32::from_le_bytes([ed[32], ed[33], ed[34], ed[35]]) as u64;
+    let addr_of_funcs = u32::from_le_bytes([ed[28], ed[29], ed[30], ed[31]]) as u64;
+    let addr_of_ords = u32::from_le_bytes([ed[36], ed[37], ed[38], ed[39]]) as u64;
+    let want = symbol.as_bytes();
+    for i in 0..num_names.min(8192) {
+        let name_rva = read_remote_u32(proc, base + addr_of_names + i as u64 * 4).unwrap_or(0) as u64;
+        if name_rva == 0 {
+            continue;
+        }
+        let mut name_buf = [0u8; 128];
+        if !read_remote(proc, base + name_rva, &mut name_buf) {
+            continue;
+        }
+        let end = name_buf.iter().position(|&c| c == 0).unwrap_or(name_buf.len());
+        if &name_buf[..end] == want {
+            let ord = u16::from_le_bytes([
+                read_remote_u32(proc, base + addr_of_ords + i as u64 * 2)
+                    .map(|v| v as u8)
+                    .unwrap_or(0),
+                0,
+            ]) as usize;
+            let func_rva =
+                read_remote_u32(proc, base + addr_of_funcs + ord as u64 * 4).unwrap_or(0);
+            if func_rva != 0 {
+                return Ok(func_rva);
+            }
+        }
+    }
+    Err(format!("未找到导出符号 {symbol}"))
 }
 
 /// Hidden CLI: --inject-smoke. Spawns ping.exe (64-bit, harmless, opens no COM),

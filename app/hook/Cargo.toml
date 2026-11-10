@@ -5,3 +5,12 @@ edition = "2021"
 
 [lib]
 crate-type = ["cdylib"]
+
+# This crate is built for BOTH architectures:
+#   cargo build --release -p monitor_hook --target x86_64-pc-windows-msvc
+#   cargo build --release -p monitor_hook --target i686-pc-windows-msvc
+#
+# A 64-bit DLL is injected into 64-bit targets and the 32-bit DLL into 32-bit
+# (WOW64) targets: the PE machine type, pointer width and calling convention all
+# differ, so one binary cannot serve both.
+

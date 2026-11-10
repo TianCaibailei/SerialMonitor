@@ -103,6 +103,97 @@ pub fn handles_self() -> i32 {
     }
 }
 
+/// --inject-test <pid> — inject the right hook DLL (x64 or x86) into a process and
+/// report whether it loaded. Verifies the 32-bit path without needing the UI.
+pub fn inject_test(pid: u32) -> i32 {
+    let wow = crate::inject::is_wow64(pid);
+    println!("inject-test: PID {pid} 32位(WOW64) = {wow:?}");
+    let dll = match wow {
+        Some(true) => crate::inject::dll_path_for(true),
+        _ => crate::inject::dll_path_for(false),
+    };
+    let Some(dll) = dll else {
+        println!("inject-test: 找不到 hook DLL");
+        return 1;
+    };
+    println!("inject-test: 使用 DLL = {}", dll.display());
+    if !dll.exists() {
+        println!("inject-test: DLL 不存在");
+        return 1;
+    }
+    match crate::inject::inject(pid, &dll.to_string_lossy()) {
+        Ok(()) => {
+            println!("inject-test: 注入成功");
+            std::thread::sleep(std::time::Duration::from_millis(800));
+            let loaded = is_module_loaded(pid, "monitor_hook");
+            println!("inject-test: 模块已加载 = {loaded}");
+            if loaded {
+                0
+            } else {
+                1
+            }
+        }
+        Err(e) => {
+            println!("inject-test: 注入失败: {e}");
+            1
+        }
+    }
+}
+
+/// Is a module whose name starts with `prefix` loaded in `pid`?
+///
+/// Uses MODULEENTRY32W with the same 44-byte header padding as PROCESSENTRY32W
+/// (measured empirically: szModule begins at offset 44 on x64).
+fn is_module_loaded(pid: u32, prefix: &str) -> bool {
+    extern "system" {
+        fn CreateToolhelp32Snapshot(flags: u32, pid: u32) -> *mut std::ffi::c_void;
+        fn Module32FirstW(snap: *mut std::ffi::c_void, me: *mut u8) -> i32;
+        fn Module32NextW(snap: *mut std::ffi::c_void, me: *mut u8) -> i32;
+        fn CloseHandle(h: *mut std::ffi::c_void) -> i32;
+    }
+    // MODULEENTRY32W is 1088 bytes on x64; szModule starts at offset 44.
+    const MODULE_OFF: usize = 44;
+    let mut buf = [0u8; 1088];
+    buf[0..4].copy_from_slice(&1088u32.to_le_bytes());
+    let snap = unsafe { CreateToolhelp32Snapshot(0x8, pid) };
+    if snap as isize == -1 {
+        return false;
+    }
+    let needle = prefix.to_lowercase();
+    let mut found = false;
+    if unsafe { Module32FirstW(snap, buf.as_mut_ptr()) } != 0 {
+        loop {
+            // Read szModule as UTF-16 from the known offset.
+            let mut units = Vec::new();
+            for i in 0..256usize {
+                let o = MODULE_OFF + i * 2;
+                if o + 1 >= buf.len() {
+                    break;
+                }
+                let u = u16::from_le_bytes([buf[o], buf[o + 1]]);
+                if u == 0 {
+                    break;
+                }
+                units.push(u);
+            }
+            let name = String::from_utf16_lossy(&units);
+            if name.to_lowercase().contains(&needle) {
+                found = true;
+                break;
+            }
+            // Zero the name area before the next entry so stale text cannot match.
+            for b in buf[MODULE_OFF..].iter_mut() {
+                *b = 0;
+            }
+            if unsafe { Module32NextW(snap, buf.as_mut_ptr()) } == 0 {
+                break;
+            }
+        }
+    }
+    unsafe { CloseHandle(snap) };
+    found
+}
+
 /// --holders <COMx>... — which processes hold these serial ports.
 pub fn holders(ports: &[String]) -> i32 {
     let (list, note) = crate::portowners::find_port_holders(ports);
