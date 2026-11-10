@@ -311,6 +311,11 @@ fn pipe_instance(tx: std::sync::mpsc::Sender<CapMsg>) {
 }
 
 // simple win32 GetLastError via a probe that sets it reliably
+/// Public: Win32 last-error for diagnostics in other modules.
+pub fn last_error() -> u32 {
+    get_last_error()
+}
+
 fn get_last_error() -> u32 {
     extern "system" {
         fn GetLastError() -> u32;

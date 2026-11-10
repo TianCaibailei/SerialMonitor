@@ -44,14 +44,14 @@ struct UnicodeString {
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct SystemHandleEntry {
-    object: usize,
-    unique_process_id: usize,
-    handle_value: usize,
-    granted_access: u32,
-    creator_back_trace_index: u16,
-    object_type_index: u16,
-    handle_attributes: u32,
-    reserved: u32,
+    pub object: usize,
+    pub unique_process_id: usize,
+    pub handle_value: usize,
+    pub granted_access: u32,
+    pub creator_back_trace_index: u16,
+    pub object_type_index: u16,
+    pub handle_attributes: u32,
+    pub reserved: u32,
 }
 
 const _: () = {
@@ -212,43 +212,47 @@ pub struct PortOwner {
 
 /// System-wide handle snapshot: (pid, handle) of every handle held by every process.
 fn snapshot_handles() -> Vec<SystemHandleEntry> {
-    let mut size: u32 = 1 << 20;
-    loop {
-        let mut buf: Vec<u8> = vec![0; size as usize];
+    const ENTRY: usize = std::mem::size_of::<SystemHandleEntry>();
+    const HDR: usize = std::mem::size_of::<SystemHandleInfoHeader>();
+    let mut size: usize = 4 << 20;
+    for _attempt in 0..6 {
+        let mut buf: Vec<u8> = vec![0; size];
         let mut ret: u32 = 0;
         let status = unsafe {
             NtQuerySystemInformation(
                 SYSTEM_HANDLE_INFORMATION,
                 buf.as_mut_ptr() as *mut std::ffi::c_void,
-                size,
+                size as u32,
                 &mut ret,
             )
         };
         if status == STATUS_INFO_LENGTH_MISMATCH {
-            size = (ret + (64 * 1024)).max(size * 2);
-            if size > 256 * 1024 * 1024 {
-                return Vec::new(); // absurd; give up rather than allocate forever
-            }
+            // Grow using the size the kernel asked for, plus headroom for the steady
+            // stream of handles being created while we allocate.
+            let want = (ret as usize).max(size);
+            size = want.saturating_mul(2).min(512 << 20);
             continue;
         }
         if status != 0 {
             return Vec::new();
         }
-        let hdr = buf.as_ptr() as *const SystemHandleInfoHeader;
-        let count = unsafe { (*hdr).number_of_handles };
-        let base = unsafe { buf.as_ptr().add(std::mem::size_of::<SystemHandleInfoHeader>()) }
-            as *const SystemHandleEntry;
-        // Never trust `count` beyond what the returned buffer can actually hold:
-        // a truncated or racing snapshot must be clipped, not read past.
-        let avail = (ret as usize).saturating_sub(std::mem::size_of::<SystemHandleInfoHeader>())
-            / std::mem::size_of::<SystemHandleEntry>();
-        let count = count.min(avail).min(buf.len() / std::mem::size_of::<SystemHandleEntry>());
+        // Address the buffer BEFORE it is dropped; compute the entry count from the
+        // header, bounded by the buffer that actually holds them.
+        let (count, base) = unsafe {
+            let hdr = buf.as_ptr() as *const SystemHandleInfoHeader;
+            let n = (*hdr).number_of_handles;
+            let b = buf.as_ptr().add(HDR) as *const SystemHandleEntry;
+            (n, b)
+        };
+        let max_by_buffer = size.saturating_sub(HDR) / ENTRY;
+        let count = count.min(max_by_buffer);
         let mut out = Vec::with_capacity(count);
         for i in 0..count {
             out.push(unsafe { *base.add(i) });
         }
         return out;
     }
+    Vec::new()
 }
 
 /// The object name behind a handle, if this handle names a device object.
@@ -318,6 +322,12 @@ fn object_name(pid: u32, handle: usize) -> Option<String> {
     }
     unsafe { CloseHandle(proc) };
     result
+}
+
+/// Public wrapper: the exe name of a PID (used by the port-owner scanner and the
+/// attach dialog).
+pub fn process_exe_of(pid: u32) -> String {
+    process_exe(pid)
 }
 
 fn process_exe(pid: u32) -> String {

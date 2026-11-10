@@ -34,6 +34,89 @@ pub fn list_procs() -> i32 {
     }
 }
 
+/// --handles-self: verify the handle snapshot really contains our own handles.
+/// Prints how many entries belong to this PID and whether a freshly opened handle
+/// appears in them — the exact check that made port-owner detection silently fail.
+pub fn handles_self() -> i32 {
+    extern "system" {
+        #[link_name = "CreateFileW"]
+        fn OpenFile(
+            name: *const u16,
+            access: u32,
+            share: u32,
+            sa: *mut std::ffi::c_void,
+            disp: u32,
+            flags: u32,
+            tmpl: *mut std::ffi::c_void,
+        ) -> *mut std::ffi::c_void;
+        #[link_name = "CloseHandle"]
+        fn CloseHandle(h: *mut std::ffi::c_void) -> i32;
+        #[link_name = "GetCurrentProcessId"]
+        fn GetCurrentProcessId() -> u32;
+    }
+    let me = unsafe { GetCurrentProcessId() };
+    let snap = crate::autoattach::snapshot_handles_pub();
+    let mine = snap.iter().filter(|e| e.unique_process_id as u32 == me).count();
+    println!("handles-self: 快照总数={} 本进程={} PID={}", snap.len(), mine, me);
+
+    // Open a real file handle we can look for.
+    let path = std::env::temp_dir().join("um_handle_probe.txt");
+    let wide: Vec<u16> = path.to_string_lossy().encode_utf16().chain(std::iter::once(0)).collect();
+    let h = unsafe {
+        OpenFile(
+            wide.as_ptr(),
+            0x4000_0000,
+            0x7,
+            std::ptr::null_mut(),
+            4, // OPEN_ALWAYS
+            0x80,
+            std::ptr::null_mut(),
+        )
+    };
+    if h as isize == -1 {
+        println!("handles-self: 无法创建探针文件");
+        return 1;
+    }
+    let hv = h as usize;
+    // Take the snapshot a few times: the kernel's handle table is updated lazily and
+    // a handle created microseconds ago may not be visible in the very first snapshot.
+    let mut found = false;
+    let mut found_mine = false;
+    for attempt in 0..5 {
+        let snap2 = crate::autoattach::snapshot_handles_pub();
+        found = snap2.iter().any(|e| e.handle_value == hv);
+        found_mine = snap2
+            .iter()
+            .any(|e| e.handle_value == hv && e.unique_process_id as u32 == me);
+        if found_mine {
+            println!("handles-self: 第 {} 次快照找到（PID 匹配）", attempt + 1);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(30));
+    }
+    println!("handles-self: 探针句柄={hv:#x} 快照中出现={found} 且PID匹配={found_mine}");
+    unsafe { CloseHandle(h) };
+    if found_mine {
+        0
+    } else {
+        1
+    }
+}
+
+/// --holders <COMx>... — which processes hold these serial ports.
+pub fn holders(ports: &[String]) -> i32 {
+    let (list, note) = crate::portowners::find_port_holders(ports);
+    println!("holders: {note}");
+    for (pid, exe) in &list {
+        println!("holders:   PID {pid}  {exe}");
+    }
+    if list.is_empty() {
+        1
+    } else {
+        0
+    }
+}
+
 pub fn find_owners(port: &str) -> i32 {
     println!("find-owners: 端口 = {port}");
     let elevated = crate::autoattach::enable_debug_privilege();

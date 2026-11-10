@@ -9,6 +9,7 @@ mod headless;
 mod inject;
 mod layout_probe;
 mod native_serial;
+mod portowners;
 mod protocol;
 mod session;
 mod ui;
@@ -45,6 +46,15 @@ fn parse_args() -> Option<String> {
                 }
             }
             std::process::exit(headless::headless_watch(&port, &result));
+        }
+        // --handles-self — verify the handle snapshot contains our own handles
+        if args[i] == "--handles-self" {
+            std::process::exit(diag::handles_self());
+        }
+        // --holders <COMx>... — which processes hold these serial ports
+        if args[i] == "--holders" {
+            let ports: Vec<String> = args[i + 1..].to_vec();
+            std::process::exit(diag::holders(&ports));
         }
         // --list-procs — what the process enumerator sees (auto-attach diagnostic)
         if args[i] == "--list-procs" {

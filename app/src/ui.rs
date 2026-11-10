@@ -73,6 +73,16 @@ pub struct MonitorApp {
     pub cap_rx: Option<Receiver<CapMsg>>,
     pub procs: Vec<(u32, String)>,
     pub attach_sel: Option<usize>,
+    /// Filter text for the attach dialog: matches exe name or PID.
+    pub attach_filter: String,
+    /// Hide obvious non-candidates (services, brokers, browsers) by default.
+    pub attach_only_apps: bool,
+    /// PIDs currently known to hold one of the watched ports, refreshed by the dialog.
+    pub port_holders: Vec<u32>,
+    /// Human-readable result of the last holder scan (shown in the dialog).
+    pub holder_note: String,
+    /// Frame on which the holder list was last refreshed.
+    pub holders_at: u64,
     /// (pid, hook handle) → port name, from Open records; lets Rx/Tx route into
     /// hook-watch sessions by port even when the Open predates session creation.
     pub hook_ports: HashMap<(u32, u64), String>,
@@ -121,6 +131,24 @@ fn b(v: bool) -> &'static str {
     if v { "1" } else { "0" }
 }
 
+/// Rough "is this a user application rather than a service/broker" test, used to keep
+/// the attach list short by default. It only filters the *display* — any process is
+/// still reachable by typing its name or PID in the search box.
+fn looks_like_app(name: &str) -> bool {
+    let n = name.to_lowercase();
+    const NOISE: &[&str] = &[
+        "svchost", "dllhost", "conhost", "runtimebroker", "searchhost", "searchindexer",
+        "searchprotocolhost", "searchfilterhost", "taskhostw", "sihost", "fontdrvhost",
+        "dwm", "csrss", "smss", "wininit", "winlogon", "lsass", "services", "spoolsv",
+        "audiodg", "msmpeng", "mpdefender", "securityhealth", "smartscreen", "wudfhost",
+        "wmiprvse", "dashost", "unsecapp", "lockapp", "textinputhost",
+        "startmenuexperiencehost", "shellexperiencehost", "applicationframehost",
+        "aggregatorhost", "backgroundtaskhost", "msedgewebview2", "crashpad_handler",
+        "widgetboard", "widgetservice", "useroobebroker", "openconsole", "systemsettings",
+    ];
+    !NOISE.iter().any(|k| n.contains(k))
+}
+
 impl MonitorApp {
     pub fn new(screenshot: Option<String>) -> Self {
         let ports: Vec<String> = serialport::available_ports()
@@ -149,6 +177,11 @@ impl MonitorApp {
             cap_rx: Some(inject::start_capture_server()),
             procs: Vec::new(),
             attach_sel: None,
+            attach_filter: String::new(),
+            attach_only_apps: true,
+            port_holders: Vec::new(),
+            holder_note: String::new(),
+            holders_at: 0,
             hook_ports: HashMap::new(),
             auto: None,
             chan_kind: 0,
@@ -194,6 +227,13 @@ impl MonitorApp {
             seed_demo(&mut s);
             app.sessions.push(s);
             app.active = 0;
+            // A screenshot run can ask for the attach dialog instead of the main
+            // window, which is how the dialog's layout gets verified.
+            if std::env::var("UM_SHOW_ATTACH").is_ok() {
+                app.dlg_attach = true;
+                app.procs = inject::list_processes();
+                app.attach_filter = String::new();
+            }
         }
         app
     }
@@ -1154,56 +1194,182 @@ impl MonitorApp {
     }
 
     fn dlg_attach_ui(&mut self, ui: &mut Ui) {
-        ui.label("选择要拦截串口通信的进程 (仅 64 位)：");
+        // Refresh the process list when the dialog is first shown.
+        if self.procs.is_empty() {
+            self.procs = inject::list_processes();
+        }
+        // Refresh the port-holder list at most every ~1.5 s (the scan walks the whole
+        // system handle table, so doing it every frame would burn CPU).
+        if self.frame_count.saturating_sub(self.holders_at) > 90 || self.holders_at == 0 {
+            self.holders_at = self.frame_count;
+            let ports: Vec<String> = self
+                .sessions
+                .iter()
+                .flat_map(|s| s.channels.iter())
+                .filter(|c| c.kind == ChanKind::HookSerial)
+                .map(|c| c.name.clone())
+                .collect();
+            if ports.is_empty() {
+                self.port_holders.clear();
+                self.holder_note = "尚未创建「串口监听」会话，无法判断谁在占用端口".into();
+            } else {
+                let (list, note) = crate::portowners::find_port_holders(&ports);
+                self.port_holders = list.into_iter().map(|(p, _)| p).collect();
+                self.holder_note = note;
+            }
+        }
+
+        ui.label(
+            egui::RichText::new("附加到进程（被动拦截，不占用串口）").strong(),
+        );
+        ui.add_space(4.0);
+
+        // --- filter row ---
         ui.horizontal(|ui| {
-            if ui.button("刷新列表").clicked() {
-                self.procs = inject::list_processes();
+            ui.label("搜索:");
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut self.attach_filter)
+                    .hint_text("进程名或 PID")
+                    .desired_width(180.0),
+            );
+            if resp.changed() {
                 self.attach_sel = None;
             }
-            ui.label(format!("{} 个进程", self.procs.len()));
+            if ui.button("清空").clicked() {
+                self.attach_filter.clear();
+            }
+            ui.checkbox(&mut self.attach_only_apps, "只看应用进程");
+            if ui.button("刷新").clicked() {
+                self.procs = inject::list_processes();
+                self.holders_at = 0;
+                self.attach_sel = None;
+            }
         });
-        ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
-            for (i, (pid, name)) in self.procs.iter().enumerate() {
-                let label = format!("{}  (PID {})", name, pid);
-                if ui
-                    .add(SelectableLabel::new(self.attach_sel == Some(i), label))
-                    .clicked()
-                {
-                    self.attach_sel = Some(i);
+
+        // --- holder status ---
+        // Two sources of truth, the second being authoritative:
+        //   * a name-based candidate scan (helps before anything is injected), and
+        //   * the hook's own OPEN reports — a PID that reported opening a watched
+        //     port definitely holds it, and is marked accordingly.
+        let confirmed: Vec<u32> = self
+            .hook_ports
+            .keys()
+            .map(|(pid, _)| *pid)
+            .collect();
+        let holder_txt = format!("{} 个进程；{}", self.procs.len(), self.holder_note);
+        if confirmed.is_empty() && self.port_holders.is_empty() {
+            ui.label(egui::RichText::new(holder_txt).weak());
+        } else {
+            let extra = if confirmed.is_empty() {
+                String::new()
+            } else {
+                format!("；已确认占用串口的进程 {} 个", confirmed.len())
+            };
+            ui.colored_label(
+                egui::Color32::from_rgb(0x2e, 0x7d, 0x32),
+                format!("{holder_txt}{extra}"),
+            );
+        }
+
+        // --- filtered candidate list ---
+        let needle = self.attach_filter.trim().to_lowercase();
+        let mut shown: Vec<(usize, String, bool)> = Vec::new();
+        for (i, (pid, name)) in self.procs.iter().enumerate() {
+            let is_holder = confirmed.contains(pid) || self.port_holders.contains(pid);
+            if self.attach_only_apps && !is_holder && !looks_like_app(name) {
+                continue;
+            }
+            if !needle.is_empty()
+                && !name.to_lowercase().contains(&needle)
+                && !pid.to_string().contains(&needle)
+            {
+                continue;
+            }
+            let label = if confirmed.contains(pid) {
+                format!("● {name}  (PID {pid})  ← 已确认占用串口")
+            } else if is_holder {
+                format!("○ {name}  (PID {pid})  ← 可能占用串口")
+            } else {
+                format!("  {name}  (PID {pid})")
+            };
+            shown.push((i, label, is_holder));
+        }
+        // Port holders first, then alphabetical — the useful rows are always on top.
+        shown.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.1.cmp(&b.1)));
+
+        ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
+            if shown.is_empty() {
+                ui.label("(没有匹配的进程)");
+            }
+            for (i, label, _) in shown.iter() {
+                let selected = self.attach_sel == Some(*i);
+                let resp = ui.add(SelectableLabel::new(selected, label));
+                if resp.clicked() {
+                    self.attach_sel = Some(*i);
+                }
+                if resp.double_clicked() {
+                    self.attach_sel = Some(*i);
+                    self.attach_selected();
                 }
             }
-            if self.procs.is_empty() {
-                ui.label("(未发现可注入进程)");
-            }
         });
+
         ui.separator();
         ui.horizontal(|ui| {
+            let can = self.attach_sel.is_some();
             if ui
-                .add_enabled(self.attach_sel.is_some(), egui::Button::new("注入并监控"))
+                .add_enabled(can, egui::Button::new("注入并监控"))
+                .clicked()
+            {
+                self.attach_selected();
+            }
+            if ui
+                .add_enabled(
+                    self.attach_sel.is_some(),
+                    egui::Button::new("复制 PID"),
+                )
                 .clicked()
             {
                 if let Some(i) = self.attach_sel {
-                    let (pid, name) = self.procs[i].clone();
-                    let dll = inject::dll_path()
-                        .map(|p| p.to_string_lossy().into_owned())
-                        .unwrap_or_default();
-                    match inject::inject(pid, &dll) {
-                        Ok(()) => {
-                            self.toast(format!(
-                                "已注入 {} (PID {})，其串口读写将被拦截显示",
-                                name, pid
-                            ));
-                            self.dlg_attach = false;
-                        }
-                        Err(e) => self.toast(format!("注入失败: {}", e)),
-                    }
+                    let (pid, _) = self.procs[i].clone();
+                    ui.output_mut(|o| o.copied_text = pid.to_string());
                 }
             }
-            if ui.button("取消").clicked() {
+            if ui.button("关闭").clicked() {
                 self.dlg_attach = false;
             }
         });
-        ui.label("提示：注入后进程新打开的串口立即命名；注入前已打开的串口在下次读写时识别。");
+        ui.add_space(2.0);
+        ui.label(
+            egui::RichText::new(
+                "提示：带 ● 的进程正在占用被监听的串口，优先附加它们。\
+                 注入后新打开的串口会立即命名；注入前已打开的串口在下次读写时识别。",
+            )
+            .weak()
+            .small(),
+        );
+    }
+
+    /// Inject the hook into the selected process and report the outcome.
+    fn attach_selected(&mut self) {
+        let Some(i) = self.attach_sel else { return };
+        let Some((pid, name)) = self.procs.get(i).cloned() else {
+            return;
+        };
+        let dll = inject::dll_path()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        match inject::inject(pid, &dll) {
+            Ok(()) => {
+                self.toast(format!("已注入 {name} (PID {pid})，其串口读写将被拦截"));
+                if let Some(s) = self.sessions.get_mut(self.active) {
+                    s.notices
+                        .push(format!("已附加 {name} (PID {pid})"));
+                }
+                self.dlg_attach = false;
+            }
+            Err(e) => self.toast(format!("注入失败: {e}")),
+        }
     }
 
     /// Drain records streamed by injected hook DLLs and route them into sessions.
