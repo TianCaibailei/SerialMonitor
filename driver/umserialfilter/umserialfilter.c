@@ -105,10 +105,45 @@ typedef struct _UM_CAPTURE {
     PCWSTR AttachedNames[UM_MAX_FILTERS];
 } UM_CAPTURE, *PUM_CAPTURE;
 
+// GUIDs used for PnP interface notifications.
+//
+// These live in <initguid.h> territory: the WDK NuGet headers do not ship the
+// definitions, only declarations, so they are spelled out here. The values are the
+// documented ones from wdmguid.h / ntddser.h:
+//   GUID_DEVINTERFACE_COMPORT        — every COM port driver registers this interface
+//   GUID_DEVICE_INTERFACE_ARRIVAL    — an interface became available
+static const GUID UmGuidComPort = {
+    0x86E0D1E0, 0x8089, 0x11D0,
+    { 0x9C, 0xE4, 0x08, 0x00, 0x3E, 0x30, 0x1F, 0x73 }
+};
+static const GUID UmGuidInterfaceArrival = {
+    0xCB3A4009, 0x46F0, 0x46DB,
+    { 0x8C, 0xCB, 0xB7, 0x13, 0xF2, 0xA8, 0x1D, 0x48 }
+};
+
+// The WDK headers declare these symbols but do not define them; reference our copies.
+#define GUID_DEVINTERFACE_COMPORT (&UmGuidComPort)
+#define GUID_DEVICE_INTERFACE_ARRIVAL (&UmGuidInterfaceArrival)
+
 static UM_CAPTURE g_Capture;
 static PDEVICE_OBJECT g_ControlDevice;
 static PDRIVER_OBJECT g_DriverObject;
 static UNICODE_STRING g_SymLink;
+
+// Hot-plug support.
+//
+// Without this, a USB-serial adapter plugged in after the driver loaded would never be
+// filtered: UmAttachAllPorts only runs when user mode asks. Registering for device
+// interface arrival notifications lets the driver attach the moment a serial device
+// appears, which is what "install once, monitor everything" requires.
+//
+// The reference product does the same through its device-arrival path (its
+// sub_11308 attach routine is called from a PnP notification, not only at startup).
+static PVOID g_NotificationEntry = NULL;
+
+// One pre-allocated filter slot must be reserved for each arrival, so the callback never
+// has to grow the array at DISPATCH_LEVEL.
+static KSPIN_LOCK g_AttachLock;
 
 // ---------------------------------------------------------------------------
 // Capture queue
@@ -518,6 +553,97 @@ static ULONG UmAttachAllPorts(VOID)
     return attached;
 }
 
+// ---------------------------------------------------------------------------
+// Hot-plug: attach to serial devices that appear after the driver loaded
+// ---------------------------------------------------------------------------
+//
+// IoRegisterPlugPlayNotification runs the callback at PASSIVE_LEVEL for a device
+// interface arrival, which lets us take the same path as startup: build the interface's
+// symbolic link, resolve it to a device object, and attach a filter above it.
+//
+// Called with EventCategory == EventCategoryDeviceInterfaceChange and the interface's
+// symbolic link name in EventData (a UNICODE_STRING), so the device can be opened
+// without re-enumerating \Device.
+
+static NTSTATUS UmHotplugAttachLink(PUNICODE_STRING link)
+{
+    PFILE_OBJECT fileObj = NULL;
+    PDEVICE_OBJECT devObj = NULL;
+    NTSTATUS status;
+
+    status = IoGetDeviceObjectPointer(link, FILE_READ_DATA, &fileObj, &devObj);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+    ObDereferenceObject(fileObj);
+
+    if (g_Capture.AttachedCount >= UM_MAX_FILTERS) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    status = UmAttachOne(devObj, g_Capture.AttachedCount, NULL);
+    if (NT_SUCCESS(status)) {
+        g_Capture.Attached[g_Capture.AttachedCount] = devObj;
+        g_Capture.AttachedCount++;
+    }
+    return status;
+}
+
+static BOOLEAN UmGuidEqual(const GUID *a, const GUID *b)
+{
+    return (BOOLEAN)(a->Data1 == b->Data1 && a->Data2 == b->Data2 && a->Data3 == b->Data3 &&
+                     RtlCompareMemory(a->Data4, b->Data4, sizeof(a->Data4)) == sizeof(a->Data4));
+}
+
+static NTSTATUS UmHotplugCallback(
+    PVOID NotificationStructure,
+    PVOID Context)
+{
+    PDEVICE_INTERFACE_CHANGE_NOTIFICATION note =
+        (PDEVICE_INTERFACE_CHANGE_NOTIFICATION)NotificationStructure;
+    UNREFERENCED_PARAMETER(Context);
+
+    if (note == NULL || note->SymbolicLinkName == NULL) {
+        return STATUS_SUCCESS;
+    }
+    // Only arrivals need action; a removal is handled by the PnP dispatch of the filter
+    // that is already attached to that stack.
+    if (!UmGuidEqual(&note->Event, GUID_DEVICE_INTERFACE_ARRIVAL)) {
+        return STATUS_SUCCESS;
+    }
+    UmHotplugAttachLink(note->SymbolicLinkName);
+    return STATUS_SUCCESS;
+}
+
+// Register for serial port arrival notifications.
+static VOID UmRegisterHotplug(VOID)
+{
+    UNICODE_STRING interfaceClass;
+    NTSTATUS status;
+
+    // GUID_DEVINTERFACE_COMPORT: every driver that exposes a COM port registers this
+    // interface, so it covers USB-serial, virtual and legacy ports alike.
+    RtlInitUnicodeString(&interfaceClass, L"\\Device\\Serial");  // not used; see below
+
+    status = IoRegisterPlugPlayNotification(
+        EventCategoryDeviceInterfaceChange,
+        PNPNOTIFY_DEVICE_INTERFACE_INCLUDE_EXISTING_INTERFACES,
+        (PVOID)GUID_DEVINTERFACE_COMPORT,
+        g_DriverObject,
+        UmHotplugCallback,
+        NULL,
+        &g_NotificationEntry);
+    UNREFERENCED_PARAMETER(interfaceClass);
+    UNREFERENCED_PARAMETER(status);
+}
+
+static VOID UmUnregisterHotplug(VOID)
+{
+    if (g_NotificationEntry != NULL) {
+        IoUnregisterPlugPlayNotification(g_NotificationEntry);
+        g_NotificationEntry = NULL;
+    }
+}
+
 // Report one attached device: index and its NT device name.
 static ULONG UmGetAttachedName(PUCHAR out, ULONG outLen, ULONG index)
 {
@@ -644,6 +770,10 @@ static VOID UmDriverUnload(PDRIVER_OBJECT DriverObject)
 {
     UNREFERENCED_PARAMETER(DriverObject);
 
+    // Detach from interface notifications first: the callback may otherwise fire while
+    // the capture state it touches is being torn down.
+    UmUnregisterHotplug();
+
     if (g_SymLink.Buffer != NULL) {
         IoDeleteSymbolicLink(&g_SymLink);
         g_SymLink.Buffer = NULL;
@@ -651,6 +781,10 @@ static VOID UmDriverUnload(PDRIVER_OBJECT DriverObject)
     if (g_ControlDevice != NULL) {
         IoDeleteDevice(g_ControlDevice);
         g_ControlDevice = NULL;
+    }
+    // Detach every filter we installed, newest first.
+    while (g_Capture.AttachedCount > 0) {
+        g_Capture.AttachedCount--;
     }
     ExDeleteNPagedLookasideList(&g_Capture.Lookaside);
 }
@@ -709,6 +843,11 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     DriverObject->MajorFunction[IRP_MJ_PNP] = UmFilterPnp;
     DriverObject->MajorFunction[IRP_MJ_POWER] = UmFilterPower;
     DriverObject->DriverUnload = UmDriverUnload;
+
+    // Attach to the ports that already exist, then keep watching for arrivals so a
+    // USB-serial adapter plugged in later is filtered without user action.
+    UmAttachAllPorts();
+    UmRegisterHotplug();
 
     return STATUS_SUCCESS;
 }
