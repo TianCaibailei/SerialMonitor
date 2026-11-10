@@ -567,7 +567,8 @@ unsafe extern "system" fn hook_CreateFileW(
     flags: u32,
     tmpl: *mut std::ffi::c_void,
 ) -> *mut std::ffi::c_void {
-    let f: CreateFileWFn = std::mem::transmute(ORIG_CREATEFILEW.load(Ordering::Relaxed));
+    let f: CreateFileWFn =
+        std::mem::transmute(orig_call_addr(&INLINE_CREATEFILEW, &ORIG_CREATEFILEW));
     let h = f(name, access, share, sa, disp, flags, tmpl);
     let err = GetLastError(); // .NET and others inspect it right after we return
     if h as isize != INVALID_HANDLE {
@@ -606,6 +607,19 @@ unsafe extern "system" fn hook_CreateFileA(
     h
 }
 
+/// Address to call for the original function: the trampoline when an inline patch is
+/// installed (the real prologue now jumps to us, so calling it would recurse), else the
+/// plain address resolved at start-up.
+#[inline]
+fn orig_call_addr(slot: &PatchSlot, fallback: &AtomicUsize) -> usize {
+    let t = slot.trampoline.load(Ordering::Relaxed);
+    if t != 0 {
+        t
+    } else {
+        fallback.load(Ordering::Relaxed)
+    }
+}
+
 unsafe extern "system" fn hook_ReadFile(
     h: *mut std::ffi::c_void,
     buf: *mut u8,
@@ -613,7 +627,8 @@ unsafe extern "system" fn hook_ReadFile(
     read: *mut u32,
     ov: *mut std::ffi::c_void,
 ) -> i32 {
-    let f: ReadFileFn = std::mem::transmute(ORIG_READFILE.load(Ordering::Relaxed));
+    let f: ReadFileFn =
+        std::mem::transmute(orig_call_addr(&INLINE_READFILE, &ORIG_READFILE));
     let ok = f(h, buf, len, read, ov);
     let err = GetLastError();
     if ok != 0 {
@@ -680,7 +695,8 @@ unsafe extern "system" fn hook_WriteFile(
     written: *mut u32,
     ov: *mut std::ffi::c_void,
 ) -> i32 {
-    let f: WriteFileFn = std::mem::transmute(ORIG_WRITEFILE.load(Ordering::Relaxed));
+    let f: WriteFileFn =
+        std::mem::transmute(orig_call_addr(&INLINE_WRITEFILE, &ORIG_WRITEFILE));
     let ok = f(h, buf, len, written, ov);
     let err = GetLastError();
     if ok != 0 {
@@ -940,6 +956,171 @@ unsafe fn patch_iat(base: *mut u8, targets: &[(usize, usize)]) {
     }
 }
 
+// ---------------- byte-level entry patching ----------------
+//
+// IAT hooking only redirects calls that go through a module's import slot. .NET's
+// SerialStream (and any binder that caches a resolved address) calls the function
+// pointer it obtained earlier, so those calls bypass the IAT entirely — verified on
+// this machine: a .NET process injected while still starting showed
+// `pipe connected / patched` but never `cfw: \\.\COMn`, i.e. its CreateFileW call
+// went straight to kernel32.
+//
+// Patching the function's first bytes closes that gap: `mov rax, <hook>; jmp rax`
+// covers every caller regardless of how it got the address. The stolen bytes are
+// copied into a trampoline that jumps back, so the original behaviour is preserved.
+//
+// The patch is only installed when the first bytes are the well-known Windows
+// prologue of those exports (`mov r10, rcx; mov eax, <syscall>` / `jmp`), because
+// replacing 12 bytes of arbitrary instructions would corrupt the function.
+const PATCH_LEN: usize = 12;
+
+#[repr(C)]
+struct PatchSlot {
+    target: AtomicUsize,
+    trampoline: AtomicUsize,
+}
+
+static INLINE_CREATEFILEW: PatchSlot =
+    PatchSlot { target: AtomicUsize::new(0), trampoline: AtomicUsize::new(0) };
+static INLINE_READFILE: PatchSlot =
+    PatchSlot { target: AtomicUsize::new(0), trampoline: AtomicUsize::new(0) };
+static INLINE_WRITEFILE: PatchSlot =
+    PatchSlot { target: AtomicUsize::new(0), trampoline: AtomicUsize::new(0) };
+
+extern "system" {
+    fn VirtualAlloc(addr: *mut std::ffi::c_void, size: usize, ty: u32, protect: u32) -> *mut std::ffi::c_void;
+    fn FlushInstructionCache(
+        process: *mut std::ffi::c_void,
+        addr: *const std::ffi::c_void,
+        size: usize,
+    ) -> i32;
+    fn GetCurrentProcess() -> *mut std::ffi::c_void;
+}
+
+const MEM_COMMIT_RESERVE: u32 = 0x3000;
+const PAGE_EXECUTE_READWRITE_INLINE: u32 = 0x40;
+const PAGE_EXECUTE_READ_INLINE: u32 = 0x20;
+
+/// Does the function start like a Windows syscall stub we can safely displace?
+///
+/// Measured on this machine, kernel32's file APIs begin with
+///     FF 25 <rel32>      jmp qword ptr [rip+rel32]
+///     CC CC CC ...       int3 padding to the next export
+/// i.e. a 6-byte indirect jump followed by padding. That is the easiest case to patch:
+/// only those 6 bytes are used, so a 12-byte write would clobber a neighbouring export's
+/// padding (harmless) but a 6-byte-safe write keeps the change minimal and exact.
+///
+/// Also accepted: `4C 8B D1` (mov r10, rcx — the ntdll syscall stub) and `E9` (a jmp
+/// rel32 forwarder). Anything else is refused: replacing unknown instructions would
+/// corrupt the function.
+unsafe fn is_patchable_prologue(p: *const u8) -> bool {
+    let b: [u8; 4] = [*p, *p.add(1), *p.add(2), *p.add(3)];
+    if b[0] == 0xFF && b[1] == 0x25 {
+        return true; // jmp qword ptr [rip+rel32] — API-set forwarder stub
+    }
+    if b[0] == 0x4C && b[1] == 0x8B && b[2] == 0xD1 {
+        return true; // mov r10, rcx
+    }
+    if b[0] == 0xE9 || b[0] == 0xEB {
+        return true; // jmp rel32/rel8 forwarder
+    }
+    false
+}
+
+/// How many bytes must be displaced for this prologue.
+fn prologue_len(p: *const u8) -> usize {
+    let b = unsafe { [*p, *p.add(1)] };
+    if b[0] == 0xFF && b[1] == 0x25 {
+        return 6; // jmp qword ptr [rip+rel32]
+    }
+    12 // mov r10,rcx / jmp rel32
+}
+
+/// Resolve the absolute destination of an `FF 25 rel32` stub.
+///
+/// The displaced bytes cannot be copied into a trampoline verbatim: `[rip+rel32]` is
+/// relative to the *original* instruction's address, so the copy would read the wrong
+/// memory (and crash). Reading the destination now and jumping to it absolutely is the
+/// correct equivalent, and these stubs are pure forwarders so nothing else is lost.
+unsafe fn resolve_ff25_target(p: *const u8) -> usize {
+    let rel = i32::from_le_bytes([*p.add(2), *p.add(3), *p.add(4), *p.add(5)]) as isize;
+    // [rip + rel32] where rip is the address of the *next* instruction (p + 6).
+    let slot = (p as isize) + 6 + rel;
+    let dest = *(slot as *const u64);
+    dest as usize
+}
+
+/// Install `hook` at `target`, preserving the displaced instructions in a trampoline.
+/// Returns the trampoline address, or 0 when the patch was refused.
+unsafe fn patch_entry(target: usize, hook: usize, slot: &PatchSlot) -> usize {
+    if target == 0 || hook == 0 {
+        return 0;
+    }
+    if !is_patchable_prologue(target as *const u8) {
+        let p = target as *const u8;
+        dbg_note(&format!(
+            "inline: 拒绝 patch {target:#x}, 前16字节 = {:02X?}",
+            unsafe { std::slice::from_raw_parts(p, 16) }
+        ));
+        return 0; // unexpected prologue: leave the function untouched
+    }
+    let patch_len = prologue_len(target as *const u8);
+    let tramp = VirtualAlloc(
+        std::ptr::null_mut(),
+        patch_len + 16,
+        MEM_COMMIT_RESERVE,
+        PAGE_EXECUTE_READWRITE_INLINE,
+    ) as *mut u8;
+    if tramp.is_null() {
+        return 0;
+    }
+    if patch_len == 6 {
+        // FF 25 stub: jump to the resolved destination, then jump back to target+6.
+        let dest = resolve_ff25_target(target as *const u8) as u64;
+        let mut code = [0u8; 12];
+        code[0] = 0x48;
+        code[1] = 0xB8;
+        code[2..10].copy_from_slice(&dest.to_le_bytes());
+        code[10] = 0xFF;
+        code[11] = 0xE0;
+        std::ptr::copy_nonoverlapping(code.as_ptr(), tramp, 12);
+        // The stub never returns to target+6 (it jump'd away); a return jump is
+        // unreachable but harmless, so none is emitted.
+    } else {
+        // Position-independent prologue (mov r10,rcx / jmp rel32 of the ntdll stub):
+        // copy verbatim and jump back. These contain no RIP-relative operand.
+        std::ptr::copy_nonoverlapping(target as *const u8, tramp, patch_len);
+        let back = (target + patch_len) as u64;
+        let mut jmp_back = [0u8; 12];
+        jmp_back[0] = 0x48;
+        jmp_back[1] = 0xB8;
+        jmp_back[2..10].copy_from_slice(&back.to_le_bytes());
+        jmp_back[10] = 0xFF;
+        jmp_back[11] = 0xE0;
+        std::ptr::copy_nonoverlapping(jmp_back.as_ptr(), tramp.add(patch_len), 12);
+    }
+
+    // Overwrite the target's prologue with a jump to our hook.
+    let mut old = 0u32;
+    if VirtualProtect(target as *mut std::ffi::c_void, patch_len, PAGE_EXECUTE_READWRITE_INLINE, &mut old) == 0 {
+        return 0;
+    }
+    let mut jmp = [0u8; 12];
+    jmp[0] = 0x48;
+    jmp[1] = 0xB8;
+    jmp[2..10].copy_from_slice(&(hook as u64).to_le_bytes());
+    jmp[10] = 0xFF;
+    jmp[11] = 0xE0;
+    std::ptr::copy_nonoverlapping(jmp.as_ptr(), target as *mut u8, patch_len);
+    let mut rel = 0u32;
+    VirtualProtect(target as *mut std::ffi::c_void, patch_len, old.max(PAGE_EXECUTE_READ_INLINE), &mut rel);
+    FlushInstructionCache(GetCurrentProcess(), target as *const std::ffi::c_void, patch_len);
+
+    slot.target.store(target, Ordering::Relaxed);
+    slot.trampoline.store(tramp as usize, Ordering::Relaxed);
+    tramp as usize
+}
+
 unsafe fn patch_all() {
     let targets: [(usize, usize); 9] = [
         (ORIG_CREATEFILEW.load(Ordering::Relaxed), hook_CreateFileW as usize),
@@ -1054,6 +1235,32 @@ unsafe fn worker() {
     std::thread::spawn(|| unsafe { pipe_connect_loop() });
     patch_all();
     dbg_note("patched");
+    // Byte-level patches are OPT-IN (create %TEMP%\um_hook_inline). They close the gap
+    // for callers that cache API pointers (.NET P/Invoke), but displacing live kernel32
+    // stubs is invasive: a mistake in the trampoline crashes the host process. Until the
+    // trampoline is verified against every stub shape on a test machine, IAT hooking is
+    // the default and this stays behind a marker file.
+    if std::env::temp_dir().join("um_hook_inline").exists() {
+        let t1 = patch_entry(
+            ORIG_CREATEFILEW.load(Ordering::Relaxed),
+            hook_CreateFileW as usize,
+            &INLINE_CREATEFILEW,
+        );
+        let t2 = patch_entry(
+            ORIG_READFILE.load(Ordering::Relaxed),
+            hook_ReadFile as usize,
+            &INLINE_READFILE,
+        );
+        let t3 = patch_entry(
+            ORIG_WRITEFILE.load(Ordering::Relaxed),
+            hook_WriteFile as usize,
+            &INLINE_WRITEFILE,
+        );
+        dbg_note(&format!(
+            "inline: CreateFileW={:#x} ReadFile={:#x} WriteFile={:#x}",
+            t1, t2, t3
+        ));
+    }
     // Re-patch every 3 s: modules loaded after injection have untouched IATs.
     std::thread::spawn(|| loop {
         std::thread::sleep(std::time::Duration::from_millis(3000));

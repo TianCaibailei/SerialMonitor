@@ -130,22 +130,100 @@ extern "system" {
     fn GetCurrentProcessId() -> u32;
 }
 
+/// PROCESSENTRY32W as Windows actually lays it out on x64.
+///
+/// Measured against a live snapshot: the executable name begins at **offset 44**, not
+/// at 36. The nine DWORD fields (dwSize..dwFlags) occupy bytes 0..36, but the wide
+/// character array is 8-byte aligned, so Windows leaves 8 bytes of padding before it.
+/// Modelling that padding explicitly is what makes the process names come out instead
+/// of an empty string, and `dwSize` must be the full 568.
 #[repr(C)]
 struct ProcessEntry32W {
     dwSize: u32,
     cntUsage: u32,
     th32ProcessID: u32,
-    th32DefaultHeap: usize,
+    th32DefaultHeap: u32,
     th32ModuleID: u32,
     cntThreads: u32,
     th32ParentProcessID: u32,
-    pcPriClassBase: isize,
+    pcPriClassBase: u32,
     dwFlags: u32,
+    /// Pads the DWORD block out to byte 44, where szExeFile actually begins on x64
+    /// (measured from a live snapshot: "[System Process]" starts at offset 0x2C).
+    _align: [u32; 2],
     szExeFile: [u16; 260],
+    /// Trailing slack so the struct is exactly the 568 bytes Windows expects.
+    _pad: [u8; 4],
 }
+
+const _: () = {
+    assert!(std::mem::size_of::<ProcessEntry32W>() == 568);
+};
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// UTF-16 NUL-terminated copy (shared with the port scanner and diagnostics).
+pub fn wide_str(s: &str) -> Vec<u16> {
+    wide(s)
+}
+
+/// True when a lower-cased NT device path names a serial port device.
+pub fn is_serial_device_path(path: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "\\device\\serial",
+        "\\device\\usbser",
+        "\\device\\prolific",
+        "\\device\\silabser",
+        "\\device\\vcp",
+        "\\device\\vserial",
+        "\\device\\ftdi",
+        "\\device\\comport",
+        "\\device\\bthmodem",
+        "\\device\\vser",
+        "\\device\\ttys",
+        "\\device\\bthfcom",
+        "\\device\\cdc",
+        "\\device\\aries",
+        "\\device\\ch341",
+        "\\device\\mct_u232",
+    ];
+    MARKERS.iter().any(|m| path.contains(m))
+}
+
+/// True for OS-critical processes we must never inject into.
+pub fn is_critical_pid(pid: u32) -> bool {
+    const CRITICAL_PIDS: &[u32] = &[0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40];
+    if CRITICAL_PIDS.contains(&pid) {
+        return true;
+    }
+    let h = unsafe { OpenProcess(0x1000, 0, pid) };
+    if h.is_null() {
+        return false;
+    }
+    let mut buf = [0u16; 512];
+    let mut size = buf.len() as u32;
+    extern "system" {
+        fn QueryFullProcessImageNameW(
+            h: *mut std::ffi::c_void,
+            flags: u32,
+            name: *mut u16,
+            size: *mut u32,
+        ) -> i32;
+    }
+    let ok = unsafe { QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &mut size) };
+    unsafe { CloseHandle(h) };
+    if ok == 0 {
+        return false;
+    }
+    let s = String::from_utf16_lossy(&buf[..size as usize]);
+    let name = s.rsplit('\\').next().unwrap_or(&s).to_lowercase();
+    if name.is_empty() {
+        return false;
+    }
+    let bare = name.strip_suffix(".exe").unwrap_or(&name);
+    BLACKLIST.iter().any(|b| bare == *b || name == *b)
 }
 
 fn dbg(msg: &str) {
@@ -163,7 +241,11 @@ fn pipe_instance(tx: std::sync::mpsc::Sender<CapMsg>) {
                 name.as_ptr(),
                 PIPE_ACCESS_DUPLEX, // server side reads; mode keeps clients happy
                 PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-                4, // instances (the server starts 4 threads)
+                255, // max instances: one connection per injected process, and the
+                     // auto-attach hook lives in many processes at once. With the old
+                     // value of 4, every process beyond the fourth got
+                     // ERROR_PIPE_BUSY (231) and silently streamed nothing — which is
+                     // exactly why a monitored program could look completely idle.
                 4096,
                 4096,
                 0,
@@ -268,7 +350,10 @@ fn decode(tag: u32, pid: u32, p: &[u8]) -> Option<CapMsg> {
 pub fn start_capture_server() -> Receiver<CapMsg> {
     let (tx, rx) = channel();
     let tx = Mutex::new(tx);
-    for _ in 0..4 {
+    // One server thread per possible hook connection. Each instance accepts exactly
+    // one client at a time and then loops, so this covers every injected process
+    // without any of them being turned away with ERROR_PIPE_BUSY.
+    for _ in 0..12 {
         let tx = tx.lock().unwrap().clone();
         std::thread::spawn(move || pipe_instance(tx));
     }
@@ -301,7 +386,9 @@ pub fn list_processes() -> Vec<(u32, String)> {
         th32ParentProcessID: 0,
         pcPriClassBase: 0,
         dwFlags: 0,
+        _align: [0; 2],
         szExeFile: [0; 260],
+        _pad: [0; 4],
     };
     unsafe {
         if Process32FirstW(snap, &mut pe) != 0 {

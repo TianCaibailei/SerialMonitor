@@ -1,9 +1,14 @@
 // 万能串口监控 — serial / TCP / UDP / Modbus communication monitor.
 // CLI: --screenshot <file.png>  render ~110 frames, save a PNG, exit 0.
 
+mod autoattach;
 mod capture;
+mod diag;
 mod e2e;
+mod headless;
 mod inject;
+mod layout_probe;
+mod native_serial;
 mod protocol;
 mod session;
 mod ui;
@@ -27,6 +32,39 @@ fn parse_args() -> Option<String> {
             let port = args.get(i + 1).cloned().unwrap_or_else(|| "COM6".into());
             let peer = args.get(i + 2).cloned().unwrap_or_else(|| "COM7".into());
             std::process::exit(e2e::hook_e2e(&port, &peer));
+        }
+        // --headless-watch <COMx> --result <file.json>
+        // Runs the passive-session + auto-attach path without a window and writes
+        // what it captured. Used by the end-to-end scenario test.
+        if args[i] == "--headless-watch" {
+            let port = args.get(i + 1).cloned().unwrap_or_else(|| "COM6".into());
+            let mut result = String::from("watch-result.json");
+            if let Some(pos) = args.iter().position(|a| a == "--result") {
+                if let Some(p) = args.get(pos + 1) {
+                    result = p.clone();
+                }
+            }
+            std::process::exit(headless::headless_watch(&port, &result));
+        }
+        // --list-procs — what the process enumerator sees (auto-attach diagnostic)
+        if args[i] == "--list-procs" {
+            std::process::exit(diag::list_procs());
+        }
+        // --probe-layout — dump the raw PROCESSENTRY32W bytes to verify field offsets
+        if args[i] == "--probe-layout" {
+            std::process::exit(layout_probe::probe_layout());
+        }
+        // --native-serial <COMx> <ms> — a native (non-.NET) serial tool, used to test
+        // whether the hook works for programs that call the Win32 API directly.
+        if args[i] == "--native-serial" {
+            let com = args.get(i + 1).cloned().unwrap_or_else(|| "COM6".into());
+            let ms: u64 = args.get(i + 2).and_then(|s| s.parse().ok()).unwrap_or(8000);
+            std::process::exit(native_serial::run(&com, ms));
+        }
+        // --find-owners <COMx> — who holds this port right now (auto-attach diagnostic)
+        if args[i] == "--find-owners" {
+            let port = args.get(i + 1).cloned().unwrap_or_else(|| "COM6".into());
+            std::process::exit(diag::find_owners(&port));
         }
         if args[i] == "--screenshot" {
             return args.get(i + 1).cloned();

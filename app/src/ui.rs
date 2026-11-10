@@ -76,6 +76,9 @@ pub struct MonitorApp {
     /// (pid, hook handle) → port name, from Open records; lets Rx/Tx route into
     /// hook-watch sessions by port even when the Open predates session creation.
     pub hook_ports: HashMap<(u32, u64), String>,
+    /// Background service that injects the hook DLL into whatever program holds a
+    /// watched port, so the user only opens a session and never picks processes.
+    pub auto: Option<crate::autoattach::AutoAttach>,
 
     // new-monitor dialog state (defaults, persisted to config.ini)
     pub chan_kind: usize,
@@ -147,6 +150,7 @@ impl MonitorApp {
             procs: Vec::new(),
             attach_sel: None,
             hook_ports: HashMap::new(),
+            auto: None,
             chan_kind: 0,
             ports,
             port_sel,
@@ -341,7 +345,28 @@ impl MonitorApp {
         self.view_sel = 0;
         self.dlg_new = false;
         self.save_cfg();
+        self.sync_auto_attach();
         self.toast("会话已创建");
+    }
+
+    /// Point the auto-attach service at the ports of every passive (串口监听)
+    /// channel. Called whenever sessions change.
+    fn sync_auto_attach(&mut self) {
+        let ports: Vec<String> = self
+            .sessions
+            .iter()
+            .flat_map(|s| s.channels.iter())
+            .filter(|c| c.kind == ChanKind::HookSerial)
+            .map(|c| c.name.clone())
+            .collect();
+        match &self.auto {
+            Some(a) => a.set_ports(ports),
+            None => {
+                if !ports.is_empty() {
+                    self.auto = Some(crate::autoattach::AutoAttach::start(ports));
+                }
+            }
+        }
     }
 
     fn close_active(&mut self) {
@@ -1208,9 +1233,17 @@ impl MonitorApp {
                     .next()
                     .unwrap_or("")
                     .to_string();
-                self.sessions.push(Session::new_capture(pid, &short));
-                self.active = self.sessions.len() - 1;
-                self.toast(format!("已附加进程 PID {} ({})", pid, short));
+                // With a passive (串口监听) session open, data must flow into THAT
+                // session — auto-attach must not spawn a new window per process.
+                let has_passive = self
+                    .sessions
+                    .iter()
+                    .any(|s| s.channels.iter().any(|c| c.kind == ChanKind::HookSerial));
+                if !has_passive {
+                    self.sessions.push(Session::new_capture(pid, &short));
+                    self.active = self.sessions.len() - 1;
+                }
+                self.toast(format!("已附加进程 {} (PID {})", short, pid));
             }
             CapMsg::Open { pid, handle, port } => {
                 self.hook_ports.insert((pid, handle), port.clone());
@@ -1563,6 +1596,29 @@ impl MonitorApp {
             }
         });
     }
+    /// True while any session is actively collecting. A passive (串口监听) channel
+    /// counts as live even when idle, because a row can arrive at any moment.
+    fn monitoring_live(&self) -> bool {
+        self.sessions.iter().any(|s| {
+            s.running
+                || s.channels.iter().any(|c| c.kind == ChanKind::HookSerial)
+                || s.cap_pid.is_some()
+        })
+    }
+
+    /// Show auto-attach events (which programs got hooked) without a dialog.
+    fn drain_auto_attach(&mut self) {
+        let lines = match &self.auto {
+            Some(a) => a.drained_log(),
+            None => return,
+        };
+        for line in lines {
+            self.toast(line.clone());
+            if let Some(s) = self.sessions.get_mut(self.active) {
+                s.notices.push(line);
+            }
+        }
+    }
 }
 
 impl eframe::App for MonitorApp {
@@ -1592,6 +1648,7 @@ impl eframe::App for MonitorApp {
             }
         }
         self.drain_capture();
+        self.drain_auto_attach();
         for s in self.sessions.iter_mut() {
             s.poll();
         }
@@ -1606,8 +1663,10 @@ impl eframe::App for MonitorApp {
             .show(ctx, |ui| self.send_pane(ui));
         egui::CentralPanel::default().show(ctx, |ui| self.main_area(ui));
         self.dialogs(ctx);
-        if self.frame_count < 200 {
-            ctx.request_repaint();
+        // Live monitoring must repaint continuously: rows arrive from background
+        // threads and the window has to show them without a mouse move.
+        if self.frame_count < 200 || self.monitoring_live() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(60));
         }
     }
 }
