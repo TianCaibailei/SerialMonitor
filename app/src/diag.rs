@@ -230,7 +230,7 @@ pub fn driver_test(seconds: u64) -> i32 {
         match h.next_record() {
             Some(rec) => {
                 n += 1;
-                if rec.dir_tx {
+                if rec.kind == crate::driver::RecordKind::Tx {
                     tx += rec.data.len();
                 } else {
                     rx += rec.data.len();
@@ -243,7 +243,7 @@ pub fn driver_test(seconds: u64) -> i32 {
                     .collect();
                 println!(
                     "driver-test: [{}] pid={} port={} {} 字节: {preview}",
-                    if rec.dir_tx { "TX" } else { "RX" },
+                    if rec.kind == crate::driver::RecordKind::Tx { "TX" } else { "RX" },
                     rec.pid,
                     rec.port_index,
                     rec.data.len()

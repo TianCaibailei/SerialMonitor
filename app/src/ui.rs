@@ -734,12 +734,14 @@ impl MonitorApp {
             // FILETIME (100 ns since 1601) → seconds/millis since midnight.
             let secs = rec.timestamp / 10_000_000 % 86_400;
             let millis = (rec.timestamp / 10_000) % 1000;
+            // Read the direction before moving `data` out of `rec`.
+            let dir_tx = rec.kind == crate::driver::RecordKind::Tx;
             self.sessions[sess_idx].ingest(
                 chan,
                 rec.data,
                 secs,
                 millis as u32,
-                rec.dir_tx,
+                dir_tx,
             );
         }
     }

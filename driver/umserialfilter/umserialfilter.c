@@ -92,6 +92,33 @@ static BOOLEAN UmKeyMatches(const UCHAR *candidate);
 
 #define UM_DIR_RX 0
 #define UM_DIR_TX 1
+// Control records: a serial parameter change observed on an IOCTL. The payload is a
+// UM_CTRL_INFO, not captured bytes. Mixed into the same stream as RX/TX so the UI can
+// show them inline as its own row kind (as requested).
+#define UM_DIR_CTRL 2
+
+// Serial control IOCTLs we report. Values from ntddser.h; DeviceType 0x1b is
+// FILE_DEVICE_SERIAL_PORT.
+#define UM_IOCTL_SERIAL_SET_BAUD_RATE   0x001B0004
+#define UM_IOCTL_SERIAL_GET_BAUD_RATE   0x001B0050
+#define UM_IOCTL_SERIAL_SET_LINE_CONTROL 0x001B000C
+#define UM_IOCTL_SERIAL_GET_LINE_CONTROL 0x001B0054
+#define UM_IOCTL_SERIAL_SET_TIMEOUTS    0x001B001C
+#define UM_IOCTL_SERIAL_GET_TIMEOUTS    0x001B0058
+#define UM_IOCTL_SERIAL_SET_HANDFLOW    0x001B0044
+#define UM_IOCTL_SERIAL_GET_HANDFLOW    0x001B0060
+
+// Payload of a UM_DIR_CTRL record. Fixed layout, little endian.
+typedef struct _UM_CTRL_INFO {
+    UINT32 IoctlCode;    // which operation produced this record
+    UINT32 BaudRate;     // valid for *_BAUD_RATE
+    UINT32 HandFlow;     // valid for *_HANDFLOW (low 32 bits)
+    UINT32 Timeouts[5];  // valid for *_TIMEOUTS
+    UINT8  DataBits;     // valid for *_LINE_CONTROL (5..8)
+    UINT8  StopBits;     // 0=1, 1=1.5, 2=2
+    UINT8  Parity;       // 0=none, 1=odd, 2=even, 3=mark, 4=space
+    UINT8  Reserved;
+} UM_CTRL_INFO, *PUM_CTRL_INFO;
 
 #pragma pack(push, 8)
 typedef struct _UM_RECORD {
@@ -191,6 +218,12 @@ static UM_CAPTURE g_Capture;
 static BOOLEAN UmAlreadyAttached(PDEVICE_OBJECT physical);
 static LONG UmRegisterAttached(PDEVICE_OBJECT physical, PWSTR name);
 static BOOLEAN UmIsOwnFilterDevice(PDEVICE_OBJECT devObj);
+static BOOLEAN UmIsSerialControlIoctl(ULONG Code);
+static NTSTATUS UmCtrlComplete(PDEVICE_OBJECT DeviceObject, PIRP Irp, PVOID Context);
+static VOID UmQueueControlRecord(ULONG ioctlCode, ULONG pid, ULONG portIndex,
+                                  ULONG64 portId, ULONG baudRate, ULONG handFlow,
+                                  const ULONG *timeouts, UCHAR dataBits,
+                                  UCHAR stopBits, UCHAR parity);
 static PDEVICE_OBJECT UmLowestDevice(PDEVICE_OBJECT devObj);
 static VOID UmFreeSlotResources(ULONG index);
 static PWSTR UmDuplicateName(PCUNICODE_STRING name);
@@ -322,6 +355,160 @@ typedef struct _UM_IRP_CTX {
     ULONG64 Handle;
 } UM_IRP_CTX, *PUM_IRP_CTX;
 
+// Context for a serial control IOCTL we are watching.
+typedef struct _UM_CTRL_CTX {
+    ULONG IoctlCode;
+    ULONG Pid;
+    ULONG PortIndex;
+    ULONG64 PortId;
+} UM_CTRL_CTX, *PUM_CTRL_CTX;
+
+// Is this one of the serial parameter IOCTLs we report?
+static BOOLEAN UmIsSerialControlIoctl(ULONG Code)
+{
+    switch (Code) {
+    case UM_IOCTL_SERIAL_SET_BAUD_RATE:
+    case UM_IOCTL_SERIAL_GET_BAUD_RATE:
+    case UM_IOCTL_SERIAL_SET_LINE_CONTROL:
+    case UM_IOCTL_SERIAL_GET_LINE_CONTROL:
+    case UM_IOCTL_SERIAL_SET_TIMEOUTS:
+    case UM_IOCTL_SERIAL_GET_TIMEOUTS:
+    case UM_IOCTL_SERIAL_SET_HANDFLOW:
+    case UM_IOCTL_SERIAL_GET_HANDFLOW:
+        return TRUE;
+    default:
+        return FALSE;
+    }
+}
+
+// Record a serial parameter change.
+//
+// Called from the IOCTL completion routine, i.e. only after the serial driver reported
+// success, so what lands in the trace is the configuration the port actually accepted.
+static VOID UmQueueControlRecord(ULONG ioctlCode, ULONG pid, ULONG portIndex,
+                                  ULONG64 portId, ULONG baudRate, ULONG handFlow,
+                                  const ULONG *timeouts, UCHAR dataBits,
+                                  UCHAR stopBits, UCHAR parity)
+{
+    PUM_RECORD_ITEM item;
+    PUM_CTRL_INFO info;
+    KIRQL old;
+    LARGE_INTEGER now;
+
+    if (g_Capture.Enabled == 0) {
+        return;
+    }
+    if (g_Capture.TargetPid != 0 && g_Capture.TargetPid != pid) {
+        return;
+    }
+
+    item = (PUM_RECORD_ITEM)ExAllocateFromNPagedLookasideList(&g_Capture.Lookaside);
+    if (item == NULL) {
+        InterlockedIncrement((PLONG)&g_Capture.Dropped);
+        return;
+    }
+    RtlZeroMemory(&item->Record, UM_RECORD_HEADER);
+    item->Record.Size = sizeof(UM_CTRL_INFO);
+    item->Record.Dir = UM_DIR_CTRL;
+    item->Record.Pid = pid;
+    item->Record.PortIndex = portIndex;
+    item->Record.Handle = portId;
+    KeQuerySystemTime(&now);
+    item->Record.Timestamp = (ULONGLONG)now.QuadPart;
+    info = (PUM_CTRL_INFO)item->Record.Data;
+    info->IoctlCode = ioctlCode;
+    info->BaudRate = baudRate;
+    info->HandFlow = handFlow;
+    if (timeouts != NULL) {
+        RtlCopyMemory(info->Timeouts, timeouts, sizeof(info->Timeouts));
+    }
+    info->DataBits = dataBits;
+    info->StopBits = stopBits;
+    info->Parity = parity;
+
+    KeAcquireSpinLock(&g_Capture.Lock, &old);
+    if (g_Capture.Count >= UM_MAX_RECORDS && !IsListEmpty(&g_Capture.Queue)) {
+        PLIST_ENTRY head = RemoveHeadList(&g_Capture.Queue);
+        PUM_RECORD_ITEM oldItem = CONTAINING_RECORD(head, UM_RECORD_ITEM, Entry);
+        g_Capture.Count--;
+        KeReleaseSpinLock(&g_Capture.Lock, old);
+        ExFreeToNPagedLookasideList(&g_Capture.Lookaside, oldItem);
+        InterlockedIncrement((PLONG)&g_Capture.Dropped);
+        KeAcquireSpinLock(&g_Capture.Lock, &old);
+    }
+    InsertTailList(&g_Capture.Queue, &item->Entry);
+    g_Capture.Count++;
+    KeReleaseSpinLock(&g_Capture.Lock, old);
+}
+
+// Completion routine for a serial parameter IOCTL.
+//
+// Reads the resulting configuration out of the IRP buffers. Structures come from
+// ntddser.h:
+//   SERIAL_BAUD_RATE      { ULONG BaudRate; }
+//   SERIAL_LINE_CONTROL   { UCHAR StopBits, Parity, WordLength; }
+//   SERIAL_HANDFLOW       { ULONG ControlHandShake, FlowReplace; LONG XonLimit, XoffLimit; }
+//   SERIAL_TIMEOUTS       { ULONG ReadInterval, ReadTotalMultiplier, ReadTotalConstant,
+//                           WriteTotalMultiplier, WriteTotalConstant; }
+static NTSTATUS UmCtrlComplete(PDEVICE_OBJECT DeviceObject, PIRP Irp, PVOID Context)
+{
+    PUM_CTRL_CTX cctx = (PUM_CTRL_CTX)Context;
+    PIO_STACK_LOCATION stack;
+
+    UNREFERENCED_PARAMETER(DeviceObject);
+
+    stack = IoGetCurrentIrpStackLocation(Irp);
+    if (cctx != NULL) {
+        // Only successful operations describe the port real configuration. A failed
+        // SET_BAUD_RATE leaves the previous rate in place, so recording it would be a lie.
+        if (NT_SUCCESS(Irp->IoStatus.Status)) {
+            ULONG baud = 0;
+            ULONG handFlow = 0;
+            ULONG timeouts[5] = {0, 0, 0, 0, 0};
+            UCHAR dataBits = 0;
+            UCHAR stopBits = 0;
+            UCHAR parity = 0;
+            PVOID buf = Irp->AssociatedIrp.SystemBuffer;
+
+            if (buf == NULL) {
+                buf = Irp->UserBuffer;
+            }
+            if (buf != NULL) {
+                switch (cctx->IoctlCode) {
+                case UM_IOCTL_SERIAL_SET_BAUD_RATE:
+                case UM_IOCTL_SERIAL_GET_BAUD_RATE:
+                    baud = *(PULONG)buf;
+                    break;
+                case UM_IOCTL_SERIAL_SET_LINE_CONTROL:
+                case UM_IOCTL_SERIAL_GET_LINE_CONTROL:
+                    dataBits = ((PUCHAR)buf)[2];   // WordLength
+                    stopBits = ((PUCHAR)buf)[0];   // StopBits
+                    parity   = ((PUCHAR)buf)[1];   // Parity
+                    break;
+                case UM_IOCTL_SERIAL_SET_HANDFLOW:
+                case UM_IOCTL_SERIAL_GET_HANDFLOW:
+                    handFlow = *(PULONG)buf;
+                    break;
+                case UM_IOCTL_SERIAL_SET_TIMEOUTS:
+                case UM_IOCTL_SERIAL_GET_TIMEOUTS:
+                    RtlCopyMemory(timeouts, buf, sizeof(timeouts));
+                    break;
+                default:
+                    break;
+                }
+            }
+            UmQueueControlRecord(cctx->IoctlCode, cctx->Pid, cctx->PortIndex,
+                                 cctx->PortId, baud, handFlow, timeouts,
+                                 dataBits, stopBits, parity);
+        }
+        ExFreeToNPagedLookasideList(&g_Capture.CtxLookaside, cctx);
+    }
+    if (Irp->PendingReturned) {
+        IoMarkIrpPending(Irp);
+    }
+    return STATUS_SUCCESS;
+}
+
 static NTSTATUS UmReadWriteComplete(PDEVICE_OBJECT DeviceObject, PIRP Irp, PVOID Context)
 {
     PUM_IRP_CTX ctx = (PUM_IRP_CTX)Context;
@@ -437,6 +624,34 @@ static NTSTATUS UmFilterDispatch(PDEVICE_OBJECT DeviceObject, PIRP Irp)
             InterlockedIncrement((PLONG)&g_Capture.Dropped);
             // Allocation failed: fall through to a plain pass-through so the I/O still
             // completes 鈥?losing one capture is better than losing the application's data.
+        }
+    } else if (stack->MajorFunction == IRP_MJ_DEVICE_CONTROL) {
+        // Serial parameter changes are reported, never altered.
+        //
+        // The completion routine reads the parameters AFTER the serial driver accepted
+        // them, so the record shows what the port actually uses rather than what the
+        // application asked for. A rejected SET_BAUD_RATE therefore produces no record,
+        // which is the useful behaviour: the trace shows the real configuration.
+        ULONG code = stack->Parameters.DeviceIoControl.IoControlCode;
+        if (UmIsSerialControlIoctl(code)) {
+            PUM_CTRL_CTX cctx = (PUM_CTRL_CTX)
+                ExAllocateFromNPagedLookasideList(&g_Capture.CtxLookaside);
+            if (cctx != NULL) {
+                cctx->IoctlCode = code;
+                cctx->Pid = (ULONG)(ULONG_PTR)PsGetCurrentProcessId();
+                cctx->PortIndex = ctx->Index;
+                cctx->PortId = ctx->PortId;
+                IoCopyCurrentIrpStackLocationToNext(Irp);
+                {
+                    PIO_STACK_LOCATION next = IoGetNextIrpStackLocation(Irp);
+                    next->CompletionRoutine = UmCtrlComplete;
+                    next->Context = cctx;
+                    next->Control = SL_INVOKE_ON_SUCCESS | SL_INVOKE_ON_ERROR |
+                                    SL_INVOKE_ON_CANCEL;
+                }
+                return IoCallDriver(ctx->Lower, Irp);
+            }
+            InterlockedIncrement((PLONG)&g_Capture.Dropped);
         }
     }
 

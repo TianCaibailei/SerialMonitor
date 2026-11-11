@@ -105,15 +105,86 @@ impl DriverStats {
     }
 }
 
-/// One captured chunk, decoded from the driver's wire format.
+/// What kind of event a record describes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecordKind {
+    /// Bytes the application read from the port.
+    Rx,
+    /// Bytes the application wrote to the port.
+    Tx,
+    /// A serial parameter change (baud rate, line control, handflow, timeouts).
+    Control,
+}
+
+/// Decoded serial parameter change carried by a RecordKind::Control record.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ControlInfo {
+    pub ioctl_code: u32,
+    pub baud_rate: u32,
+    pub hand_flow: u32,
+    pub timeouts: [u32; 5],
+    pub data_bits: u8,
+    pub stop_bits: u8,
+    pub parity: u8,
+}
+
+impl ControlInfo {
+    pub fn summary(&self) -> String {
+        const BAUD_SET: u32 = 0x001B_0004;
+        const BAUD_GET: u32 = 0x001B_0050;
+        const LINE_SET: u32 = 0x001B_000C;
+        const LINE_GET: u32 = 0x001B_0054;
+        const TO_SET: u32 = 0x001B_001C;
+        const TO_GET: u32 = 0x001B_0058;
+        const HF_SET: u32 = 0x001B_0044;
+        const HF_GET: u32 = 0x001B_0060;
+
+        match self.ioctl_code {
+            BAUD_SET => format!("设置波特率 {}", self.baud_rate),
+            BAUD_GET => format!("读取波特率 {}", self.baud_rate),
+            LINE_SET | LINE_GET => {
+                let parity = match self.parity {
+                    1 => "O",
+                    2 => "E",
+                    3 => "M",
+                    4 => "S",
+                    _ => "N",
+                };
+                let stop = match self.stop_bits {
+                    1 => "1.5",
+                    2 => "2",
+                    _ => "1",
+                };
+                format!("{}{}{}", self.data_bits, parity, stop)
+            }
+            TO_SET | TO_GET => format!(
+                "超时 {}/{}/{}/{}/{}",
+                self.timeouts[0], self.timeouts[1], self.timeouts[2],
+                self.timeouts[3], self.timeouts[4]
+            ),
+            HF_SET | HF_GET => format!("流控 0x{:X}", self.hand_flow),
+            other => format!("串口参数 0x{other:08X}"),
+        }
+    }
+}
+
+/// One record decoded from the driver's wire format.
 #[derive(Clone, Debug)]
 pub struct Record {
-    pub dir_tx: bool,
+    pub kind: RecordKind,
     pub pid: u32,
     pub port_index: u32,
     pub handle: u64,
     pub timestamp: u64,
     pub data: Vec<u8>,
+    /// Populated only for RecordKind::Control.
+    pub control: Option<ControlInfo>,
+}
+
+impl Record {
+    pub fn dir_tx(&self) -> bool {
+        self.kind == RecordKind::Tx
+    }
 }
 
 /// An attached port the driver knows about.
@@ -416,21 +487,51 @@ impl DriverHandle {
         let handle = u64::from_le_bytes(handle);
         let timestamp = u64::from_le_bytes(ts);
         let take = size.min(MAX_PAYLOAD).min(buf.len().saturating_sub(RECORD_HEADER));
+        let payload = &buf[RECORD_HEADER..RECORD_HEADER + take];
+
+        // Direction 2 is a serial parameter change, not captured bytes. It travels in the
+        // same queue so the UI can show it inline as its own row kind.
+        let (kind, control) = if dir == 2 {
+            const CTRL_SIZE: usize = 36;
+            let mut info = ControlInfo::default();
+            if payload.len() >= CTRL_SIZE {
+                let u = |o: usize| {
+                    u32::from_le_bytes([
+                        payload[o], payload[o + 1], payload[o + 2], payload[o + 3],
+                    ])
+                };
+                info.ioctl_code = u(0);
+                info.baud_rate = u(4);
+                info.hand_flow = u(8);
+                for k in 0..5 {
+                    info.timeouts[k] = u(12 + k * 4);
+                }
+                info.data_bits = payload[32];
+                info.stop_bits = payload[33];
+                info.parity = payload[34];
+            }
+            (RecordKind::Control, Some(info))
+        } else if dir == 1 {
+            (RecordKind::Tx, None)
+        } else {
+            (RecordKind::Rx, None)
+        };
+
         Some(Record {
-            dir_tx: dir == 1,
+            kind,
             pid,
             port_index,
             handle,
             timestamp,
-            data: buf[RECORD_HEADER..RECORD_HEADER + take].to_vec(),
+            data: payload.to_vec(),
+            control,
         })
     }
 
     /// Frames the driver has queued right now (from IOCTL_UM_GET_STATS).
     ///
     /// Used by the UI to tell "capture is running but nothing is transmitted" apart from
-    /// "the driver is not seeing traffic at all" — two situations that look identical in
-    /// the table but need completely different fixes.
+    /// "the driver is not seeing traffic at all".
     pub fn queued(&self) -> Option<u32> {
         self.stats().map(|s| s.records)
     }
