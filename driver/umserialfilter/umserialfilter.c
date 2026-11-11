@@ -299,16 +299,71 @@ static NTSTATUS UmFilterDispatch(PDEVICE_OBJECT DeviceObject, PIRP Irp)
             irpCtx->Pid = (ULONG)(ULONG_PTR)PsGetCurrentProcessId();
             irpCtx->PortIndex = ctx->Index;
             irpCtx->Handle = (ULONG64)(ULONG_PTR)ctx->Physical;
-            stack->CompletionRoutine = UmReadWriteComplete;
-            stack->Context = irpCtx;
-            stack->Control = SL_INVOKE_ON_SUCCESS | SL_INVOKE_ON_ERROR | SL_INVOKE_ON_CANCEL;
+            // A completion routine needs its OWN stack location.
+            // IoSkipCurrentIrpStackLocation makes the lower driver REUSE our stack
+            // location, so writing CompletionRoutine into it afterwards corrupts what the
+            // lower driver reads. That broke every request on the port: IRP_MJ_CREATE
+            // failed with "Incorrect function" (the port looked busy to every serial
+            // tool), and readers waited forever for a reply that never came — exactly the
+            // hang seen in both umfilter_reader and the GUI.
+            IoCopyCurrentIrpStackLocationToNext(Irp);
+            {
+                PIO_STACK_LOCATION next = IoGetNextIrpStackLocation(Irp);
+                next->CompletionRoutine = UmReadWriteComplete;
+                next->Context = irpCtx;
+                next->Control = SL_INVOKE_ON_SUCCESS | SL_INVOKE_ON_ERROR | SL_INVOKE_ON_CANCEL;
+            }
+            return IoCallDriver(ctx->Lower, Irp);
         } else {
             InterlockedIncrement((PLONG)&g_Capture.Dropped);
+            // Allocation failed: fall through to a plain pass-through so the I/O still
+            // completes — losing one capture is better than losing the application's data.
         }
     }
 
     IoSkipCurrentIrpStackLocation(Irp);
     return IoCallDriver(ctx->Lower, Irp);
+}
+
+// Forward declarations (the dispatch entries below are referenced by the shared table).
+static NTSTATUS UmFilterDispatch(PDEVICE_OBJECT DeviceObject, PIRP Irp);
+static NTSTATUS UmFilterPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp);
+static NTSTATUS UmFilterPower(PDEVICE_OBJECT DeviceObject, PIRP Irp);
+
+// ---------------------------------------------------------------------------
+// Per-device dispatch
+// ---------------------------------------------------------------------------
+//
+// THE BUG THIS FIXES
+// ------------------
+// Windows gives every device of a driver the SAME MajorFunction table, so the filter
+// devices and the control device necessarily share entry points. The original code put
+// the control handlers there for every device, so IRP_MJ_CREATE on a serial port was
+// answered by UmControlCreate — completing the open immediately — and the real serial
+// driver never saw it. Consequences: every COM port looked occupied ("Incorrect
+// function"), no data ever flowed, and user-mode readers blocked forever waiting for a
+// reply that would never come (the umfilter_reader / GUI hang).
+//
+// The fix: the shared entries branch on whether the device has a lower device attached.
+// A control device has Lower == NULL; a filter device has Lower != NULL and must forward
+// everything untouched.
+
+// Detach and delete our filter device only AFTER the lower stack finished the remove IRP.
+//
+// Calling IoDetachDevice + IoDeleteDevice immediately after IoCallDriver is a
+// use-after-free: the lower driver may complete asynchronously, and our device object
+// (along with the IRP's stack location living in it) would already be gone. The
+// completion routine defers the teardown to the right moment.
+static NTSTATUS UmRemoveComplete(PDEVICE_OBJECT DeviceObject, PIRP Irp, PVOID Context)
+{
+    PUM_DEVICE_CTX ctx = (PUM_DEVICE_CTX)Context;
+    UNREFERENCED_PARAMETER(Irp);
+    if (ctx != NULL && ctx->Lower != NULL) {
+        IoDetachDevice(ctx->Lower);
+        ctx->Lower = NULL;
+    }
+    IoDeleteDevice(DeviceObject);
+    return STATUS_SUCCESS; // let the I/O manager finish the IRP
 }
 
 static NTSTATUS UmFilterPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp)
@@ -316,24 +371,41 @@ static NTSTATUS UmFilterPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     PUM_DEVICE_CTX ctx = (PUM_DEVICE_CTX)DeviceObject->DeviceExtension;
     PIO_STACK_LOCATION stack = IoGetCurrentIrpStackLocation(Irp);
 
+    if (ctx->Lower == NULL) {
+        // Already detached (or never attached): nothing to forward to.
+        Irp->IoStatus.Status = STATUS_DEVICE_NOT_CONNECTED;
+        Irp->IoStatus.Information = 0;
+        IoCompleteRequest(Irp, IO_NO_INCREMENT);
+        return STATUS_DEVICE_NOT_CONNECTED;
+    }
+
     if (stack->MinorFunction == IRP_MN_REMOVE_DEVICE) {
-        IoSkipCurrentIrpStackLocation(Irp);
-        NTSTATUS status = IoCallDriver(ctx->Lower, Irp);
-        if (ctx->Lower != NULL) {
-            IoDetachDevice(ctx->Lower);
-            ctx->Lower = NULL;
+        IoCopyCurrentIrpStackLocationToNext(Irp);
+        {
+            PIO_STACK_LOCATION next = IoGetNextIrpStackLocation(Irp);
+            next->CompletionRoutine = UmRemoveComplete;
+            next->Context = ctx;
+            next->Control = SL_INVOKE_ON_SUCCESS | SL_INVOKE_ON_ERROR | SL_INVOKE_ON_CANCEL;
         }
-        IoDeleteDevice(DeviceObject);
-        return status;
+        return IoCallDriver(ctx->Lower, Irp);
     }
     IoSkipCurrentIrpStackLocation(Irp);
     return IoCallDriver(ctx->Lower, Irp);
 }
 
+// Power IRPs pass straight through. PoStartNextPowerIrp is deliberately not called:
+// it is only required when the driver installs a power completion routine, and calling
+// it unconditionally on a pass-through double-advances the power state machine.
 static NTSTATUS UmFilterPower(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 {
     PUM_DEVICE_CTX ctx = (PUM_DEVICE_CTX)DeviceObject->DeviceExtension;
-    PoStartNextPowerIrp(Irp);
+    if (ctx->Lower == NULL) {
+        PoStartNextPowerIrp(Irp);
+        Irp->IoStatus.Status = STATUS_DEVICE_NOT_CONNECTED;
+        Irp->IoStatus.Information = 0;
+        IoCompleteRequest(Irp, IO_NO_INCREMENT);
+        return STATUS_DEVICE_NOT_CONNECTED;
+    }
     IoSkipCurrentIrpStackLocation(Irp);
     return PoCallDriver(ctx->Lower, Irp);
 }
@@ -474,6 +546,26 @@ static NTSTATUS UmAttachOne(PDEVICE_OBJECT target, ULONG index, PCWSTR name)
     filter->Flags &= ~DO_DEVICE_INITIALIZING;
     g_Capture.AttachedNames[index] = name;
     return STATUS_SUCCESS;
+}
+
+// ---------------------------------------------------------------------------
+// Device-kind dispatch (the kernel has no per-device dispatch table)
+// ---------------------------------------------------------------------------
+//
+// Windows gives every device object of a driver the SAME MajorFunction table, so the
+// filter devices and the control device necessarily share entry points. The original code
+// installed the control-device handlers for every device, which meant IRP_MJ_CREATE on a
+// serial port was answered by UmControlCreate (completing it immediately) instead of being
+// forwarded — that is what made every COM port unusable while the driver was loaded.
+//
+// The fix: the shared entries branch on whether the device has a lower device attached.
+// A control device has Lower == NULL and owns the IOCTL interface; a filter device has
+// Lower != NULL and must forward everything untouched.
+
+static BOOLEAN UmIsControlDevice(PDEVICE_OBJECT DeviceObject)
+{
+    PUM_DEVICE_CTX ctx = (PUM_DEVICE_CTX)DeviceObject->DeviceExtension;
+    return ctx != NULL && ctx->Lower == NULL && ctx->PassThroughOnly;
 }
 
 // Enumerate \Device and attach to every child that looks like a serial port.
@@ -754,9 +846,18 @@ static ULONG UmGetAttachedName(PUCHAR out, ULONG outLen, ULONG index)
 // Control device (user-mode interface)
 // ---------------------------------------------------------------------------
 
+// IRP_MJ_CREATE for EVERY device of this driver.
+//
+// A control device answers the open itself; a filter device sitting above a serial port
+// must forward it, because whether the port opens belongs to the real serial driver.
+// Answering it locally was the bug that made every COM port appear unusable while the
+// filter was loaded: the open "succeeded" on our device without the serial driver ever
+// seeing it, so no data ever flowed and readers waited forever.
 static NTSTATUS UmControlCreate(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 {
-    UNREFERENCED_PARAMETER(DeviceObject);
+    if (!UmIsControlDevice(DeviceObject)) {
+        return UmFilterDispatch(DeviceObject, Irp);
+    }
     g_Capture.Enabled = 1;
     Irp->IoStatus.Status = STATUS_SUCCESS;
     Irp->IoStatus.Information = 0;
@@ -764,9 +865,12 @@ static NTSTATUS UmControlCreate(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     return STATUS_SUCCESS;
 }
 
+// IRP_MJ_CLOSE: same split between control and filter devices.
 static NTSTATUS UmControlClose(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 {
-    UNREFERENCED_PARAMETER(DeviceObject);
+    if (!UmIsControlDevice(DeviceObject)) {
+        return UmFilterDispatch(DeviceObject, Irp);
+    }
     Irp->IoStatus.Status = STATUS_SUCCESS;
     Irp->IoStatus.Information = 0;
     IoCompleteRequest(Irp, IO_NO_INCREMENT);
@@ -783,7 +887,11 @@ static NTSTATUS UmControlIoctl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     ULONG inLen = stack->Parameters.DeviceIoControl.InputBufferLength;
     PVOID buf = Irp->AssociatedIrp.SystemBuffer;
 
-    UNREFERENCED_PARAMETER(DeviceObject);
+    // A serial port's own IOCTLs (baud rate, line control, handshake...) must reach the
+    // serial driver untouched. Only the control device interprets UM_* codes.
+    if (!UmIsControlDevice(DeviceObject)) {
+        return UmFilterDispatch(DeviceObject, Irp);
+    }
 
     switch (code) {
     case IOCTL_UM_GET_RECORD:
