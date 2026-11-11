@@ -101,7 +101,11 @@ typedef struct _UM_CAPTURE {
     ULONGLONG Received;
     ULONGLONG Sent;
     ULONG AttachedCount;
+    // Physical device (the serial PDO/FDO) each filter sits above…
     PDEVICE_OBJECT Attached[UM_MAX_FILTERS];
+    // …and our filter object for it. Both are kept so teardown never has to guess the
+    // filter by walking the stack.
+    PDEVICE_OBJECT AttachedFilters[UM_MAX_FILTERS];
     PCWSTR AttachedNames[UM_MAX_FILTERS];
 } UM_CAPTURE, *PUM_CAPTURE;
 
@@ -253,16 +257,30 @@ static NTSTATUS UmReadWriteComplete(PDEVICE_OBJECT DeviceObject, PIRP Irp, PVOID
     if (ctx != NULL) {
         if (NT_SUCCESS(Irp->IoStatus.Status) && Irp->IoStatus.Information > 0) {
             ULONG len = (ULONG)Irp->IoStatus.Information;
+            // Clamp to what the caller actually asked for. A driver may report more bytes
+            // than the request length in rare cases; copying that much would read past the
+            // end of the buffer.
+            ULONG requested = (stack->MajorFunction == IRP_MJ_READ)
+                                  ? stack->Parameters.Read.Length
+                                  : stack->Parameters.Write.Length;
             PVOID buf = NULL;
 
-            if (Irp->AssociatedIrp.SystemBuffer != NULL) {
-                buf = Irp->AssociatedIrp.SystemBuffer;
-            } else if (Irp->MdlAddress != NULL) {
+            if (len > requested) {
+                len = requested;
+            }
+
+            // Buffer-source order matters. Serial drivers overwhelmingly use DO_DIRECT_IO,
+            // so the MDL is the normal case and SystemBuffer is usually NULL — checking
+            // SystemBuffer first (as an earlier version did) missed every such transfer.
+            // UserBuffer is the fallback for METHOD_NEITHER and is valid for reads too.
+            if (Irp->MdlAddress != NULL) {
                 buf = MmGetSystemAddressForMdlSafe(Irp->MdlAddress, NormalPagePriority);
-            } else if (stack->MajorFunction == IRP_MJ_WRITE) {
+            } else if (Irp->AssociatedIrp.SystemBuffer != NULL) {
+                buf = Irp->AssociatedIrp.SystemBuffer;
+            } else {
                 buf = Irp->UserBuffer;
             }
-            if (buf != NULL) {
+            if (buf != NULL && len > 0) {
                 UmQueueRecord(ctx->Dir, ctx->Pid, ctx->PortIndex, ctx->Handle, (const UCHAR *)buf, len);
             }
         }
@@ -542,9 +560,15 @@ static NTSTATUS UmAttachOne(PDEVICE_OBJECT target, ULONG index, PCWSTR name)
         IoDeleteDevice(filter);
         return STATUS_DEVICE_NOT_CONNECTED;
     }
-    filter->Flags |= ctx->Lower->Flags & (DO_BUFFERED_IO | DO_DIRECT_IO | DO_POWER_PAGABLE);
+    // Inherit the stack's buffering and power flags. DO_POWER_INRUSH matters for devices
+    // that draw inrush current at power-up; a filter must not clear it or the device may
+    // not power on reliably.
+    filter->Flags |= ctx->Lower->Flags &
+                     (DO_BUFFERED_IO | DO_DIRECT_IO | DO_POWER_PAGABLE | DO_POWER_INRUSH);
     filter->Flags &= ~DO_DEVICE_INITIALIZING;
     g_Capture.AttachedNames[index] = name;
+    // Record the filter object so DriverUnload can detach/delete it without guessing.
+    g_Capture.AttachedFilters[index] = filter;
     return STATUS_SUCCESS;
 }
 
@@ -664,6 +688,7 @@ static ULONG UmAttachAllPorts(VOID)
                                     KIRQL old;
                                     KeAcquireSpinLock(&g_AttachLock, &old);
                                     g_Capture.Attached[(ULONG)idx] = NULL;
+                                    g_Capture.AttachedFilters[(ULONG)idx] = NULL;
                                     g_Capture.AttachedNames[(ULONG)idx] = NULL;
                                     KeReleaseSpinLock(&g_AttachLock, old);
                                 }
@@ -757,6 +782,7 @@ static NTSTATUS UmHotplugAttachLink(PUNICODE_STRING link)
         KIRQL old;
         KeAcquireSpinLock(&g_AttachLock, &old);
         g_Capture.Attached[(ULONG)index] = NULL;
+        g_Capture.AttachedFilters[(ULONG)index] = NULL;
         g_Capture.AttachedNames[(ULONG)index] = NULL;
         KeReleaseSpinLock(&g_AttachLock, old);
     }
@@ -877,6 +903,24 @@ static NTSTATUS UmControlClose(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     return STATUS_SUCCESS;
 }
 
+// IRP_MJ_CLEANUP: the last handle to the device is being closed.
+//
+// A filter driver MUST forward this. Windows delivers CLEANUP before CLOSE, and the
+// serial driver uses it to abort pending reads and release port resources. Without the
+// forward, an application that closes its port leaves stale state behind — which shows up
+// as "the port is still busy" on the next open. The reference driver handles CLEANUP in
+// the same branch as CLOSE for exactly this reason.
+static NTSTATUS UmControlCleanup(PDEVICE_OBJECT DeviceObject, PIRP Irp)
+{
+    if (!UmIsControlDevice(DeviceObject)) {
+        return UmFilterDispatch(DeviceObject, Irp);
+    }
+    Irp->IoStatus.Status = STATUS_SUCCESS;
+    Irp->IoStatus.Information = 0;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return STATUS_SUCCESS;
+}
+
 static NTSTATUS UmControlIoctl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 {
     PIO_STACK_LOCATION stack = IoGetCurrentIrpStackLocation(Irp);
@@ -977,8 +1021,33 @@ static VOID UmDriverUnload(PDRIVER_OBJECT DriverObject)
         IoDeleteDevice(g_ControlDevice);
         g_ControlDevice = NULL;
     }
-    // Detach every filter we installed, newest first.
+    // Tear down every filter device we attached.
+    //
+    // An earlier version only reset AttachedCount to zero, which leaked the device
+    // objects AND left them attached to the serial stacks. Driver unload then freed the
+    // driver while live filter devices still pointed at its dispatch table — a guaranteed
+    // bugcheck on the next serial I/O. Each filter must be detached and deleted for real.
+    //
+    // The filter objects are recorded in AttachedFilters[] precisely so this loop does not
+    // have to guess them from the stack.
     while (g_Capture.AttachedCount > 0) {
+        ULONG i = g_Capture.AttachedCount - 1;
+        PDEVICE_OBJECT filter = g_Capture.AttachedFilters[i];
+        PDEVICE_OBJECT physical = g_Capture.Attached[i];
+
+        if (filter != NULL) {
+            PUM_DEVICE_CTX fctx = (PUM_DEVICE_CTX)filter->DeviceExtension;
+            // Clear Lower first so any IRP still in flight through this filter sees a
+            // disconnected device instead of a freed one.
+            fctx->Lower = NULL;
+            if (physical != NULL) {
+                IoDetachDevice(physical);
+            }
+            IoDeleteDevice(filter);
+        }
+        g_Capture.AttachedFilters[i] = NULL;
+        g_Capture.Attached[i] = NULL;
+        g_Capture.AttachedNames[i] = NULL;
         g_Capture.AttachedCount--;
     }
     ExDeleteNPagedLookasideList(&g_Capture.Lookaside);
@@ -1033,6 +1102,14 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 
     DriverObject->MajorFunction[IRP_MJ_CREATE] = UmControlCreate;
     DriverObject->MajorFunction[IRP_MJ_CLOSE] = UmControlClose;
+    // CLEANUP and INTERNAL_DEVICE_CONTROL are the two the reference driver sets and an
+    // earlier version of this one omitted:
+    //   * CLEANUP must reach the serial driver so a closed port is really released.
+    //   * INTERNAL_DEVICE_CONTROL carries the private requests stacked drivers use
+    //     (usbser / SerCx rely on it); leaving it unassigned makes IRP_MJ dispatch fall
+    //     through to IopInvalidDeviceRequest.
+    DriverObject->MajorFunction[IRP_MJ_CLEANUP] = UmControlCleanup;
+    DriverObject->MajorFunction[IRP_MJ_INTERNAL_DEVICE_CONTROL] = UmControlIoctl;
     DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = UmControlIoctl;
     DriverObject->MajorFunction[IRP_MJ_READ] = UmFilterDispatch;
     DriverObject->MajorFunction[IRP_MJ_WRITE] = UmFilterDispatch;
