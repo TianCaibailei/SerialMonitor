@@ -56,9 +56,26 @@
 #define IOCTL_UM_AUTHENTICATE \
     CTL_CODE(UM_DEVICE_TYPE, 0x805, METHOD_BUFFERED, FILE_WRITE_DATA)
 
-// IoDeviceObjectType is exported by ntoskrnl but not declared by the WDK NuGet km headers.
-// ObReferenceObjectByName needs it to know we are asking for a device object.
+// The WDK NuGet km headers do not declare these, so they would otherwise compile as
+// implicit int returns — which silently truncates 64-bit pointers and hand back garbage
+// STATUS values. Declaring them explicitly is REQUIRED for correct code on x64.
 extern POBJECT_TYPE *IoDeviceObjectType;
+
+NTSTATUS NTAPI ZwOpenDirectoryObject(
+    PHANDLE DirectoryHandle,
+    ACCESS_MASK DesiredAccess,
+    POBJECT_ATTRIBUTES ObjectAttributes);
+
+// Parameter order per ntifs.h:
+//   (Handle, Buffer, Length, ReturnSingleEntry, RestartScan, Context, ReturnLength)
+NTSTATUS NTAPI ZwQueryDirectoryObject(
+    HANDLE DirectoryHandle,
+    PVOID Buffer,
+    ULONG Length,
+    BOOLEAN ReturnSingleEntry,
+    BOOLEAN RestartScan,
+    PULONG Context,
+    PULONG ReturnLength);
 
 #define UM_CTX_AUTHENTICATED 0x00000001UL
 // Registry location where the session key is published.
@@ -172,7 +189,7 @@ static UM_CAPTURE g_Capture;
 // Slot bookkeeping used by the PnP/removal path (which appears earlier in this file than
 // the definitions, so the prototypes have to live here).
 static BOOLEAN UmAlreadyAttached(PDEVICE_OBJECT physical);
-static LONG UmRegisterAttached(PDEVICE_OBJECT physical, PCWSTR name);
+static LONG UmRegisterAttached(PDEVICE_OBJECT physical, PWSTR name);
 static VOID UmFreeSlotResources(ULONG index);
 static PWSTR UmDuplicateName(PCUNICODE_STRING name);
 
@@ -684,7 +701,7 @@ static BOOLEAN UmIsSafeSerialTarget(PDEVICE_OBJECT Target, PCUNICODE_STRING Name
 // conflicts with the real BOOLEAN/LONG definitions.
 // (prototypes are at the top of the file)
 
-static NTSTATUS UmAttachOne(PDEVICE_OBJECT target, ULONG index, PCWSTR name)
+static NTSTATUS UmAttachOne(PDEVICE_OBJECT target, ULONG index, PWSTR name)
 {
     PDEVICE_OBJECT filter = NULL;
     PUM_DEVICE_CTX ctx;
@@ -698,29 +715,55 @@ static NTSTATUS UmAttachOne(PDEVICE_OBJECT target, ULONG index, PCWSTR name)
     // PDO owns. Passing target->Characteristics through verbatim made IoCreateDevice fail
     // with STATUS_INVALID_PARAMETER for stacks that set FILE_REMOVABLE_MEDIA /
     // FILE_DEVICE_IS_MOUNTABLE_DEVICE, and the failure was silent (attach just returned 0).
+    // ORDER MATTERS — this replicates the reference driver sub_11308 exactly:
+    //   0x1133e  IoCreateDevice(...)
+    //   0x1134c  copy DO_BUFFERED_IO from the lower device
+    //   0x11359  copy DO_DIRECT_IO from the lower device
+    //   0x11366  copy FILE_DEVICE_SECURE_OPEN from the lower Characteristics
+    //   0x1137b  filter->Flags |= DO_POWER_PAGABLE
+    //   0x11383  IoAttachDeviceToDeviceStack
+    //   0x113df  filter->Flags &= ~DO_DEVICE_INITIALIZING
+    //
+    // The flags are set BEFORE attaching. Setting them afterwards leaves the device with
+    // wrong buffering/power flags for the window in which the lower stack can already
+    // receive IRPs through us.
     status = IoCreateDevice(
         g_DriverObject, sizeof(UM_DEVICE_CTX), NULL,
-        target->DeviceType, FILE_DEVICE_SECURE_OPEN,
+        target->DeviceType, 0,
         FALSE, &filter);
     if (!NT_SUCCESS(status)) {
         return status;
     }
+
+    // (2)(3) buffering mode must match the device below.
+    if (target->Flags & DO_BUFFERED_IO) {
+        filter->Flags |= DO_BUFFERED_IO;
+    }
+    if (target->Flags & DO_DIRECT_IO) {
+        filter->Flags |= DO_DIRECT_IO;
+    }
+    // (4) SECURE_OPEN must be mirrored or the open path changes behaviour.
+    if (target->Characteristics & FILE_DEVICE_SECURE_OPEN) {
+        filter->Characteristics |= FILE_DEVICE_SECURE_OPEN;
+    }
+    // (5) pagable power IRPs.
+    filter->Flags |= DO_POWER_PAGABLE;
+
     ctx = (PUM_DEVICE_CTX)filter->DeviceExtension;
     RtlZeroMemory(ctx, sizeof(UM_DEVICE_CTX));
     ctx->Self = filter;
     ctx->Physical = target;
     ctx->Index = index;
     ctx->PortId = (ULONG64)InterlockedIncrement64(&g_Capture.NextPortId);
+
+    // (6) attach above the target.
     ctx->Lower = IoAttachDeviceToDeviceStack(filter, target);
     if (ctx->Lower == NULL) {
         IoDeleteDevice(filter);
         return STATUS_DEVICE_NOT_CONNECTED;
     }
-    // Inherit the stack's buffering and power flags. DO_POWER_INRUSH matters for devices
-    // that draw inrush current at power-up; a filter that drops it can break the power
-    // budget for the whole stack.
-    filter->Flags |= ctx->Lower->Flags &
-                     (DO_BUFFERED_IO | DO_DIRECT_IO | DO_POWER_PAGABLE | DO_POWER_INRUSH);
+    // (7) the device is live now; the I/O manager may clear this itself only for devices
+    // created inside DriverEntry, and ours are created later, so clear it explicitly.
     filter->Flags &= ~DO_DEVICE_INITIALIZING;
     g_Capture.AttachedNames[index] = name;
     // Record the filter object so DriverUnload can detach/delete it without guessing.
@@ -787,10 +830,16 @@ static ULONG UmAttachAllPorts(VOID)
         }
         ULONG retLen = 0;
         ULONG i;
+        // SIGNATURE ORDER MATTERS: (Handle, Buffer, Length,
+        //                            ReturnSingleEntry, RestartScan, Context, ReturnLength)
+        //
+        // These two booleans were previously swapped, which made RestartScan permanently
+        // TRUE: every call re-read the first directory entry and the IOCTL never returned.
+        // That is what hung ATTACH_PORTS.
         status = ZwQueryDirectoryObject(
             dirHandle, buf, bufLen,
-            first,          // TRUE only on the very first iteration
-            TRUE,           // one entry per call
+            TRUE,           // ReturnSingleEntry: one entry per call
+            first,          // RestartScan: TRUE only on the very first iteration
             &context, &retLen);
         first = FALSE;
         if (!NT_SUCCESS(status)) {
@@ -972,7 +1021,7 @@ static BOOLEAN UmAlreadyAttached(PDEVICE_OBJECT physical)
 }
 
 // Claim the first free slot for `physical`. Returns its index, or -1 when full.
-static LONG UmRegisterAttached(PDEVICE_OBJECT physical, PCWSTR name)
+static LONG UmRegisterAttached(PDEVICE_OBJECT physical, PWSTR name)
 {
     LONG index = -1;
     ULONG i;
@@ -1028,14 +1077,18 @@ static NTSTATUS UmHotplugAttachLink(PUNICODE_STRING link)
     LONG index;
     PWSTR nameCopy;
 
-    // Same non-blocking reference as the scan path: opening the device here would wait for
-    // PnP completion inside a notification callback.
-    status = ObReferenceObjectByName(
-        link, OBJ_CASE_INSENSITIVE, NULL, 0,
-        *IoDeviceObjectType, NULL, (PVOID *)&devObj);
-    if (!NT_SUCCESS(status) || devObj == NULL) {
+    // Open the same way the reference driver does (sub_1140c), then drop the file object:
+    // the device object keeps its own reference for as long as the stack exists.
+    //
+    // ObReferenceObjectByName is deliberately NOT used: the WDK NuGet headers do not
+    // declare it, so it compiled as an implicit int return and truncated the pointer to
+    // 32 bits on x64 — a guaranteed access violation the moment the result was used.
+    status = IoGetDeviceObjectPointer(link, FILE_ALL_ACCESS, &fileObj, &devObj);
+    if (!NT_SUCCESS(status) || fileObj == NULL || devObj == NULL) {
         return STATUS_DEVICE_NOT_CONNECTED;
     }
+    ObDereferenceObject(fileObj);
+    ObReferenceObject(devObj);
 
     // Same safety gate as the scan: never splice into a non-serial device, or that driver
     // bugchecks on the IRPs we rewrote.
