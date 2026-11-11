@@ -218,6 +218,8 @@ static UM_CAPTURE g_Capture;
 static BOOLEAN UmAlreadyAttached(PDEVICE_OBJECT physical);
 static LONG UmRegisterAttached(PDEVICE_OBJECT physical, PWSTR name);
 static BOOLEAN UmIsOwnFilterDevice(PDEVICE_OBJECT devObj);
+static PDEVICE_OBJECT UmLowestDevice(PDEVICE_OBJECT devObj);
+static ULONGLONG UmNowUnixMillis(VOID);
 static BOOLEAN UmIsSerialControlIoctl(ULONG Code);
 static NTSTATUS UmCtrlComplete(PDEVICE_OBJECT DeviceObject, PIRP Irp, PVOID Context);
 static VOID UmQueueControlRecord(ULONG ioctlCode, ULONG pid, ULONG portIndex,
@@ -251,6 +253,25 @@ static KSPIN_LOCK g_AttachLock;
 // Capture queue
 // ---------------------------------------------------------------------------
 
+// Current time as Unix milliseconds (1970-01-01 UTC).
+//
+// KeQuerySystemTime returns FILETIME: 100 ns ticks since 1601-01-01. The GUI renders
+// Unix seconds/millis, so converting here once is far less error-prone than having every
+// consumer subtract the epoch itself — an earlier build passed raw FILETIME through and
+// every row showed 1970-01-01.
+static ULONGLONG UmNowUnixMillis(VOID)
+{
+    LARGE_INTEGER now;
+    // 11644473600 seconds between 1601-01-01 and 1970-01-01, in 100 ns ticks.
+    const ULONGLONG EPOCH_DIFF_TICKS = 116444736000000000ULL;
+
+    KeQuerySystemTime(&now);
+    if ((ULONGLONG)now.QuadPart <= EPOCH_DIFF_TICKS) {
+        return 0;
+    }
+    return ((ULONGLONG)now.QuadPart - EPOCH_DIFF_TICKS) / 10000ULL;
+}
+
 static VOID UmQueueRecord(ULONG dir, ULONG pid, ULONG portIndex, ULONG64 handle,
                           const UCHAR *data, ULONG len)
 {
@@ -279,8 +300,7 @@ static VOID UmQueueRecord(ULONG dir, ULONG pid, ULONG portIndex, ULONG64 handle,
     item->Record.Pid = pid;
     item->Record.PortIndex = portIndex;
     item->Record.Handle = handle;
-    KeQuerySystemTime(&now);
-    item->Record.Timestamp = (ULONGLONG)now.QuadPart;
+    item->Record.Timestamp = UmNowUnixMillis();
     RtlCopyMemory(item->Record.Data, data, len);
 
     KeAcquireSpinLock(&g_Capture.Lock, &old);
@@ -413,8 +433,7 @@ static VOID UmQueueControlRecord(ULONG ioctlCode, ULONG pid, ULONG portIndex,
     item->Record.Pid = pid;
     item->Record.PortIndex = portIndex;
     item->Record.Handle = portId;
-    KeQuerySystemTime(&now);
-    item->Record.Timestamp = (ULONGLONG)now.QuadPart;
+    item->Record.Timestamp = UmNowUnixMillis();
     info = (PUM_CTRL_INFO)item->Record.Data;
     info->IoctlCode = ioctlCode;
     info->BaudRate = baudRate;

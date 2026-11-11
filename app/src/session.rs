@@ -95,6 +95,22 @@ pub struct Row {
     pub parsed: Option<ModbusParsed>,
     pub kind: FrameKind,
     pub merged: bool,
+    /// Where the row came from. Driver rows are raw serial bytes captured by the kernel
+    /// filter, not Modbus frames, so the UI must not present a parsed function code for
+    /// them (the parser happily reports 00/"Unknown" for arbitrary bytes).
+    pub origin: RowOrigin,
+    /// Serial parameter change, when this row is a control record.
+    pub control: Option<crate::driver::ControlInfo>,
+}
+
+/// Which capture path produced a row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum RowOrigin {
+    /// Injected hook or a real serial/protocol channel.
+    #[default]
+    Channel,
+    /// Kernel filter driver capture.
+    Driver,
 }
 
 #[derive(Clone)]
@@ -615,6 +631,78 @@ impl Session {
         }
     }
 
+    /// Feed one record captured by the kernel filter driver.
+    ///
+    /// Separate from `ingest` because driver rows are raw serial bytes, not protocol
+    /// frames: no MBAP/ASCII parsing, no row merging, and the row is tagged with its
+    /// origin so the UI shows "串口读/串口写" instead of a meaningless Modbus function
+    /// code (the parser reports 00/"Unknown" for arbitrary bytes).
+    pub fn ingest_driver(
+        &mut self,
+        idx: usize,
+        data: Vec<u8>,
+        secs: u64,
+        millis: u32,
+        dir_tx: bool,
+        control: Option<crate::driver::ControlInfo>,
+    ) {
+        if dir_tx {
+            self.bytes_tx += data.len() as u64;
+        } else if control.is_none() {
+            self.bytes_rx += data.len() as u64;
+        }
+
+        self.seq += 1;
+        let kind = if dir_tx {
+            FrameKind::Req
+        } else {
+            FrameKind::Resp
+        };
+        let row = Row {
+            seq: self.seq,
+            idx,
+            dir_tx,
+            secs,
+            millis,
+            data,
+            parsed: None,
+            kind,
+            merged: false,
+            origin: RowOrigin::Driver,
+            control,
+        };
+        let chan = self
+            .channels
+            .get(idx)
+            .map(|c| c.name.clone())
+            .unwrap_or_else(|| "?".into());
+        if let Some(a) = &mut self.autosave {
+            if a.on {
+                autosave_line(&chan, &row, a);
+            }
+        }
+        match self.rate.last_mut() {
+            Some(e) if e.0 == secs => {
+                if dir_tx {
+                    e.2 += 1;
+                } else {
+                    e.1 += 1;
+                }
+            }
+            _ => {
+                self.rate.push((secs, if dir_tx { 0 } else { 1 }, if dir_tx { 1 } else { 0 }));
+                if self.rate.len() > 600 {
+                    self.rate.remove(0);
+                }
+            }
+        }
+        self.rows.push(row);
+        if self.rows.len() > 1_000_000 {
+            let drop = self.rows.len() - 1_000_000;
+            self.rows.drain(0..drop);
+        }
+    }
+
     pub fn ingest(&mut self, idx: usize, data: Vec<u8>, secs: u64, millis: u32, dir_tx: bool) {
         if dir_tx {
             self.bytes_tx += data.len() as u64;
@@ -756,6 +844,8 @@ impl Session {
             parsed,
             kind,
             merged: false,
+            origin: RowOrigin::Channel,
+            control: None,
         };
         let chan = self
             .channels

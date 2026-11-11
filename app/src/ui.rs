@@ -3,7 +3,7 @@
 use crate::inject::{self, CapMsg};
 use crate::protocol::{self, REQUEST_PRESETS, RESPONSE_PRESETS};
 use crate::session::{
-    bytes_hex, escape_text, fmt_time, now_wall, seed_demo, Autosave, ChanKind, ChannelCfg, Filters,
+    bytes_hex, escape_text, fmt_time, now_wall, seed_demo, Autosave, ChanKind, ChannelCfg, Filters, RowOrigin,
     ProtoType, Session, ViewToggles,
 };
 use egui::{
@@ -127,6 +127,14 @@ pub struct MonitorApp {
     /// 端口序号 → 设备路径。start_driver_capture / 重新扫描时一次性取全，
     /// drain_driver 只查表（见 drain_driver 里的说明）。
     pub drv_names: HashMap<u32, String>,
+    /// Ports the user actually asked to watch, by short name (e.g. "VSerial8_2").
+    ///
+    /// The driver attaches to every serial port and streams everything it sees — that is
+    /// deliberate (it matches the reference product, and it lets the user switch ports
+    /// without re-attaching). Filtering to the selected ports is therefore the UI's job:
+    /// records from a port not in this set are dropped before they become rows.
+    /// An empty set means "no restriction".
+    pub drv_watch: std::collections::HashSet<String>,
     /// 最近一次可用性检测的结果与错误码（错误码用于给签名/权限问题分类）。
     pub drv_avail: bool,
     pub drv_err: u32,
@@ -245,6 +253,7 @@ impl MonitorApp {
             drv_checked: false,
             drv_note: String::new(),
             drv_names: HashMap::new(),
+            drv_watch: std::collections::HashSet::new(),
             drv_avail: false,
             drv_err: 0,
             drv_probe_at: None,
@@ -500,6 +509,23 @@ impl MonitorApp {
         let target = self.drv_pid.unwrap_or(0);
         h.set_target(target);
         self.drv_names = ports.iter().cloned().collect();
+        // Build the watch set from the ports the user selected when creating the session.
+        //
+        // Channel names are the short device names ("VSerial8_2"), which is also how
+        // drain_driver identifies an incoming record, so the two line up without any extra
+        // mapping. When the session has no explicit serial channels every port is allowed,
+        // which keeps the "just show me everything" case working.
+        self.drv_watch.clear();
+        if let Some(s) = self.sessions.get(self.active) {
+            for c in &s.channels {
+                if c.kind == ChanKind::HookSerial {
+                    let n = c.name.trim();
+                    if !n.is_empty() {
+                        self.drv_watch.insert(n.to_string());
+                    }
+                }
+            }
+        }
         self.set_driver_note_for_ports(attached, &ports);
 
         // Move the handle into a capture thread and stream records back over a channel.
@@ -689,6 +715,9 @@ impl MonitorApp {
         // Which session receives driver data? The active passive-monitor session, or a
         // dedicated one created on first record.
         if self.sessions.is_empty() {
+            // A session created purely by driver capture is raw serial traffic, not a
+            // Modbus/TCP conversation — leaving the protocol at its default made the parser
+            // label arbitrary bytes with a meaningless function code.
             let s = Session::new(
                 "驱动捕获".into(),
                 Vec::new(),
@@ -700,6 +729,24 @@ impl MonitorApp {
         }
         let sess_idx = self.active.min(self.sessions.len() - 1);
         for rec in batch {
+            // Drop records from ports the user is not watching.
+            //
+            // The driver streams every attached serial port (by design — see drv_watch).
+            // Without this filter, opening COM6 in a session also showed COM1/COM2/COM7,
+            // which is not what "监视这个端口" means to the user.
+            let rec_name = self
+                .drv_names
+                .get(&rec.port_index)
+                .map(|d| short_dev(d));
+            if !self.drv_watch.is_empty() {
+                let watched = match &rec_name {
+                    Some(n) => self.drv_watch.contains(n),
+                    None => false,
+                };
+                if !watched {
+                    continue;
+                }
+            }
             let key = (sess_idx, rec.port_index);
             let chan = match self.drv_ports.get(&key) {
                 Some(&c) => c,
@@ -731,17 +778,21 @@ impl MonitorApp {
                     idx
                 }
             };
-            // FILETIME (100 ns since 1601) → seconds/millis since midnight.
-            let secs = rec.timestamp / 10_000_000 % 86_400;
-            let millis = (rec.timestamp / 10_000) % 1000;
+            // The driver now reports Unix milliseconds, which is exactly what fmt_time
+            // expects. (An earlier build passed raw FILETIME through here and every row
+            // showed 1970-01-01.)
+            let secs = rec.timestamp / 1000;
+            let millis = (rec.timestamp % 1000) as u32;
             // Read the direction before moving `data` out of `rec`.
             let dir_tx = rec.kind == crate::driver::RecordKind::Tx;
-            self.sessions[sess_idx].ingest(
+            let control = rec.control;
+            self.sessions[sess_idx].ingest_driver(
                 chan,
                 rec.data,
                 secs,
-                millis as u32,
+                millis,
                 dir_tx,
+                control,
             );
         }
     }
@@ -1160,8 +1211,21 @@ impl MonitorApp {
                             ui.colored_label(c, t);
                         });
                         row.col(|ui| {
-                            if let Some(p) = &r.parsed {
-                                ui.label(format!("{:02X} {}", p.function, protocol::fc_name(p.function)));
+                            // For driver-captured serial traffic the "function" column is
+                            // not a Modbus function code: the session protocol may still be
+                            // set to Modbus RTU, in which case the parser reports function
+                            // 00/"Unknown" for what is really just bytes. Show the actual
+                            // meaning — direction and, for control records, the operation.
+                            if let Some(ci) = &r.control {
+                                ui.label(ci.summary());
+                            } else if let Some(p) = &r.parsed {
+                                ui.label(format!(
+                                    "{:02X} {}",
+                                    p.function,
+                                    protocol::fc_name(p.function)
+                                ));
+                            } else if r.origin == RowOrigin::Driver {
+                                ui.label(if r.dir_tx { "串口写" } else { "串口读" });
                             } else {
                                 ui.label(r.kind.name());
                             }
@@ -1182,12 +1246,35 @@ impl MonitorApp {
                             } else {
                                 bytes_hex(&r.data)
                             };
-                            ui.monospace(RichText::new(shown).color(Self::kind_color(r.kind)));
+                            // Colour the payload by direction so reads and writes are
+                            // distinguishable at a glance, matching the 读/写 column.
+                            // Control records get their own colour instead.
+                            let color = if r.control.is_some() {
+                                C_REQ
+                            } else if r.dir_tx {
+                                C_TX
+                            } else {
+                                C_RX
+                            };
+                            ui.monospace(RichText::new(shown).color(color));
                         });
                         row.col(|ui| {
-                            let mut t = escape_text(&r.data, s.ascii_escape);
-                            t.truncate(s.string_len.max(4));
-                            ui.label(t);
+                            // Do NOT truncate by a fixed character count. `string_len` is a
+                            // display preference from the original UI (16 by default) and
+                            // clipping here silently cut most payloads in half —
+                            // "Welcome to UartAssist 23" became "Welcome to UartA".
+                            // The column scrolls/clips visually if it is too narrow, which
+                            // is the right behaviour: the data is still there.
+                            let t = escape_text(&r.data, s.ascii_escape);
+                            // Same direction colouring as the hex column.
+                            let color = if r.control.is_some() {
+                                C_REQ
+                            } else if r.dir_tx {
+                                C_TX
+                            } else {
+                                C_RX
+                            };
+                            ui.colored_label(color, t);
                         });
                     });
                 }
@@ -2477,10 +2564,14 @@ impl eframe::App for MonitorApp {
             .show(ctx, |ui| self.send_pane(ui));
         egui::CentralPanel::default().show(ctx, |ui| self.main_area(ui));
         self.dialogs(ctx);
-        // Live monitoring must repaint continuously: rows arrive from background
-        // threads and the window has to show them without a mouse move.
+        // Live monitoring must repaint continuously: rows arrive from background threads
+        // and the window has to show them without a mouse move.
+        //
+        // 16 ms (~60 fps) rather than 60 ms. At 60 ms a row could sit in the channel for a
+        // whole frame boundary, which read as "the monitor is always one message behind":
+        // sending a second message is what made the first one appear.
         if self.frame_count < 200 || self.monitoring_live() {
-            ctx.request_repaint_after(std::time::Duration::from_millis(60));
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
         }
     }
 }
