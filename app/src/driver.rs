@@ -39,6 +39,8 @@ extern "system" {
 
 const GENERIC_READ: u32 = 0x8000_0000;
 const GENERIC_WRITE: u32 = 0x4000_0000;
+const FILE_SHARE_READ: u32 = 0x0000_0001;
+const FILE_SHARE_WRITE: u32 = 0x0000_0002;
 const OPEN_EXISTING: u32 = 3;
 const INVALID: isize = -1;
 
@@ -144,13 +146,19 @@ unsafe impl Send for DriverHandle {}
 
 impl DriverHandle {
     /// Open the control device. Returns None when the driver is not loaded.
+    ///
+    /// FILE_SHARE_READ | FILE_SHARE_WRITE matters: with share=0 the first open owns the
+    /// device exclusively, so the capture thread holding the handle made every later
+    /// probe from the UI fail with ERROR_SHARING_VIOLATION (32) — the settings dialog
+    /// then showed "driver missing" even though it was running, and set_target/rescan
+    /// silently did nothing.
     pub fn open() -> Option<Self> {
         let path = wide(CHANNEL_NAME);
         let h = unsafe {
             CreateFileW(
                 path.as_ptr(),
                 GENERIC_READ | GENERIC_WRITE,
-                0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
                 std::ptr::null_mut(),
                 OPEN_EXISTING,
                 0,
@@ -244,21 +252,24 @@ impl DriverHandle {
     }
 
     /// 驱动的计数器（含已附加端口数、目标 PID）。
+    ///
+    /// 线格式是 10 个 u32：队列 / 丢弃 / 收低 / 收高 / 发低 / 发高 / 启用 / 目标 PID /
+    /// 已附加 / 保留。收发计数是 64 位的，分两格存放——只取低 32 位会在 4 GB 后回绕。
     pub fn stats(&self) -> Option<DriverStats> {
-        let (buf, n) = self.ioctl(IOCTL_GET_STATS, None, 32)?;
-        if n < 32 {
+        let (buf, n) = self.ioctl(IOCTL_GET_STATS, None, 40)?;
+        if n < 40 {
             return None;
         }
         let u = |o: usize| u32::from_le_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]]);
+        let u64_at = |o: usize| u(o) as u64 | ((u(o + 4) as u64) << 32);
         Some(DriverStats {
             records: u(0),
             dropped: u(4),
-            // 驱动把 64 位计数按 u32 拆成两格写；界面只需要量级，取低位即可。
-            received: u(8) as u64,
-            sent: u(12) as u64,
-            enabled: u(16),
-            target_pid: u(20),
-            attached: u(24),
+            received: u64_at(8),
+            sent: u64_at(16),
+            enabled: u(24),
+            target_pid: u(28),
+            attached: u(32),
         })
     }
 
@@ -269,6 +280,12 @@ impl DriverHandle {
     }
 
     /// Pop one record; None when the queue is empty.
+    ///
+    /// IMPORTANT: this IOCTL completes immediately with a zero-length result when the
+    /// driver's queue is empty — it does NOT block. That is what makes the capture thread
+    /// safe to run at 15 ms intervals. If it ever did block, the UI would freeze the
+    /// moment a port went quiet, which is exactly the failure mode seen with the first
+    /// driver build.
     pub fn next_record(&self) -> Option<Record> {
         let (buf, n) = self.ioctl(IOCTL_GET_RECORD, None, RECORD_HEADER + MAX_PAYLOAD)?;
         if n < RECORD_HEADER as u32 {
@@ -293,6 +310,15 @@ impl DriverHandle {
             timestamp,
             data: buf[RECORD_HEADER..RECORD_HEADER + take].to_vec(),
         })
+    }
+
+    /// Frames the driver has queued right now (from IOCTL_UM_GET_STATS).
+    ///
+    /// Used by the UI to tell "capture is running but nothing is transmitted" apart from
+    /// "the driver is not seeing traffic at all" — two situations that look identical in
+    /// the table but need completely different fixes.
+    pub fn queued(&self) -> Option<u32> {
+        self.stats().map(|s| s.records)
     }
 }
 

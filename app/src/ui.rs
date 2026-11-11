@@ -564,10 +564,17 @@ impl MonitorApp {
         if let Some(stop) = self.drv_stop.take() {
             stop.store(true, std::sync::atomic::Ordering::Relaxed);
         }
-        // join 会等到线程真正退出；如果它正卡在 IOCTL 里，这里的等待也只是毫秒级，
-        // 因为驱动对空队列的 GET_RECORD 是立即返回而不是挂起等待。
+        // Never join on the UI thread.
+        //
+        // A join waits for the capture thread to leave next_record(), and that IOCTL can
+        // be stuck inside a faulty driver. Joining would then freeze the whole window on
+        // a bad driver — precisely the "not responding, cannot even be killed" state seen
+        // with the first driver build. Reaping on a helper thread keeps the UI alive no
+        // matter what the driver does.
         if let Some(t) = self.drv_thread.take() {
-            let _ = t.join();
+            std::thread::spawn(move || {
+                let _ = t.join();
+            });
         }
         self.drv_rx = None;
         self.drv_evt = None;

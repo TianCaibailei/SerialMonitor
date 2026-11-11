@@ -929,17 +929,21 @@ static NTSTATUS UmControlIoctl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
         break;
 
     case IOCTL_UM_GET_STATS:
-        if (buf != NULL && outLen >= 32) {
+        // Layout: 8 x u32. The byte counters are 64-bit, so they are split across two
+        // slots each — truncating them to 32 bits would wrap after 4 GB of traffic.
+        if (buf != NULL && outLen >= 40) {
             PULONG s = (PULONG)buf;
             s[0] = g_Capture.Count;
             s[1] = g_Capture.Dropped;
-            s[2] = (ULONG)g_Capture.Received;
-            s[3] = (ULONG)g_Capture.Sent;
-            s[4] = g_Capture.Enabled;
-            s[5] = g_Capture.TargetPid;
-            s[6] = g_Capture.AttachedCount;
-            s[7] = 0;
-            info = 32;
+            s[2] = (ULONG)(g_Capture.Received & 0xFFFFFFFF);
+            s[3] = (ULONG)(g_Capture.Received >> 32);
+            s[4] = (ULONG)(g_Capture.Sent & 0xFFFFFFFF);
+            s[5] = (ULONG)(g_Capture.Sent >> 32);
+            s[6] = g_Capture.Enabled;
+            s[7] = g_Capture.TargetPid;
+            s[8] = g_Capture.AttachedCount;
+            s[9] = 0;
+            info = 40;
             status = STATUS_SUCCESS;
         } else {
             status = STATUS_BUFFER_TOO_SMALL;
