@@ -128,22 +128,20 @@ pub struct MonitorApp {
     /// 端口序号 → 设备路径。start_driver_capture / 重新扫描时一次性取全，
     /// drain_driver 只查表（见 drain_driver 里的说明）。
     pub drv_names: HashMap<u32, String>,
-    /// Ports the user actually asked to watch, by short name (e.g. "VSerial8_2").
-    ///
-    /// The driver attaches to every serial port and streams everything it sees — that is
-    /// deliberate (it matches the reference product, and it lets the user switch ports
-    /// without re-attaching). Filtering to the selected ports is therefore the UI's job:
-    /// records from a port not in this set are dropped before they become rows.
-    /// An empty set means "no restriction".
-    pub drv_watch: std::collections::HashSet<String>,
-    // ---- 会话级「监视端口」过滤（过滤设置对话框）----
+    // ---- 端口过滤：统一由「过滤设置 → 监视端口」控制 ----
     //
-    // 端口过滤是**会话**属性（两个会话可以分别盯不同端口），所以真正生效的状态在
-    // `Session::port_watch` / `Session::port_watch_on` 上；这里只放两份副本：
+    // 两套捕获路径（注入 / 驱动）看到的世界不一样，过滤必须收敛到一处，否则用户
+    // 要在两个地方各勾一遍，而且两个地方用的是**不同的名字**（驱动用设备短名
+    // `VSerial8_2`，注入用 COM 号 `COM6`），对不上就会静默失效。
     //
-    //  * `fport_*`       —— 上一次「应用」的结果，同时是新建会话的默认值和 config.ini 的落盘值
-    //                       （本程序不落盘会话本身，config.ini 是它唯一能跨重启保留的位置）；
-    //  * `fport_draft_*` —— 对话框里正在编辑、还没点「应用」的草稿。
+    // 统一后的规则：
+    //   * 唯一生效状态是 `Session::port_watch` / `port_watch_on`，按 **COM 号** 匹配；
+    //   * 注入路径在 route_hook_data 里用它筛；
+    //   * 驱动路径在 drain_driver 里用它筛；
+    //   * 「驱动捕获设置」不再持有自己的端口白名单（原来的 drv_watch 已删除）。
+    //
+    // 这样用户只需要在一个地方表达「我关心 COM6」，两条路径同时遵守；
+    // 而且驱动即使挂接了全部端口，也只有关注的端口会变成数据行。
     /// 端口白名单的默认/落盘状态：是否启用端口过滤。
     pub fport_on: bool,
     /// 端口白名单的默认/落盘状态：勾选的端口名（空集合 = 不限制）。
@@ -297,7 +295,6 @@ impl MonitorApp {
             drv_checked: false,
             drv_note: String::new(),
             drv_names: HashMap::new(),
-            drv_watch: std::collections::HashSet::new(),
             fport_on: false,
             fport_sel: HashSet::new(),
             fport_draft_sess: None,
@@ -371,6 +368,11 @@ impl MonitorApp {
                 if !app.drv_avail {
                     app.drv_note = crate::driver::open_failure_hint(app.drv_err);
                 }
+            }
+            // 同理，UM_SHOW_FILTER 让截图直接打开「过滤设置」，用于验证端口过滤区
+            // 的排版（这是现在唯一的端口过滤入口，两条捕获路径共用）。
+            if std::env::var("UM_SHOW_FILTER").is_ok() {
+                app.dlg_filter = true;
             }
         }
         app
@@ -578,13 +580,8 @@ impl MonitorApp {
         self.drv_names = ports.iter().cloned().collect();
         // Device path -> COM number, so the port list can show both.
         self.drv_com = crate::driver::com_names();
-        // Default: watch EVERY attached port.
-        //
-        // The driver attaches to all serial ports (by design — matching the reference
-        // product), so the natural default is to show everything and let the user narrow
-        // it down. Port selection lives in the session's port list, where each entry shows
-        // both the device name and the COM number the user actually recognises.
-        // `drv_watch` stays empty until the user unchecks something.
+        // 端口过滤的统一规则见 MonitorApp 里 fport_* 字段上的说明：唯一白名单是
+        // 「过滤设置 → 监视端口」，按 COM 号匹配，驱动与注入两条路径共用。
         self.set_driver_note_for_ports(attached, &ports);
 
         // Move the handle into a capture thread and stream records back over a channel.
@@ -764,6 +761,13 @@ impl MonitorApp {
                 DrvEvt::Ports(list) => {
                     let n = list.len() as u32;
                     self.drv_names = list.iter().cloned().collect();
+                    // 端口表变了，设备路径 → COM 号的映射必须一起刷新。
+                    //
+                    // 不刷新的话，捕获中新插入的端口在 drv_com 里查不到，channel_port_name
+                    // 会退回设备短名（VSerial8_3 而不是 COM7）：通道建起来的名字和白名单里
+                    // 用户勾的 COM7 对不上，port_allowed 静默返回 false，那个端口一个字都
+                    // 不会显示，而「监视端口」列表里还多出一个没人认得的 VSerial8_3。
+                    self.drv_com = crate::driver::com_names();
                     self.set_driver_note_for_ports(n, &list);
                     self.toast(self.drv_note.clone());
                 }
@@ -805,39 +809,17 @@ impl MonitorApp {
         }
         let sess_idx = self.active.min(self.sessions.len() - 1);
         for rec in batch {
-            // Drop records from ports the user is not watching.
+            // 端口过滤：唯一来源是「过滤设置 → 监视端口」（`Session::port_watch`）。
             //
-            // The driver streams every attached serial port (by design — see drv_watch).
-            // Without this filter, opening COM6 in a session also showed COM1/COM2/COM7,
-            // which is not what "监视这个端口" means to the user.
-            let rec_name = self
-                .drv_names
-                .get(&rec.port_index)
-                .map(|d| short_dev(d));
-            if !self.drv_watch.is_empty() {
-                let watched = match &rec_name {
-                    Some(n) => self.drv_watch.contains(n),
-                    None => false,
-                };
-                if !watched {
-                    continue;
-                }
-            }
-            // 第二道闸：「过滤设置」→「监视端口」里的会话级白名单。
+            // 驱动按设计挂接全部串口并上报一切（与参考产品一致，也让用户不必重新挂接
+            // 就能切端口），所以"只看我关心的端口"必须由这一侧完成。注入路径在
+            // route_hook_data 里用同一份白名单筛选，两条路径行为一致。
             //
-            // drv_watch 是"驱动这次连上的哪些端口值得看"（全局、驱动采集期间有效），
-            // 会话白名单是"这个会话想收哪些端口"（每会话一份，跟着会话走）。
-            // 两层都要过：用户可能在驱动设置里开了全部，然后只在某个会话里取消勾选 COM7。
-            //
-            // 注意白名单的实际丢弃发生在**建通道之后**（见下面 ingest 之前那次判断）：
-            // 通道列表就是「监视端口」勾选区的数据源，如果被过滤的端口连通道都不建，
-            // 那个端口就永远不会出现在列表里，用户也就没法把它勾回来 —— 单向门。
-            //
-            // 判断用的是**通道名**，必须和建通道时用的是同一个名字：驱动采集优先用
-            // COM 号（用户认得的那个），拿不到 COM 映射才退回设备短名。两处不一致会让
-            // 白名单永远匹配不上（表现是"什么都没过滤掉"或"全被丢弃"），所以统一走
-            // channel_port_name。
+            // 名字必须取自 channel_port_name：它和建通道用的是同一个函数，都优先返回
+            // COM 号（用户认得的那个）。两处名字不一致会让白名单静默失效。
             let chan_port = self.channel_port_name(rec.port_index);
+            // 白名单判断放在**建通道之后**（下面 ingest 之前）：被过滤的端口仍然会建
+            // 通道，因此它还留在「监视端口」列表里，用户随时能勾回来 —— 否则就是单向门。
             let key = (sess_idx, rec.port_index);
             let chan = match self.drv_ports.get(&key) {
                 Some(&c) => c,
@@ -1885,61 +1867,75 @@ impl MonitorApp {
             }
         }
 
-        // --- 端口勾选：默认全选，取消勾选即过滤 ---
+        // --- 端口过滤：统一入口在「过滤设置」，这里只做引导 ---
+        //
+        // 这里曾经有一套自己的端口勾选（按设备短名 VSerial8_2 匹配），而
+        // 「过滤设置」里还有一套（按 COM 号匹配）。两份白名单、两种名字，
+        // 用户在 A 处勾了 B 处不生效，而且驱动路径和注入路径各认一套 ——
+        // 这就是"过滤不可预测"的根源。现在只有「过滤设置 → 监视端口」一处，
+        // 两条捕获路径共用，这里只显示当前生效的选择并给出入口。
         ui.separator();
         ui.horizontal(|ui| {
             ui.label(RichText::new("监视端口").strong());
             ui.label(
-                RichText::new("（取消勾选即过滤该端口；默认监视全部）")
+                RichText::new("（与注入模式共用同一份设置）")
                     .small()
                     .color(Color32::GRAY),
             );
-            if ui.small_button("全选").clicked() {
-                self.drv_watch.clear();
+            if ui.button("去设置…").clicked() {
+                self.dlg_drv = false;
+                self.dlg_filter = true;
             }
         });
         if self.drv_names.is_empty() {
             ui.label(RichText::new("尚未扫描到端口").small().color(Color32::GRAY));
         } else {
-            // Sorted by COM number so the list reads the way the user thinks.
-            let mut rows: Vec<(u32, String, String)> = self
+            // 按 COM 号排序，读起来和用户的心智模型一致。
+            let mut rows: Vec<(String, String)> = self
                 .drv_names
-                .iter()
-                .map(|(idx, path)| {
-                    let short = path.rsplit('\\').next().unwrap_or(path).to_string();
-                    let com = self
-                        .drv_com
-                        .get(path)
-                        .cloned()
-                        .unwrap_or_else(|| short.clone());
-                    (*idx, com, short)
+                .values()
+                .map(|path| {
+                    let short = short_dev(path);
+                    let com = self.drv_com.get(path).cloned().unwrap_or_else(|| short.clone());
+                    (com, short)
                 })
                 .collect();
-            rows.sort_by(|a, b| a.1.cmp(&b.1));
+            rows.sort();
+            rows.dedup();
 
-            for (_idx, com, short) in rows {
-                // `drv_watch` holds short device names; empty means "no restriction".
-                let watched = self.drv_watch.is_empty() || self.drv_watch.contains(&short);
-                let mut on = watched;
-                let label = format!("{com}  ({short})");
-                if ui.checkbox(&mut on, label).changed() {
-                    if self.drv_watch.is_empty() {
-                        // First narrowing action: start from "everything selected".
-                        for (_i, _p) in self.drv_names.iter() {
-                            let s = _p.rsplit('\\').next().unwrap_or(_p).to_string();
-                            self.drv_watch.insert(s);
-                        }
+            // 当前生效的白名单状态（只读展示，改要进「过滤设置」）。
+            let (on, sel) = match self.sessions.get(self.active) {
+                Some(s) => (s.port_watch_on, s.port_watch.clone()),
+                None => (self.fport_on, self.fport_sel.clone()),
+            };
+            for (com, short) in rows {
+                let watched = crate::session::pw_allowed(&sel, on, &com);
+                let label = if com == short {
+                    com.clone()
+                } else {
+                    format!("{com}  ({short})")
+                };
+                let mut on_box = watched;
+                ui.horizontal(|ui| {
+                    // 只读：勾选状态反映真实过滤结果，避免这里改了和实际不一致。
+                    ui.add_enabled(false, egui::Checkbox::new(&mut on_box, label));
+                    if !watched {
+                        ui.label(RichText::new("已过滤").small().color(C_FAIL));
                     }
-                    if on {
-                        self.drv_watch.insert(short.clone());
-                    } else {
-                        self.drv_watch.remove(&short);
-                    }
-                    // All selected again -> back to "no restriction".
-                    if self.drv_watch.len() >= self.drv_names.len() {
-                        self.drv_watch.clear();
-                    }
-                }
+                });
+            }
+            if !on {
+                ui.label(
+                    RichText::new("当前：监视全部端口")
+                        .small()
+                        .color(Color32::GRAY),
+                );
+            } else {
+                ui.label(
+                    RichText::new(format!("当前：仅监视 {} 个端口", sel.len()))
+                        .small()
+                        .color(Color32::GRAY),
+                );
             }
         }
 
@@ -2597,11 +2593,28 @@ impl MonitorApp {
             }
             self.fport_draft_sess = Some(self.active);
         }
-        // 端口候选来自当前会话的 HookSerial 通道名（COM6 这种）。
-        let port_all: Vec<String> = match self.sessions.get(self.active) {
+        // 端口候选 = 会话已有通道 + 驱动已发现但还没有任何流量的端口。
+        //
+        // 只用会话通道会漏掉一种真实情况：驱动挂接了全部端口，但某个端口还没收到
+        // 数据，因此还没建通道 —— 用户想在它出数据之前就把其他端口过滤掉，就找不到
+        // 这个端口可勾。把驱动端口表并进来，候选集才是"机器上存在的串口"。
+        let mut port_all: Vec<String> = match self.sessions.get(self.active) {
             Some(s) => s.port_choices(),
             None => Vec::new(),
         };
+        for idx in self.drv_names.keys() {
+            let n = self.channel_port_name(*idx);
+            if !n.is_empty() && !port_all.iter().any(|x| x == &n) {
+                port_all.push(n);
+            }
+        }
+        // 按 COM 号排序；非 COM 名（设备短名）排在后面，保持稳定。
+        port_all.sort_by_key(|n| {
+            n.strip_prefix("COM")
+                .and_then(|d| d.parse::<u32>().ok())
+                .map(|d| (0u8, d, String::new()))
+                .unwrap_or((1u8, 0, n.clone()))
+        });
 
         ui.label("数据方向:");
         ui.horizontal(|ui| {
@@ -2734,15 +2747,9 @@ impl MonitorApp {
             if ui.button("关闭").clicked() {
                 self.dlg_filter = false;
                 self.fport_draft_sess = None;
-                        ui.close_menu();
+                ui.close_menu();
             }
         });
-        ui.separator();
-        if ui.button("关闭").clicked() {
-            self.dlg_filter = false;
-            self.fport_draft_sess = None;
-                        ui.close_menu();
-        }
     }
 
     fn dlg_redir_ui(&mut self, ui: &mut Ui) {
@@ -2872,15 +2879,38 @@ impl MonitorApp {
     }
 
     /// Show auto-attach events (which programs got hooked) without a dialog.
+    ///
+    /// The status bar already renders the session's most recent notice, and the toast
+    /// area renders transient messages. Feeding the same line to both printed it twice
+    /// — once small and grey from `notices`, once larger and blue from the toast — which
+    /// is what the duplicated `串口占用=COM6:false 持有者=[]` in the status bar was.
+    ///
+    /// Only the session notice is kept: it is the durable, always-visible one, and it
+    /// survives a repaint. Reserve the toast for one-off confirmations (injected / failed)
+    /// so the two mechanisms never describe the same event.
     fn drain_auto_attach(&mut self) {
         let lines = match &self.auto {
             Some(a) => a.drained_log(),
             None => return,
         };
-        for line in lines {
-            self.toast(line.clone());
-            if let Some(s) = self.sessions.get_mut(self.active) {
+        if lines.is_empty() {
+            return;
+        }
+        if let Some(s) = self.sessions.get_mut(self.active) {
+            for line in lines {
                 s.notices.push(line);
+            }
+            // `notices` is only ever displayed per session and never trimmed; an
+            // auto-attach service that runs for hours would grow it without bound.
+            let excess = s.notices.len().saturating_sub(64);
+            if excess > 0 {
+                s.notices.drain(..excess);
+            }
+        } else {
+            // No session yet (nothing to attach the line to): the toast is the only
+            // place it can be seen, so use it rather than dropping the information.
+            if let Some(last) = lines.last() {
+                self.toast(last.clone());
             }
         }
     }
