@@ -550,21 +550,98 @@ typedef struct _UM_DIRECTORY_INFORMATION {
     UNICODE_STRING TypeName;
 } UM_DIRECTORY_INFORMATION, *PUM_DIRECTORY_INFORMATION;
 
-// === UM_SAFE_TARGET_GATE ===
-// Forward declaration: defined just below, used by the gate above it.
-static BOOLEAN UmLooksLikeSerialPort(PCUNICODE_STRING name);
-// Decide whether it is safe to attach a filter above this device.
+// === UM_DISCOVERY_V2 ===
+// ---------------------------------------------------------------------------
+// Device discovery — replicating the reference driver's approach
+// ---------------------------------------------------------------------------
 //
-// A false positive here does not merely mis-capture data: it splices our dispatch into a
-// foreign driver's IRP chain, and that driver then bugchecks when it receives the IRPs we
-// rewrote. The machine already crashed once that way, with the fault attributed to an
-// unrelated vendor driver.
+// THE REFERENCE DRIVER'S RULES (recovered from ComDrv12x64.sys, sub_127b0 / sub_1140c):
 //
-// Requirements (all must hold):
-//   1. The object really is a device object.
-//   2. DeviceType is FILE_DEVICE_SERIAL_PORT.
-//   3. It is not our own control device.
-//   4. The name still matches a serial-port family.
+//   1. It walks \Device and matches NAMESPACE PREFIXES, not arbitrary substrings:
+//      the only patterns it compares are "Serial" and "VSerial" (0x13440 / 0x13460),
+//      against the object name at OBJ_HEADER+0x78.
+//
+//   2. It validates every pointer with MmIsAddressValid before dereferencing (0x127f5,
+//      0x12807), so a racing removal cannot make it walk freed memory.
+//
+//   3. On a hit it returns the NAME, and the caller (sub_1140c) re-opens that name with
+//      IoGetDeviceObjectPointer. Discovery and attachment are therefore separate, and
+//      nothing is attached that was not opened by name.
+//
+// WHY THIS MATTERS — the reason for the two bugchecks:
+//   Our old code matched substrings ("vcp", "vser"). Those fragments also occur in device
+//   names belonging to VPN, virtualisation and DLP products. Attaching a filter above such
+//   a device splices our dispatch into that driver's IRP chain; it then receives IRPs whose
+//   stack locations we rewrote and bugchecks inside its own module. That is exactly what
+//   happened (fault reported in DocPrismX64.sys).
+//
+// SO: prefix match + device-type check + never retain an unvalidated object pointer.
+
+// A name that the reference driver would consider a serial port namespace root.
+//
+// Only two forms are accepted, matching what the reference driver compares:
+//   "Serial"  (serial.sys / serenum.sys roots, e.g. \Device\Serial0)
+//   "VSerial" (virtual serial adapters, e.g. \Device\VSerial8_2)
+// Everything else is left alone, no matter what other vendors name their devices.
+static BOOLEAN UmIsSerialNamespacePrefix(PCUNICODE_STRING Name)
+{
+    static const PCWSTR prefixes[] = {
+        L"Serial",
+        L"VSerial",
+    };
+    ULONG p;
+    ULONG chars;
+
+    if (Name == NULL || Name->Buffer == NULL || Name->Length == 0) {
+        return FALSE;
+    }
+    chars = Name->Length / sizeof(WCHAR);
+
+    for (p = 0; p < ARRAYSIZE(prefixes); p++) {
+        PCWSTR prefix = prefixes[p];
+        ULONG plen = 0;
+        ULONG i;
+        BOOLEAN match = TRUE;
+
+        while (prefix[plen] != L'\0') {
+            plen++;
+        }
+        if (chars < plen) {
+            continue;
+        }
+        for (i = 0; i < plen; i++) {
+            WCHAR a = Name->Buffer[i];
+            WCHAR b = prefix[i];
+            // Case-insensitive ASCII compare, same as RtlCompareUnicodeString(..., TRUE).
+            if (a >= L'A' && a <= L'Z') {
+                a = (WCHAR)(a - L'A' + L'a');
+            }
+            if (b >= L'A' && b <= L'Z') {
+                b = (WCHAR)(b - L'A' + L'a');
+            }
+            if (a != b) {
+                match = FALSE;
+                break;
+            }
+        }
+        if (match) {
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+// Final gate before attaching anything.
+//
+// Requires ALL of:
+//   1. a real device object,
+//   2. DeviceType == FILE_DEVICE_SERIAL_PORT,
+//   3. a serial namespace prefix in the name,
+//   4. not our own control device.
+//
+// The reference driver relies on (3) alone because it only ever opens names it built
+// itself. We add (2) as a second, independent signal: the device type is set by the driver
+// that owns the object and cannot be spoofed by naming a device "Serial...".
 static BOOLEAN UmIsSafeSerialTarget(PDEVICE_OBJECT Target, PCUNICODE_STRING Name)
 {
     UNICODE_STRING ownName;
@@ -572,98 +649,34 @@ static BOOLEAN UmIsSafeSerialTarget(PDEVICE_OBJECT Target, PCUNICODE_STRING Name
     if (Target == NULL) {
         return FALSE;
     }
-    // 1. Confirm it is a device object. ObReferenceObjectByName can be handed a name whose
-    //    object type is not a device at all.
     if (Target->Type != IO_TYPE_DEVICE) {
         return FALSE;
     }
-    // 2. The authoritative signal. Serial port drivers set FILE_DEVICE_SERIAL_PORT
-    //    (0x1b). Anything else is not ours to touch, regardless of its name.
     if (Target->DeviceType != FILE_DEVICE_SERIAL_PORT) {
         return FALSE;
     }
-    // 3. Never our own control device.
     if (Target == g_ControlDevice) {
         return FALSE;
     }
-    RtlInitUnicodeString(&ownName, L"UmSerialFilter");
-    if (Name != NULL && Name->Buffer != NULL && Name->Length == ownName.Length &&
-        RtlCompareUnicodeString(Name, &ownName, TRUE) == 0) {
-        return FALSE;
+    if (Name != NULL && Name->Buffer != NULL) {
+        RtlInitUnicodeString(&ownName, L"UmSerialFilter");
+        if (Name->Length == ownName.Length &&
+            RtlCompareUnicodeString(Name, &ownName, TRUE) == 0) {
+            return FALSE;
+        }
     }
-    // 4. Belt and braces: the name must still look like a serial port. A driver that sets
-    //    the serial device type but is not a COM port would otherwise be filtered.
-    if (Name != NULL && !UmLooksLikeSerialPort(Name)) {
+    if (!UmIsSerialNamespacePrefix(Name)) {
         return FALSE;
     }
     return TRUE;
 }
-// === UM_SAFE_TARGET_GATE_END ===
-// Does this \Device child name look like a serial port device?
-//
-// Kept broad on purpose: the reference product matches its own serial namespaces, while
-// we look for the name fragments every known COM-port driver family uses. The fragment
-// list covers Microsoft's Serial/ComPort, USB CDC (usbser), FTDI, Prolific, Silicon Labs,
-// ELAN/ELTIMA style virtual ports (VSerial, vcp, vser) and com0com.
-static BOOLEAN UmLooksLikeSerialPort(PCUNICODE_STRING name)
-{
-    static const PCWSTR fragments[] = {
-        L"Serial", L"serial",
-        L"USBSER", L"usbser",
-        L"ComPort", L"comport",
-        L"Prolific", L"prolific",
-        L"Silabser", L"silabser",
-        L"VSerial", L"vserial",
-        L"VCP", L"vcp",
-        L"vser", L"Vser",
-        L"FTDI", L"ftdi",
-        L"BthModem", L"bthmodem",
-        L"ttyS", L"ttyUSB",
-        L"cdc_acm", L"cdc-acm",
-        L"Ch341", L"ch341",
-        L"MCT_U232", L"mct_u232",
-        L"ComDB", L"comdb",
-    };
-    ULONG i;
-    USHORT nameLen;
-    PWCH buf;
+// === UM_DISCOVERY_V2_END ===
+// The old substring-matching helper (UmLooksLikeSerialPort) has been REMOVED.
+// It matched fragments such as "vcp" and "vser" as substrings, which selected devices
+// belonging to VPN, virtualisation and DLP products. Attaching a filter above one of
+// those splices our dispatch into that driver IRP chain and bugchecks inside it — the
+// cause of both 0x3B crashes. UmIsSerialNamespacePrefix() above is the only matcher now.
 
-    nameLen = name->Length / sizeof(WCHAR);
-    buf = name->Buffer;
-    if (nameLen == 0 || buf == NULL) {
-        return FALSE;
-    }
-    for (i = 0; i < ARRAYSIZE(fragments); i++) {
-        UNICODE_STRING frag;
-        WCHAR scratch[64];
-        SIZE_T len = 0;
-        PCWSTR f = fragments[i];
-        while (f[len] != L'\0' && len < ARRAYSIZE(scratch) - 1) {
-            scratch[len] = f[len];
-            len++;
-        }
-        if (len == 0) {
-            continue;
-        }
-        frag.Buffer = scratch;
-        frag.Length = (USHORT)(len * sizeof(WCHAR));
-        frag.MaximumLength = frag.Length;
-        // Substring test: walk every offset of the device name.
-        if (nameLen >= len) {
-            USHORT off;
-            for (off = 0; off + len <= nameLen; off++) {
-                UNICODE_STRING window;
-                window.Buffer = buf + off;
-                window.Length = frag.Length;
-                window.MaximumLength = frag.Length;
-                if (RtlCompareUnicodeString(&window, &frag, TRUE) == 0) {
-                    return TRUE;
-                }
-            }
-        }
-    }
-    return FALSE;
-}
 
 // Attach one filter device above `target`, recording its friendly name.
 // Forward declarations: UmAttachAllPorts (below) uses these, while their definitions
@@ -791,7 +804,10 @@ static ULONG UmAttachAllPorts(VOID)
             if (entry->Name.Buffer == NULL || entry->Name.Length == 0) {
                 break;
             }
-            if (!UmLooksLikeSerialPort(&entry->Name)) {
+            // Namespace-prefix match only, exactly like the reference driver. Substring
+            // matching (the old behaviour) selected unrelated devices and crashed the
+            // machine by splicing our filter into their IRP chains.
+            if (!UmIsSerialNamespacePrefix(&entry->Name)) {
                 continue;
             }
             // Never attach to ourselves.
@@ -829,20 +845,27 @@ static ULONG UmAttachAllPorts(VOID)
 
                 {
                     PDEVICE_OBJECT devObj = NULL;
-                    // Reference the device object BY NAME instead of opening it.
+                    // Open exactly the way the reference driver does (sub_1140c):
                     //
-                    // IoGetDeviceObjectPointer performs a real open, which BLOCKS while the
-                    // target is still starting (exactly what hangs this IOCTL on a busy or
-                    // half-initialised serial stack), and it takes a FILE_READ_DATA right on
-                    // the port we promised never to touch.
+                    //     IoGetDeviceObjectPointer(name, 0x1f01ff, &fileObj, &devObj)
+                    //     if (success) { ObDereferenceObject(fileObj); ... }
                     //
-                    // ObReferenceObjectByName just bumps a reference, so it neither opens the
-                    // port nor waits for PnP to finish. This is closer to what the reference
-                    // driver does.
-                    NTSTATUS openStatus = ObReferenceObjectByName(
-                        &devName, OBJ_CASE_INSENSITIVE, NULL, 0,
-                        *IoDeviceObjectType, NULL, (PVOID *)&devObj);
+                    // The name is one we built ourselves from a namespace-prefix match, and
+                    // UmIsSafeSerialTarget() re-validates the result, so this cannot reach a
+                    // foreign device. Dropping the file object immediately is what the
+                    // reference driver does: the device object keeps its own reference for as
+                    // long as the stack exists, and we hold one explicitly below.
+                    PFILE_OBJECT fileObj = NULL;
+                    NTSTATUS openStatus = IoGetDeviceObjectPointer(
+                        &devName, FILE_ALL_ACCESS, &fileObj, &devObj);
+                    if (NT_SUCCESS(openStatus) && fileObj != NULL) {
+                        ObDereferenceObject(fileObj);
+                    }
                     if (NT_SUCCESS(openStatus) && devObj != NULL) {
+                        // Take our own reference: dropping fileObj above released the only
+                        // reference the open gave us, and this driver keeps using devObj
+                        // (attach table, ctx->Physical) long after this loop iteration.
+                        ObReferenceObject(devObj);
                         // Refuse anything that is not demonstrably a serial port: splicing our
                         // dispatch into a foreign IRP chain bugchecks inside that driver.
                         if (!UmIsSafeSerialTarget(devObj, &entry->Name)) {
