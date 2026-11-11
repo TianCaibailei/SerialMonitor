@@ -694,7 +694,7 @@ static ULONG UmAttachAllPorts(VOID)
     NTSTATUS status;
     ULONG attached = 0;
     ULONG context = 0;
-    // Space for a generous batch of directory entries per call.
+    BOOLEAN first = TRUE;
     ULONG bufLen = 32 * 1024;
     PVOID buf = NULL;
 
@@ -715,18 +715,12 @@ static ULONG UmAttachAllPorts(VOID)
     for (;;) {
         ULONG retLen = 0;
         ULONG i;
-        PUM_DIRECTORY_INFORMATION info = (PUM_DIRECTORY_INFORMATION)buf;
-
-        // RestartScan MUST be FALSE after the first call: the enumeration position comes
-        // from `context`, which the previous call updates. Passing TRUE on every call
-        // re-read the same entry forever 鈥?that is exactly what hung DriverEntry and left
-        // the service stuck in START_PENDING, and it also explains why the service could
-        // not be deleted afterwards (a driver mid-DriverEntry cannot be unloaded).
         status = ZwQueryDirectoryObject(
             dirHandle, buf, bufLen,
-            (context == 0) ? TRUE : FALSE, // restart only on the very first call
-            TRUE /* one entry per call */,
+            first,          // TRUE only on the very first iteration
+            TRUE,           // one entry per call
             &context, &retLen);
+        first = FALSE;
         if (!NT_SUCCESS(status)) {
             break; // STATUS_NO_MORE_ENTRIES ends the walk
         }
