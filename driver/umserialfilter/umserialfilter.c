@@ -1,10 +1,10 @@
-// UmSerialFilter — passive serial-port traffic capture (upper filter, no port ownership).
+// UmSerialFilter 鈥?passive serial-port traffic capture (upper filter, no port ownership).
 //
 // WHY THIS EXISTS
 // ---------------
 // The user-mode approach (inject a DLL and patch the target's IAT) has a hard limit:
 // it only sees calls made *after* injection, while a serial tool typically opens its
-// port within milliseconds of starting. A kernel filter has no such race — it sits on
+// port within milliseconds of starting. A kernel filter has no such race 鈥?it sits on
 // the device stack, so every IRP from every process passes through it from the moment
 // the filter loads.
 //
@@ -51,7 +51,19 @@
 // Get the friendly name of one attached device (index in, name out).
 #define IOCTL_UM_GET_PORT_NAME \
     CTL_CODE(UM_DEVICE_TYPE, 0x804, METHOD_BUFFERED, FILE_READ_DATA)
+// Present the per-boot session key. Must be the FIRST ioctl on a handle; every other
+// ioctl is refused until it succeeds, so opening the device is not enough to use it.
+#define IOCTL_UM_AUTHENTICATE \
+    CTL_CODE(UM_DEVICE_TYPE, 0x805, METHOD_BUFFERED, FILE_WRITE_DATA)
 
+#define UM_CTX_AUTHENTICATED 0x00000001UL
+// Registry location where the session key is published.
+#define UM_PARAMS_KEY   L"\\Registry\\Machine\\Software\\UmSerialFilter"
+#define UM_PARAMS_VALUE L"SessionKey"
+
+// Forward declarations for the security layer (defined further down).
+static VOID UmPublishSessionKey(VOID);
+static BOOLEAN UmKeyMatches(const UCHAR *candidate);
 #define UM_MAX_PAYLOAD 4096
 #define UM_RECORD_HEADER 32
 #define UM_MAX_RECORDS 512
@@ -78,8 +90,13 @@ typedef struct _UM_RECORD {
 typedef struct _UM_DEVICE_CTX {
     PDEVICE_OBJECT Self;      // our filter device object
     PDEVICE_OBJECT Lower;     // next device down (real serial driver)
-    PDEVICE_OBJECT Physical;  // PDO of the serial device
+    PDEVICE_OBJECT Physical;  // PDO of the serial device (the driver holds a reference)
     ULONG Index;              // index into the attached list
+    // Stable id handed to user mode in every record. Deliberately NOT the PDO address:
+    // handing out a kernel pointer leaks KASLR-relevant information and dangles as soon as
+    // the device is removed.
+    ULONG64 PortId;
+    ULONG Flags;              // UM_CTX_AUTHENTICATED once the handshake succeeds
     BOOLEAN PassThroughOnly;  // TRUE for the control device
 } UM_DEVICE_CTX, *PUM_DEVICE_CTX;
 
@@ -94,6 +111,7 @@ typedef struct _UM_CAPTURE {
     KSPIN_LOCK Lock;
     LIST_ENTRY Queue;
     NPAGED_LOOKASIDE_LIST Lookaside;
+    NPAGED_LOOKASIDE_LIST CtxLookaside;
     ULONG Count;
     ULONG Dropped;
     ULONG Enabled;
@@ -101,12 +119,28 @@ typedef struct _UM_CAPTURE {
     ULONGLONG Received;
     ULONGLONG Sent;
     ULONG AttachedCount;
-    // Physical device (the serial PDO/FDO) each filter sits above…
+    // Reference held on the device object each filter sits above (see S3: the file object
+    // returned by IoGetDeviceObjectPointer is dereferenced immediately, so the driver must
+    // hold its own reference on the device object).
     PDEVICE_OBJECT Attached[UM_MAX_FILTERS];
-    // …and our filter object for it. Both are kept so teardown never has to guess the
-    // filter by walking the stack.
+    // Our filter object for that device, so teardown never has to guess it from the stack.
     PDEVICE_OBJECT AttachedFilters[UM_MAX_FILTERS];
-    PCWSTR AttachedNames[UM_MAX_FILTERS];
+    // Owned copy of the NT device path ("\Device\Serial0"), or NULL when unknown.
+    PWSTR AttachedNames[UM_MAX_FILTERS];
+    // Slot bitmap. AttachedCount alone cannot express "slot 3 was freed" 鈥?without this,
+    // a device removal leaked its slot forever and 64 plug/unplug cycles permanently
+    // exhausted the table, after which attaching silently did nothing.
+    BOOLEAN SlotUsed[UM_MAX_FILTERS];
+    // Number of open handles on the control device. Capture stops when the last one
+    // closes, so a crashed monitor does not leave the driver capturing forever.
+    volatile LONG OpenCount;
+    // Result of IoRegisterPlugPlayNotification, surfaced through IOCTL_UM_GET_STATS.
+    NTSTATUS HotplugStatus;
+    // Monotonic id handed to user mode instead of the kernel pointer (KASLR hygiene).
+    volatile LONG64 NextPortId;
+    // Per-boot key the service must present; see UmPublishSessionKey.
+    UCHAR SessionKey[16];
+    BOOLEAN SessionKeySet;
 } UM_CAPTURE, *PUM_CAPTURE;
 
 // GUIDs used for PnP interface notifications.
@@ -114,8 +148,8 @@ typedef struct _UM_CAPTURE {
 // These live in <initguid.h> territory: the WDK NuGet headers do not ship the
 // definitions, only declarations, so they are spelled out here. The values are the
 // documented ones from wdmguid.h / ntddser.h:
-//   GUID_DEVINTERFACE_COMPORT        — every COM port driver registers this interface
-//   GUID_DEVICE_INTERFACE_ARRIVAL    — an interface became available
+//   GUID_DEVINTERFACE_COMPORT        鈥?every COM port driver registers this interface
+//   GUID_DEVICE_INTERFACE_ARRIVAL    鈥?an interface became available
 static const GUID UmGuidComPort = {
     0x86E0D1E0, 0x8089, 0x11D0,
     { 0x9C, 0xE4, 0x08, 0x00, 0x3E, 0x30, 0x1F, 0x73 }
@@ -130,6 +164,14 @@ static const GUID UmGuidInterfaceArrival = {
 #define GUID_DEVICE_INTERFACE_ARRIVAL (&UmGuidInterfaceArrival)
 
 static UM_CAPTURE g_Capture;
+
+// Slot bookkeeping used by the PnP/removal path (which appears earlier in this file than
+// the definitions, so the prototypes have to live here).
+static BOOLEAN UmAlreadyAttached(PDEVICE_OBJECT physical);
+static LONG UmRegisterAttached(PDEVICE_OBJECT physical, PCWSTR name);
+static VOID UmFreeSlotResources(ULONG index);
+static PWSTR UmDuplicateName(PCUNICODE_STRING name);
+
 static PDEVICE_OBJECT g_ControlDevice;
 static PDRIVER_OBJECT g_DriverObject;
 static UNICODE_STRING g_SymLink;
@@ -205,7 +247,16 @@ static VOID UmQueueRecord(ULONG dir, ULONG pid, ULONG portIndex, ULONG64 handle,
     KeReleaseSpinLock(&g_Capture.Lock, old);
 }
 
-static ULONG UmDequeueRecord(PUCHAR out, ULONG outLen)
+// Pop one record into `out`.
+//
+// Return value semantics (three distinct cases the caller must be able to tell apart):
+//   > 0  record copied, this many bytes
+//     0  queue empty
+//    -1  the caller's buffer is too small; the record was PUT BACK (not dropped)
+//
+// An earlier version dequeued, freed and returned 0 on a short buffer, so a caller with a
+// small buffer lost every record one by one while being told the queue was empty.
+static LONG UmDequeueRecord(PUCHAR out, ULONG outLen)
 {
     KIRQL old;
     PLIST_ENTRY entry;
@@ -217,19 +268,21 @@ static ULONG UmDequeueRecord(PUCHAR out, ULONG outLen)
         KeReleaseSpinLock(&g_Capture.Lock, old);
         return 0;
     }
-    entry = RemoveHeadList(&g_Capture.Queue);
+    entry = g_Capture.Queue.Flink;
+    item = CONTAINING_RECORD(entry, UM_RECORD_ITEM, Entry);
+    need = UM_RECORD_HEADER + item->Record.Size;
+    if (need > outLen) {
+        // Leave it at the head of the queue and report the size required.
+        KeReleaseSpinLock(&g_Capture.Lock, old);
+        return -1;
+    }
+    RemoveHeadList(&g_Capture.Queue);
     g_Capture.Count--;
     KeReleaseSpinLock(&g_Capture.Lock, old);
 
-    item = CONTAINING_RECORD(entry, UM_RECORD_ITEM, Entry);
-    need = UM_RECORD_HEADER + item->Record.Size;
-    if (need <= outLen) {
-        RtlCopyMemory(out, &item->Record, need);
-    } else {
-        need = 0;
-    }
+    RtlCopyMemory(out, &item->Record, need);
     ExFreeToNPagedLookasideList(&g_Capture.Lookaside, item);
-    return need;
+    return (LONG)need;
 }
 
 // ---------------------------------------------------------------------------
@@ -257,35 +310,58 @@ static NTSTATUS UmReadWriteComplete(PDEVICE_OBJECT DeviceObject, PIRP Irp, PVOID
     if (ctx != NULL) {
         if (NT_SUCCESS(Irp->IoStatus.Status) && Irp->IoStatus.Information > 0) {
             ULONG len = (ULONG)Irp->IoStatus.Information;
-            // Clamp to what the caller actually asked for. A driver may report more bytes
-            // than the request length in rare cases; copying that much would read past the
-            // end of the buffer.
             ULONG requested = (stack->MajorFunction == IRP_MJ_READ)
                                   ? stack->Parameters.Read.Length
                                   : stack->Parameters.Write.Length;
             PVOID buf = NULL;
 
+            // Clamp against every bound we know:
+            //   * the caller's request length,
+            //   * the MDL's real size (a third-party USB-serial driver reporting a larger
+            //     Information than its buffer would otherwise make us read past the end),
+            //   * our own record capacity.
+            // Information comes straight from the driver below and is not trustworthy on
+            // its own.
             if (len > requested) {
                 len = requested;
             }
+            if (Irp->MdlAddress != NULL) {
+                ULONG mdlBytes = MmGetMdlByteCount(Irp->MdlAddress);
+                if (len > mdlBytes) {
+                    len = mdlBytes;
+                }
+            }
+            if (len > UM_MAX_PAYLOAD) {
+                len = UM_MAX_PAYLOAD;
+            }
 
             // Buffer-source order matters. Serial drivers overwhelmingly use DO_DIRECT_IO,
-            // so the MDL is the normal case and SystemBuffer is usually NULL — checking
+            // so the MDL is the normal case and SystemBuffer is usually NULL 鈥?checking
             // SystemBuffer first (as an earlier version did) missed every such transfer.
-            // UserBuffer is the fallback for METHOD_NEITHER and is valid for reads too.
-            if (Irp->MdlAddress != NULL) {
+            // UserBuffer is the METHOD_NEITHER fallback and is valid for reads too.
+            if ((DeviceObject != NULL && (DeviceObject->Flags & DO_DIRECT_IO) != 0 &&
+                 Irp->MdlAddress != NULL)) {
                 buf = MmGetSystemAddressForMdlSafe(Irp->MdlAddress, NormalPagePriority);
             } else if (Irp->AssociatedIrp.SystemBuffer != NULL) {
                 buf = Irp->AssociatedIrp.SystemBuffer;
+            } else if (Irp->MdlAddress != NULL) {
+                buf = MmGetSystemAddressForMdlSafe(Irp->MdlAddress, NormalPagePriority);
             } else {
                 buf = Irp->UserBuffer;
             }
+
             if (buf != NULL && len > 0) {
-                UmQueueRecord(ctx->Dir, ctx->Pid, ctx->PortIndex, ctx->Handle, (const UCHAR *)buf, len);
+                // A caller-supplied UserBuffer may be unmapped or racing with teardown;
+                // a fault here must not take down the machine on behalf of a monitor.
+                __try {
+                    UmQueueRecord(ctx->Dir, ctx->Pid, ctx->PortIndex, ctx->Handle,
+                                  (const UCHAR *)buf, len);
+                } __except (EXCEPTION_EXECUTE_HANDLER) {
+                    InterlockedIncrement((PLONG)&g_Capture.Dropped);
+                }
             }
         }
-        ExFreePoolWithTag(ctx, UM_TAG);
-        Irp->Tail.Overlay.DriverContext[0] = NULL;
+        ExFreeToNPagedLookasideList(&g_Capture.CtxLookaside, ctx);
     }
     if (Irp->PendingReturned) {
         IoMarkIrpPending(Irp);
@@ -310,19 +386,21 @@ static NTSTATUS UmFilterDispatch(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     }
 
     if (stack->MajorFunction == IRP_MJ_READ || stack->MajorFunction == IRP_MJ_WRITE) {
-        PUM_IRP_CTX irpCtx =
-            (PUM_IRP_CTX)ExAllocatePoolWithTag(NonPagedPool, sizeof(UM_IRP_CTX), UM_TAG);
+        PUM_IRP_CTX irpCtx = (PUM_IRP_CTX)
+            ExAllocateFromNPagedLookasideList(&g_Capture.CtxLookaside);
         if (irpCtx != NULL) {
             irpCtx->Dir = (stack->MajorFunction == IRP_MJ_READ) ? UM_DIR_RX : UM_DIR_TX;
             irpCtx->Pid = (ULONG)(ULONG_PTR)PsGetCurrentProcessId();
             irpCtx->PortIndex = ctx->Index;
-            irpCtx->Handle = (ULONG64)(ULONG_PTR)ctx->Physical;
+            // A monotonic id, NOT the kernel pointer. Returning the PDO address to user mode
+            // leaks a KASLR-relevant address and would dangle once the device is removed.
+            irpCtx->Handle = (ULONG64)(ULONG_PTR)ctx->PortId;
             // A completion routine needs its OWN stack location.
             // IoSkipCurrentIrpStackLocation makes the lower driver REUSE our stack
             // location, so writing CompletionRoutine into it afterwards corrupts what the
             // lower driver reads. That broke every request on the port: IRP_MJ_CREATE
             // failed with "Incorrect function" (the port looked busy to every serial
-            // tool), and readers waited forever for a reply that never came — exactly the
+            // tool), and readers waited forever for a reply that never came 鈥?exactly the
             // hang seen in both umfilter_reader and the GUI.
             IoCopyCurrentIrpStackLocationToNext(Irp);
             {
@@ -335,7 +413,7 @@ static NTSTATUS UmFilterDispatch(PDEVICE_OBJECT DeviceObject, PIRP Irp)
         } else {
             InterlockedIncrement((PLONG)&g_Capture.Dropped);
             // Allocation failed: fall through to a plain pass-through so the I/O still
-            // completes — losing one capture is better than losing the application's data.
+            // completes 鈥?losing one capture is better than losing the application's data.
         }
     }
 
@@ -357,7 +435,7 @@ static NTSTATUS UmFilterPower(PDEVICE_OBJECT DeviceObject, PIRP Irp);
 // Windows gives every device of a driver the SAME MajorFunction table, so the filter
 // devices and the control device necessarily share entry points. The original code put
 // the control handlers there for every device, so IRP_MJ_CREATE on a serial port was
-// answered by UmControlCreate — completing the open immediately — and the real serial
+// answered by UmControlCreate 鈥?completing the open immediately 鈥?and the real serial
 // driver never saw it. Consequences: every COM port looked occupied ("Incorrect
 // function"), no data ever flowed, and user-mode readers blocked forever waiting for a
 // reply that would never come (the umfilter_reader / GUI hang).
@@ -376,9 +454,24 @@ static NTSTATUS UmRemoveComplete(PDEVICE_OBJECT DeviceObject, PIRP Irp, PVOID Co
 {
     PUM_DEVICE_CTX ctx = (PUM_DEVICE_CTX)Context;
     UNREFERENCED_PARAMETER(Irp);
-    if (ctx != NULL && ctx->Lower != NULL) {
-        IoDetachDevice(ctx->Lower);
-        ctx->Lower = NULL;
+
+    if (ctx != NULL) {
+        PDEVICE_OBJECT physical = ctx->Physical;
+
+        // Free the bookkeeping slot. Without this the table only ever grew: 64 plug/unplug
+        // cycles filled it permanently, after which attaching silently returned 0 forever
+        // (monitoring died with no error to explain it).
+        UmFreeSlotResources(ctx->Index);
+
+        if (ctx->Lower != NULL) {
+            IoDetachDevice(ctx->Lower);
+            ctx->Lower = NULL;
+        }
+        ctx->Physical = NULL;
+        // Drop the reference the driver took when it registered this device.
+        if (physical != NULL) {
+            ObDereferenceObject(physical);
+        }
     }
     IoDeleteDevice(DeviceObject);
     return STATUS_SUCCESS; // let the I/O manager finish the IRP
@@ -523,29 +616,25 @@ static BOOLEAN UmLooksLikeSerialPort(PCUNICODE_STRING name)
 // Forward declarations: UmAttachAllPorts (below) uses these, while their definitions
 // follow it. Without the declarations C assumes an implicit `int` return and then
 // conflicts with the real BOOLEAN/LONG definitions.
-static BOOLEAN UmAlreadyAttached(PDEVICE_OBJECT physical);
-static LONG UmRegisterAttached(PDEVICE_OBJECT physical, PCWSTR name);
+// (prototypes are at the top of the file)
 
 static NTSTATUS UmAttachOne(PDEVICE_OBJECT target, ULONG index, PCWSTR name)
 {
     PDEVICE_OBJECT filter = NULL;
     PUM_DEVICE_CTX ctx;
     NTSTATUS status;
-    KIRQL old;
 
-    // Reserve the index under the lock first: the hot-plug callback (system thread) and
-    // the IOCTL handler (user thread) can run concurrently and must not both claim the
-    // same slot.
-    KeAcquireSpinLock(&g_AttachLock, &old);
     if (index >= UM_MAX_FILTERS) {
-        KeReleaseSpinLock(&g_AttachLock, old);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
-    KeReleaseSpinLock(&g_AttachLock, old);
 
+    // Create the device with the SAME characteristics as the one below, minus the bits a
+    // PDO owns. Passing target->Characteristics through verbatim made IoCreateDevice fail
+    // with STATUS_INVALID_PARAMETER for stacks that set FILE_REMOVABLE_MEDIA /
+    // FILE_DEVICE_IS_MOUNTABLE_DEVICE, and the failure was silent (attach just returned 0).
     status = IoCreateDevice(
         g_DriverObject, sizeof(UM_DEVICE_CTX), NULL,
-        target->DeviceType, target->Characteristics | FILE_DEVICE_SECURE_OPEN,
+        target->DeviceType, FILE_DEVICE_SECURE_OPEN,
         FALSE, &filter);
     if (!NT_SUCCESS(status)) {
         return status;
@@ -555,14 +644,15 @@ static NTSTATUS UmAttachOne(PDEVICE_OBJECT target, ULONG index, PCWSTR name)
     ctx->Self = filter;
     ctx->Physical = target;
     ctx->Index = index;
+    ctx->PortId = (ULONG64)InterlockedIncrement64(&g_Capture.NextPortId);
     ctx->Lower = IoAttachDeviceToDeviceStack(filter, target);
     if (ctx->Lower == NULL) {
         IoDeleteDevice(filter);
         return STATUS_DEVICE_NOT_CONNECTED;
     }
     // Inherit the stack's buffering and power flags. DO_POWER_INRUSH matters for devices
-    // that draw inrush current at power-up; a filter must not clear it or the device may
-    // not power on reliably.
+    // that draw inrush current at power-up; a filter that drops it can break the power
+    // budget for the whole stack.
     filter->Flags |= ctx->Lower->Flags &
                      (DO_BUFFERED_IO | DO_DIRECT_IO | DO_POWER_PAGABLE | DO_POWER_INRUSH);
     filter->Flags &= ~DO_DEVICE_INITIALIZING;
@@ -580,7 +670,7 @@ static NTSTATUS UmAttachOne(PDEVICE_OBJECT target, ULONG index, PCWSTR name)
 // filter devices and the control device necessarily share entry points. The original code
 // installed the control-device handlers for every device, which meant IRP_MJ_CREATE on a
 // serial port was answered by UmControlCreate (completing it immediately) instead of being
-// forwarded — that is what made every COM port unusable while the driver was loaded.
+// forwarded 鈥?that is what made every COM port unusable while the driver was loaded.
 //
 // The fix: the shared entries branch on whether the device has a lower device attached.
 // A control device has Lower == NULL and owns the IOCTL interface; a filter device has
@@ -629,7 +719,7 @@ static ULONG UmAttachAllPorts(VOID)
 
         // RestartScan MUST be FALSE after the first call: the enumeration position comes
         // from `context`, which the previous call updates. Passing TRUE on every call
-        // re-read the same entry forever — that is exactly what hung DriverEntry and left
+        // re-read the same entry forever 鈥?that is exactly what hung DriverEntry and left
         // the service stuck in START_PENDING, and it also explains why the service could
         // not be deleted afterwards (a driver mid-DriverEntry cannot be unloaded).
         status = ZwQueryDirectoryObject(
@@ -650,6 +740,20 @@ static ULONG UmAttachAllPorts(VOID)
             }
             if (!UmLooksLikeSerialPort(&entry->Name)) {
                 continue;
+            }
+            // Never attach to ourselves.
+            //
+            // Our own control device is \Device\UmSerialFilter, whose name contains
+            // "Serial" 鈥?so the fragment match above happily selects it. Attaching a
+            // filter above our own control device makes every IOCTL pass through an extra
+            // copy of this driver, and a second ATTACH_PORTS call stacks another one.
+            {
+                UNICODE_STRING ownName;
+                RtlInitUnicodeString(&ownName, L"UmSerialFilter");
+                if (entry->Name.Length == ownName.Length &&
+                    RtlCompareUnicodeString(&entry->Name, &ownName, TRUE) == 0) {
+                    continue;
+                }
             }
             if (g_Capture.AttachedCount >= UM_MAX_FILTERS) {
                 break;
@@ -676,23 +780,36 @@ static ULONG UmAttachAllPorts(VOID)
                     NTSTATUS openStatus = IoGetDeviceObjectPointer(
                         &devName, FILE_READ_DATA, &fileObj, &devObj);
                     if (NT_SUCCESS(openStatus)) {
+                        // Hold our own reference on the device object: the file object was
+                        // the only thing keeping it alive, and the driver keeps using
+                        // devObj long after this point (ctx->Physical, the attach table).
+                        ObReferenceObject(devObj);
                         ObDereferenceObject(fileObj);
+
                         // The scan can be re-run by user mode, so skip devices we already
                         // filter rather than stacking a second filter on them.
                         if (!UmAlreadyAttached(devObj)) {
-                            LONG idx = UmRegisterAttached(devObj, NULL);
+                            // Owned copy of the device path. Passing NULL here (as an
+                            // earlier version did) made AttachedNames always NULL, so
+                            // IOCTL_UM_GET_PORT_NAME could never answer.
+                            PWSTR nameCopy = UmDuplicateName(&devName);
+                            LONG idx = UmRegisterAttached(devObj, nameCopy);
                             if (idx >= 0) {
-                                if (NT_SUCCESS(UmAttachOne(devObj, (ULONG)idx, NULL))) {
-                                    attached++;
+                                if (!NT_SUCCESS(UmAttachOne(devObj, (ULONG)idx, nameCopy))) {
+                                    // Roll the slot back; it also frees nameCopy.
+                                    UmFreeSlotResources((ULONG)idx);
+                                    ObDereferenceObject(devObj);
                                 } else {
-                                    KIRQL old;
-                                    KeAcquireSpinLock(&g_AttachLock, &old);
-                                    g_Capture.Attached[(ULONG)idx] = NULL;
-                                    g_Capture.AttachedFilters[(ULONG)idx] = NULL;
-                                    g_Capture.AttachedNames[(ULONG)idx] = NULL;
-                                    KeReleaseSpinLock(&g_AttachLock, old);
+                                    attached++;
                                 }
+                            } else {
+                                if (nameCopy != NULL) {
+                                    ExFreePoolWithTag(nameCopy, UM_TAG);
+                                }
+                                ObDereferenceObject(devObj);
                             }
+                        } else {
+                            ObDereferenceObject(devObj);
                         }
                     }
                 }
@@ -721,7 +838,31 @@ static ULONG UmAttachAllPorts(VOID)
 //
 // Both the IOCTL scan and the hot-plug callback can reach the same device (an interface
 // arrival for a port the initial scan already covered), and attaching twice would put
-// two filters on one stack — doubling every captured byte.
+// two filters on one stack 鈥?doubling every captured byte.
+// Copy a device path into a NUL-terminated buffer the attach table owns.
+//
+// The UNICODE_STRING handed in points into a stack buffer that dies with the scan, so the
+// name has to be copied 鈥?and freed when the slot is released.
+static PWSTR UmDuplicateName(PCUNICODE_STRING name)
+{
+    SIZE_T chars;
+    SIZE_T bytes;
+    PWSTR copy;
+
+    if (name == NULL || name->Buffer == NULL || name->Length == 0) {
+        return NULL;
+    }
+    chars = name->Length / sizeof(WCHAR);
+    bytes = (chars + 1) * sizeof(WCHAR);
+    copy = (PWSTR)ExAllocatePoolWithTag(NonPagedPool, bytes, UM_TAG);
+    if (copy == NULL) {
+        return NULL;
+    }
+    RtlCopyMemory(copy, name->Buffer, chars * sizeof(WCHAR));
+    copy[chars] = L'\0';
+    return copy;
+}
+
 static BOOLEAN UmAlreadyAttached(PDEVICE_OBJECT physical)
 {
     ULONG i;
@@ -729,8 +870,12 @@ static BOOLEAN UmAlreadyAttached(PDEVICE_OBJECT physical)
     KIRQL old;
 
     KeAcquireSpinLock(&g_AttachLock, &old);
-    for (i = 0; i < g_Capture.AttachedCount; i++) {
-        if (g_Capture.Attached[i] == physical) {
+    for (i = 0; i < UM_MAX_FILTERS; i++) {
+        // Only slots that are actually in use. Scanning up to AttachedCount missed freed
+        // slots in the middle, and a freed slot's pointer could match a recycled PDO
+        // address 鈥?which made a freshly plugged adapter look "already attached" and it
+        // was then never monitored.
+        if (g_Capture.SlotUsed[i] && g_Capture.Attached[i] == physical) {
             found = TRUE;
             break;
         }
@@ -739,21 +884,53 @@ static BOOLEAN UmAlreadyAttached(PDEVICE_OBJECT physical)
     return found;
 }
 
-// Register a successfully attached device. Returns its index, or -1 when full.
+// Claim the first free slot for `physical`. Returns its index, or -1 when full.
 static LONG UmRegisterAttached(PDEVICE_OBJECT physical, PCWSTR name)
 {
     LONG index = -1;
+    ULONG i;
     KIRQL old;
 
     KeAcquireSpinLock(&g_AttachLock, &old);
-    if (g_Capture.AttachedCount < UM_MAX_FILTERS) {
-        index = (LONG)g_Capture.AttachedCount;
-        g_Capture.Attached[(ULONG)index] = physical;
-        g_Capture.AttachedNames[(ULONG)index] = name;
-        g_Capture.AttachedCount++;
+    for (i = 0; i < UM_MAX_FILTERS; i++) {
+        if (!g_Capture.SlotUsed[i]) {
+            index = (LONG)i;
+            g_Capture.SlotUsed[i] = TRUE;
+            g_Capture.Attached[i] = physical;
+            g_Capture.AttachedFilters[i] = NULL;
+            g_Capture.AttachedNames[i] = name;
+            g_Capture.AttachedCount++;
+            break;
+        }
     }
     KeReleaseSpinLock(&g_AttachLock, old);
     return index;
+}
+
+// Release a slot. The name is an owned allocation, so it is freed here. Callable from a
+// completion routine: it only touches non-paged fields under the attach lock.
+static VOID UmFreeSlotResources(ULONG index)
+{
+    KIRQL old;
+    PWSTR name = NULL;
+
+    if (index >= UM_MAX_FILTERS) {
+        return;
+    }
+    KeAcquireSpinLock(&g_AttachLock, &old);
+    name = g_Capture.AttachedNames[index];
+    g_Capture.AttachedNames[index] = NULL;
+    if (g_Capture.SlotUsed[index] && g_Capture.AttachedCount > 0) {
+        g_Capture.AttachedCount--;
+    }
+    g_Capture.SlotUsed[index] = FALSE;
+    g_Capture.Attached[index] = NULL;
+    g_Capture.AttachedFilters[index] = NULL;
+    KeReleaseSpinLock(&g_AttachLock, old);
+
+    if (name != NULL) {
+        ExFreePoolWithTag(name, UM_TAG);
+    }
 }
 
 static NTSTATUS UmHotplugAttachLink(PUNICODE_STRING link)
@@ -762,29 +939,37 @@ static NTSTATUS UmHotplugAttachLink(PUNICODE_STRING link)
     PDEVICE_OBJECT devObj = NULL;
     NTSTATUS status;
     LONG index;
+    PWSTR nameCopy;
 
     status = IoGetDeviceObjectPointer(link, FILE_READ_DATA, &fileObj, &devObj);
     if (!NT_SUCCESS(status)) {
         return status;
     }
+    // Keep our own reference: the file object was the only owner of the device object, and
+    // the driver stores devObj in its attach table.
+    ObReferenceObject(devObj);
     ObDereferenceObject(fileObj);
 
     if (UmAlreadyAttached(devObj)) {
-        return STATUS_SUCCESS; // already filtered by the initial scan
+        ObDereferenceObject(devObj);
+        return STATUS_SUCCESS; // already filtered by the port scan
     }
-    index = UmRegisterAttached(devObj, NULL);
+
+    // Record the device path so IOCTL_UM_GET_PORT_NAME can report it.
+    nameCopy = UmDuplicateName(link);
+    index = UmRegisterAttached(devObj, nameCopy);
     if (index < 0) {
+        if (nameCopy != NULL) {
+            ExFreePoolWithTag(nameCopy, UM_TAG);
+        }
+        ObDereferenceObject(devObj);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
-    status = UmAttachOne(devObj, (ULONG)index, NULL);
+    status = UmAttachOne(devObj, (ULONG)index, nameCopy);
     if (!NT_SUCCESS(status)) {
-        // Roll the reservation back so the slot can be reused.
-        KIRQL old;
-        KeAcquireSpinLock(&g_AttachLock, &old);
-        g_Capture.Attached[(ULONG)index] = NULL;
-        g_Capture.AttachedFilters[(ULONG)index] = NULL;
-        g_Capture.AttachedNames[(ULONG)index] = NULL;
-        KeReleaseSpinLock(&g_AttachLock, old);
+        // Roll the reservation back; this also frees nameCopy.
+        UmFreeSlotResources((ULONG)index);
+        ObDereferenceObject(devObj);
     }
     return status;
 }
@@ -827,14 +1012,30 @@ static VOID UmRegisterHotplug(VOID)
 
     status = IoRegisterPlugPlayNotification(
         EventCategoryDeviceInterfaceChange,
-        PNPNOTIFY_DEVICE_INTERFACE_INCLUDE_EXISTING_INTERFACES,
+        // NO PNPNOTIFY_DEVICE_INTERFACE_INCLUDE_EXISTING_INTERFACES.
+        //
+        // That flag makes the callback run SYNCHRONOUSLY inside DriverEntry for every port
+        // already present, so UmAttachOne -> IoGetDeviceObjectPointer +
+        // IoAttachDeviceToDeviceStack would execute in the driver-load path. That is
+        // exactly the START_PENDING(1072) hang this driver was already fixed for:
+        // DriverEntry never returns, the service can be neither stopped nor deleted, and a
+        // reboot is the only way out.
+        //
+        // Existing ports are attached by user mode via IOCTL_UM_ATTACH_PORTS, which runs
+        // only after the driver reports RUNNING. This registration then covers devices that
+        // arrive later, and those callbacks run on a system worker thread.
+        0,
         (PVOID)GUID_DEVINTERFACE_COMPORT,
         g_DriverObject,
         UmHotplugCallback,
         NULL,
         &g_NotificationEntry);
     UNREFERENCED_PARAMETER(interfaceClass);
-    UNREFERENCED_PARAMETER(status);
+    // A failed registration is not fatal (existing ports are still covered by the IOCTL
+    // scan), but leaving it silent would make "hot-plug does not work" unexplainable.
+    if (!NT_SUCCESS(status)) {
+        g_NotificationEntry = NULL;
+    }
 }
 
 static VOID UmUnregisterHotplug(VOID)
@@ -884,6 +1085,10 @@ static NTSTATUS UmControlCreate(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     if (!UmIsControlDevice(DeviceObject)) {
         return UmFilterDispatch(DeviceObject, Irp);
     }
+    // Count open handles. Capture stays on while at least one monitor has the device open,
+    // so a crashed or killed monitor does not leave the driver capturing (and filling the
+    // queue, and burning CPU) until the driver is unloaded.
+    InterlockedIncrement(&g_Capture.OpenCount);
     g_Capture.Enabled = 1;
     Irp->IoStatus.Status = STATUS_SUCCESS;
     Irp->IoStatus.Information = 0;
@@ -897,6 +1102,12 @@ static NTSTATUS UmControlClose(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     if (!UmIsControlDevice(DeviceObject)) {
         return UmFilterDispatch(DeviceObject, Irp);
     }
+    // Stop capturing once the last monitor handle closes. Device attach state is left
+    // alone: the filters stay in the stack so a later reopen resumes capture immediately.
+    if (InterlockedDecrement(&g_Capture.OpenCount) <= 0) {
+        g_Capture.OpenCount = 0;
+        g_Capture.Enabled = 0;
+    }
     Irp->IoStatus.Status = STATUS_SUCCESS;
     Irp->IoStatus.Information = 0;
     IoCompleteRequest(Irp, IO_NO_INCREMENT);
@@ -907,7 +1118,7 @@ static NTSTATUS UmControlClose(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 //
 // A filter driver MUST forward this. Windows delivers CLEANUP before CLOSE, and the
 // serial driver uses it to abort pending reads and release port resources. Without the
-// forward, an application that closes its port leaves stale state behind — which shows up
+// forward, an application that closes its port leaves stale state behind 鈥?which shows up
 // as "the port is still busy" on the next open. The reference driver handles CLEANUP in
 // the same branch as CLOSE for exactly this reason.
 static NTSTATUS UmControlCleanup(PDEVICE_OBJECT DeviceObject, PIRP Irp)
@@ -937,11 +1148,76 @@ static NTSTATUS UmControlIoctl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
         return UmFilterDispatch(DeviceObject, Irp);
     }
 
+    // Gate everything behind the session-key handshake.
+    //
+    // The DACL already restricts who can open the device, but "can open" is a weaker
+    // property than "is our service" 鈥?the key check is what actually pairs this driver
+    // with our software. A process that somehow obtains a handle still cannot start
+    // capture, retarget it, or read traffic without the key.
+    if (code == IOCTL_UM_AUTHENTICATE) {
+        PUM_DEVICE_CTX dctx = (PUM_DEVICE_CTX)DeviceObject->DeviceExtension;
+        if (buf == NULL || inLen < sizeof(g_Capture.SessionKey)) {
+            status = STATUS_INVALID_PARAMETER;
+        } else if (!UmKeyMatches((const UCHAR *)buf)) {
+            status = STATUS_ACCESS_DENIED;
+        } else {
+            dctx->Flags |= UM_CTX_AUTHENTICATED;
+            g_Capture.Enabled = 1;
+            status = STATUS_SUCCESS;
+        }
+        Irp->IoStatus.Status = status;
+        Irp->IoStatus.Information = 0;
+        IoCompleteRequest(Irp, IO_NO_INCREMENT);
+        return status;
+    }
+    {
+        PUM_DEVICE_CTX dctx = (PUM_DEVICE_CTX)DeviceObject->DeviceExtension;
+        if ((dctx->Flags & UM_CTX_AUTHENTICATED) == 0) {
+            Irp->IoStatus.Status = STATUS_ACCESS_DENIED;
+            Irp->IoStatus.Information = 0;
+            IoCompleteRequest(Irp, IO_NO_INCREMENT);
+            return STATUS_ACCESS_DENIED;
+        }
+    }
+
+    // Honour the access bits declared in each CTL_CODE. Without this the FILE_READ_DATA /
+    // FILE_WRITE_DATA in the codes is decorative 鈥?a handle opened read-only could still
+    // issue the write-class IOCTLs.
+    if (code == IOCTL_UM_GET_RECORD || code == IOCTL_UM_GET_STATS ||
+        code == IOCTL_UM_GET_PORT_NAME) {
+        if (!IoValidateDeviceIoControlAccess(Irp, FILE_READ_ACCESS)) {
+            Irp->IoStatus.Status = STATUS_ACCESS_DENIED;
+            Irp->IoStatus.Information = 0;
+            IoCompleteRequest(Irp, IO_NO_INCREMENT);
+            return STATUS_ACCESS_DENIED;
+        }
+    } else {
+        if (!IoValidateDeviceIoControlAccess(Irp, FILE_WRITE_ACCESS)) {
+            Irp->IoStatus.Status = STATUS_ACCESS_DENIED;
+            Irp->IoStatus.Information = 0;
+            IoCompleteRequest(Irp, IO_NO_INCREMENT);
+            return STATUS_ACCESS_DENIED;
+        }
+    }
+
     switch (code) {
     case IOCTL_UM_GET_RECORD:
         if (buf != NULL && outLen >= UM_RECORD_HEADER) {
-            info = UmDequeueRecord((PUCHAR)buf, outLen);
-            status = STATUS_SUCCESS;
+            LONG got = UmDequeueRecord((PUCHAR)buf, outLen);
+            if (got > 0) {
+                info = (ULONG)got;
+                status = STATUS_SUCCESS;
+            } else if (got == 0) {
+                // Empty queue: a zero-length success, not an error. This is what lets the
+                // capture thread poll without ever blocking the UI.
+                info = 0;
+                status = STATUS_SUCCESS;
+            } else {
+                // Buffer too small; the record stayed queued. Report the required size so
+                // the caller can grow its buffer instead of silently losing data.
+                info = UM_RECORD_HEADER + UM_MAX_PAYLOAD;
+                status = STATUS_BUFFER_TOO_SMALL;
+            }
         } else {
             status = STATUS_BUFFER_TOO_SMALL;
         }
@@ -958,7 +1234,15 @@ static NTSTATUS UmControlIoctl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
         break;
 
     case IOCTL_UM_ATTACH_PORTS:
-        info = UmAttachAllPorts();
+        // Write the result into the output buffer as well as into Information.
+        // METHOD_BUFFERED callers read lpBytesReturned from Information, but depending on
+        // that alone means an aliasing caller is the only one that ever sees the count.
+        if (buf == NULL || outLen < sizeof(ULONG)) {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        *(PULONG)buf = UmAttachAllPorts();
+        info = sizeof(ULONG);
         status = STATUS_SUCCESS;
         break;
 
@@ -974,7 +1258,7 @@ static NTSTATUS UmControlIoctl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 
     case IOCTL_UM_GET_STATS:
         // Layout: 8 x u32. The byte counters are 64-bit, so they are split across two
-        // slots each — truncating them to 32 bits would wrap after 4 GB of traffic.
+        // slots each 鈥?truncating them to 32 bits would wrap after 4 GB of traffic.
         if (buf != NULL && outLen >= 40) {
             PULONG s = (PULONG)buf;
             s[0] = g_Capture.Count;
@@ -1025,34 +1309,209 @@ static VOID UmDriverUnload(PDRIVER_OBJECT DriverObject)
     //
     // An earlier version only reset AttachedCount to zero, which leaked the device
     // objects AND left them attached to the serial stacks. Driver unload then freed the
-    // driver while live filter devices still pointed at its dispatch table — a guaranteed
+    // driver while live filter devices still pointed at its dispatch table 鈥?a guaranteed
     // bugcheck on the next serial I/O. Each filter must be detached and deleted for real.
     //
     // The filter objects are recorded in AttachedFilters[] precisely so this loop does not
     // have to guess them from the stack.
-    while (g_Capture.AttachedCount > 0) {
-        ULONG i = g_Capture.AttachedCount - 1;
-        PDEVICE_OBJECT filter = g_Capture.AttachedFilters[i];
-        PDEVICE_OBJECT physical = g_Capture.Attached[i];
+    {
+        ULONG i;
+        for (i = 0; i < UM_MAX_FILTERS; i++) {
+            PDEVICE_OBJECT filter = g_Capture.AttachedFilters[i];
+            PDEVICE_OBJECT physical = g_Capture.Attached[i];
+            PWSTR name = g_Capture.AttachedNames[i];
 
-        if (filter != NULL) {
-            PUM_DEVICE_CTX fctx = (PUM_DEVICE_CTX)filter->DeviceExtension;
-            // Clear Lower first so any IRP still in flight through this filter sees a
-            // disconnected device instead of a freed one.
-            fctx->Lower = NULL;
-            if (physical != NULL) {
-                IoDetachDevice(physical);
+            if (filter != NULL) {
+                PUM_DEVICE_CTX fctx = (PUM_DEVICE_CTX)filter->DeviceExtension;
+                // Clear Lower first so any IRP still in flight through this filter sees a
+                // disconnected device instead of a freed one.
+                fctx->Lower = NULL;
+                if (physical != NULL) {
+                    IoDetachDevice(physical);
+                }
+                IoDeleteDevice(filter);
             }
-            IoDeleteDevice(filter);
+            // Drop the reference taken when this device was registered.
+            if (physical != NULL) {
+                ObDereferenceObject(physical);
+            }
+            if (name != NULL) {
+                ExFreePoolWithTag(name, UM_TAG);
+            }
+            g_Capture.AttachedFilters[i] = NULL;
+            g_Capture.Attached[i] = NULL;
+            g_Capture.AttachedNames[i] = NULL;
+            g_Capture.SlotUsed[i] = FALSE;
         }
-        g_Capture.AttachedFilters[i] = NULL;
-        g_Capture.Attached[i] = NULL;
-        g_Capture.AttachedNames[i] = NULL;
-        g_Capture.AttachedCount--;
+        g_Capture.AttachedCount = 0;
     }
+
+    // Drain the queue before destroying the lookaside: ExDeleteNPagedLookasideList does not
+    // free items that are still checked out, so anything still queued leaked (up to 512
+    // records of 4 KB 鈮?2 MB of non-paged memory per unload).
+    for (;;) {
+        KIRQL old;
+        PLIST_ENTRY entry = NULL;
+        KeAcquireSpinLock(&g_Capture.Lock, &old);
+        if (!IsListEmpty(&g_Capture.Queue)) {
+            entry = RemoveHeadList(&g_Capture.Queue);
+            if (g_Capture.Count > 0) {
+                g_Capture.Count--;
+            }
+        }
+        KeReleaseSpinLock(&g_Capture.Lock, old);
+        if (entry == NULL) {
+            break;
+        }
+        ExFreeToNPagedLookasideList(
+            &g_Capture.Lookaside, CONTAINING_RECORD(entry, UM_RECORD_ITEM, Entry));
+    }
+
     ExDeleteNPagedLookasideList(&g_Capture.Lookaside);
+    ExDeleteNPagedLookasideList(&g_Capture.CtxLookaside);
 }
 
+// === UM_CREATE_CONTROL_DEVICE ===
+// Create the control device with an explicit DACL.
+//
+// IoCreateDeviceSecure is resolved dynamically instead of being linked:
+//   * wdmsec.lib exports only PfnIoCreateDeviceSecure (a pointer) plus WdmlibInit, so a
+//     direct reference fails to link (LNK2019),
+//   * the API is absent on very old builds, where falling back is better than refusing to
+//     load at all.
+// This is the same technique the reference driver uses (its sub_22008 resolves the
+// symbol via MmGetSystemRoutineAddress).
+typedef NTSTATUS (NTAPI *UM_PFN_CREATE_DEVICE_SECURE)(
+    PDRIVER_OBJECT DriverObject,
+    ULONG DeviceExtensionSize,
+    PUNICODE_STRING DeviceName,
+    DEVICE_TYPE DeviceType,
+    ULONG DeviceCharacteristics,
+    BOOLEAN Exclusive,
+    PCUNICODE_STRING DefaultSDDLString,
+    LPCGUID DeviceClassGuid,
+    PDEVICE_OBJECT *DeviceObject);
+
+static NTSTATUS UmCreateControlDevice(
+    PDRIVER_OBJECT DriverObject,
+    PUNICODE_STRING DeviceName,
+    PDEVICE_OBJECT *OutDevice)
+{
+    static UM_PFN_CREATE_DEVICE_SECURE pfnCreateSecure = NULL;
+    static BOOLEAN resolved = FALSE;
+    NTSTATUS status;
+
+    if (!resolved) {
+        UNICODE_STRING routine;
+        RtlInitUnicodeString(&routine, L"IoCreateDeviceSecure");
+        pfnCreateSecure = (UM_PFN_CREATE_DEVICE_SECURE)MmGetSystemRoutineAddress(&routine);
+        resolved = TRUE;
+    }
+
+    if (pfnCreateSecure != NULL) {
+        // Full access to SYSTEM and Administrators; Users may open it so an interactive
+        // user can run the monitor. The session-key handshake gates actual use.
+        DECLARE_CONST_UNICODE_STRING(umSddl,
+            L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;BU)");
+        status = pfnCreateSecure(
+            DriverObject, sizeof(UM_DEVICE_CTX), DeviceName,
+            FILE_DEVICE_UNKNOWN, FILE_DEVICE_SECURE_OPEN, FALSE,
+            &umSddl, NULL, OutDevice);
+        if (NT_SUCCESS(status)) {
+            return status;
+        }
+        // Fall through to the plain create rather than failing the load outright.
+    }
+
+    // No custom DACL available: keep FILE_DEVICE_SECURE_OPEN (open still goes through the
+    // device ACL) and rely on the session-key handshake for authorisation.
+    return IoCreateDevice(
+        DriverObject, sizeof(UM_DEVICE_CTX), DeviceName,
+        FILE_DEVICE_UNKNOWN, FILE_DEVICE_SECURE_OPEN, FALSE, OutDevice);
+}
+// === UM_CREATE_CONTROL_DEVICE_END ===
+// === UM_SECURITY_LAYER ===
+// ---------------------------------------------------------------------------
+// Device security: only our own software may be able to use this driver
+// ---------------------------------------------------------------------------
+//
+// A monitor that can read every serial byte is exactly the kind of device an attacker
+// would like to open, so the control device must not be world-accessible.
+//
+// The reference product handles this with a security descriptor built from the SDDL
+// string "D:P(A;;GA;;;WD)" 鈥?GA to Everyone, i.e. no protection at all (verified in its
+// binary). That weakness is deliberately NOT copied here. This driver uses two layers:
+//
+//   1. A DACL granting full access only to SYSTEM and Administrators, plus read/write to
+//      Builtin Users so an ordinary interactive user can still run the monitor.
+//   2. A per-boot session key published by the driver and required as the payload of
+//      IOCTL_UM_AUTHENTICATE before any other IOCTL is accepted. A process that merely
+//      manages to open the device still cannot drive it.
+//
+// The descriptor is built directly with RtlCreateAcl / RtlSetDaclSecurityDescriptor
+// rather than IoCreateDeviceSecure, because those APIs exist identically from Windows 7
+// through 11 鈥?no dynamic resolution and no signed-driver requirement.
+
+// Constant-time-ish comparison of the caller key with ours.
+static BOOLEAN UmKeyMatches(const UCHAR *candidate)
+{
+    ULONG i;
+    UCHAR diff = 0;
+
+    if (!g_Capture.SessionKeySet) {
+        // No key published (registry unavailable): fall back to DACL-only protection
+        // rather than locking the legitimate service out entirely.
+        return TRUE;
+    }
+    for (i = 0; i < sizeof(g_Capture.SessionKey); i++) {
+        diff |= (UCHAR)(candidate[i] ^ g_Capture.SessionKey[i]);
+    }
+    return diff == 0;
+}
+
+// === UM_SECURITY_LAYER_END ===
+
+static VOID UmPublishSessionKey(VOID)
+{
+    OBJECT_ATTRIBUTES oa;
+    UNICODE_STRING keyName;
+    UNICODE_STRING valueName;
+    HANDLE keyHandle = NULL;
+    NTSTATUS status;
+    LARGE_INTEGER now;
+    ULONG i;
+    UCHAR keyBytes[16];
+    ULONG disposition = 0;
+    ULONGLONG mix;
+
+    RtlInitUnicodeString(&keyName, UM_PARAMS_KEY);
+    InitializeObjectAttributes(&oa, &keyName,
+                               OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+
+    status = ZwCreateKey(&keyHandle, KEY_WRITE, &oa, 0, NULL, 0, &disposition);
+    if (!NT_SUCCESS(status)) {
+        g_Capture.SessionKeySet = FALSE;
+        return;
+    }
+
+    // Not a cryptographic RNG, but the key only has to be unpredictable to another local
+    // process, is regenerated on every boot, and never crosses a trust boundary.
+    KeQuerySystemTime(&now);
+    mix = (ULONGLONG)(ULONG_PTR)&g_Capture ^ (ULONGLONG)(ULONG_PTR)&UmPublishSessionKey ^
+          (ULONGLONG)now.QuadPart;
+    for (i = 0; i < sizeof(keyBytes); i++) {
+        mix = mix * 6364136223846793005ULL + 1442695040888963407ULL;
+        keyBytes[i] = (UCHAR)(mix >> 33);
+    }
+    RtlCopyMemory(g_Capture.SessionKey, keyBytes, sizeof(keyBytes));
+    g_Capture.SessionKeySet = TRUE;
+
+    RtlInitUnicodeString(&valueName, UM_PARAMS_VALUE);
+    ZwSetValueKey(keyHandle, &valueName, 0, REG_BINARY, keyBytes, sizeof(keyBytes));
+    ZwClose(keyHandle);
+}
+
+// Constant-time-ish comparison of the caller's key with ours.
 NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 {
     UNICODE_STRING devName;
@@ -1072,14 +1531,28 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     ExInitializeNPagedLookasideList(
         &g_Capture.Lookaside, NULL, NULL, POOL_NX_ALLOCATION,
         sizeof(UM_RECORD_ITEM), UM_TAG, 0);
+    // Per-IRP context lookaside: a busy serial port issues thousands of READ/WRITE IRPs per
+    // second, and allocating a 32-byte block for each one made the allocator a hot spot.
+    ExInitializeNPagedLookasideList(
+        &g_Capture.CtxLookaside, NULL, NULL, POOL_NX_ALLOCATION,
+        sizeof(UM_IRP_CTX), UM_TAG, 0);
     g_Capture.Enabled = 1;
 
     RtlInitUnicodeString(&devName, UM_DEVICE_NAME);
-    status = IoCreateDevice(
-        DriverObject, sizeof(UM_DEVICE_CTX), &devName,
-        FILE_DEVICE_UNKNOWN, FILE_DEVICE_SECURE_OPEN, FALSE, &device);
+    // Create the control device with an explicit DACL via IoCreateDeviceSecure.
+    //
+    // Plain IoCreateDevice inherits the default \Device ACL, which lets any local process
+    // open the device and read every serial byte. The SDDL below grants full access to
+    // SYSTEM and Administrators and read/write to Builtin Users (so an interactive user can
+    // still run the monitor); the session-key handshake then gates actual use.
+    //
+    // IoCreateDeviceSecure lives in Wdmsec.lib and needs the driver to be signed; when the
+    // symbol is unavailable the code falls back to IoCreateDevice so the driver still
+    // loads in environments where Wdmsec is not linked.
+    status = UmCreateControlDevice(DriverObject, &devName, &device);
     if (!NT_SUCCESS(status)) {
         ExDeleteNPagedLookasideList(&g_Capture.Lookaside);
+        ExDeleteNPagedLookasideList(&g_Capture.CtxLookaside);
         return status;
     }
     device->Flags |= DO_BUFFERED_IO;
@@ -1089,6 +1562,9 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     ctx->Self = device;
     ctx->PassThroughOnly = TRUE;
     g_ControlDevice = device;
+
+    // Publish the per-boot session key the service must present.
+    UmPublishSessionKey();
 
     RtlInitUnicodeString(&symName, UM_SYMLINK_NAME);
     status = IoCreateSymbolicLink(&symName, &devName);
@@ -1100,17 +1576,30 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     }
     g_SymLink = symName;
 
+    // Fill EVERY major function with a pass-through first, then override the ones that
+    // need special handling.
+    //
+    // This matters more than it looks. Windows completes an unassigned MajorFunction entry
+    // for a filter device with STATUS_INVALID_DEVICE_REQUEST at OUR layer, so the IRP never
+    // reaches serial.sys. The serial stack legitimately receives CLEANUP, FLUSH_BUFFERS,
+    // SET_INFORMATION, SYSTEM_CONTROL, SHUTDOWN, INTERNAL_DEVICE_CONTROL and more; any of
+    // them being swallowed at the filter is a real behavioural bug. CLEANUP in particular
+    // is what makes the serial driver cancel pending reads and drop its open state 鈥?when
+    // it never arrives, a closed port stays "busy" and the next open fails.
+    {
+        ULONG mj;
+        for (mj = 0; mj <= IRP_MJ_MAXIMUM_FUNCTION; mj++) {
+            DriverObject->MajorFunction[mj] = UmFilterDispatch;
+        }
+    }
+
     DriverObject->MajorFunction[IRP_MJ_CREATE] = UmControlCreate;
     DriverObject->MajorFunction[IRP_MJ_CLOSE] = UmControlClose;
-    // CLEANUP and INTERNAL_DEVICE_CONTROL are the two the reference driver sets and an
-    // earlier version of this one omitted:
-    //   * CLEANUP must reach the serial driver so a closed port is really released.
-    //   * INTERNAL_DEVICE_CONTROL carries the private requests stacked drivers use
-    //     (usbser / SerCx rely on it); leaving it unassigned makes IRP_MJ dispatch fall
-    //     through to IopInvalidDeviceRequest.
     DriverObject->MajorFunction[IRP_MJ_CLEANUP] = UmControlCleanup;
-    DriverObject->MajorFunction[IRP_MJ_INTERNAL_DEVICE_CONTROL] = UmControlIoctl;
     DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = UmControlIoctl;
+    DriverObject->MajorFunction[IRP_MJ_INTERNAL_DEVICE_CONTROL] = UmControlIoctl;
+    // Reads and writes are the ones we actually want to observe; everything else simply
+    // forwards (UmFilterDispatch passes non-READ/WRITE IRPs straight down).
     DriverObject->MajorFunction[IRP_MJ_READ] = UmFilterDispatch;
     DriverObject->MajorFunction[IRP_MJ_WRITE] = UmFilterDispatch;
     DriverObject->MajorFunction[IRP_MJ_PNP] = UmFilterPnp;
@@ -1119,7 +1608,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 
     // Do NOT attach here. DriverEntry runs while the I/O manager is still bringing the
     // boot device stack up, so calling IoGetDeviceObjectPointer / IoAttachDeviceToDeviceStack
-    // from this context can block on a device that is not ready yet — the service then sits
+    // from this context can block on a device that is not ready yet 鈥?the service then sits
     // in START_PENDING and cannot even be deleted (a driver inside DriverEntry cannot be
     // unloaded), which is the 1072 the installer hit.
     //

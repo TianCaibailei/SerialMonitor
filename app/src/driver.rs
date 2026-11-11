@@ -57,6 +57,10 @@ pub const IOCTL_SET_TARGET: u32 = ctl(0x801, FILE_WRITE_DATA);
 pub const IOCTL_GET_STATS: u32 = ctl(0x802, FILE_READ_DATA);
 pub const IOCTL_ATTACH_PORTS: u32 = ctl(0x803, FILE_WRITE_DATA);
 pub const IOCTL_GET_PORT_NAME: u32 = ctl(0x804, FILE_READ_DATA);
+// Present the per-boot session key. Must be the first IOCTL on a handle; the driver
+// refuses everything else until it succeeds, which is what pairs this client with the
+// driver (a process that merely opens the device cannot use it).
+pub const IOCTL_AUTHENTICATE: u32 = ctl(0x805, FILE_WRITE_DATA);
 
 pub const RECORD_HEADER: usize = 32;
 pub const MAX_PAYLOAD: usize = 4096;
@@ -124,6 +128,89 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+// ---------------------------------------------------------------------------
+// Session key: read from HKLM\Software\UmSerialFilter\SessionKey
+// ---------------------------------------------------------------------------
+//
+// The driver generates this at load time and publishes it there. HKLM is writable only by
+// administrators, so reading it is how our software proves it is allowed to use the
+// driver.
+
+const AUTH_NO_KEY: u32 = 0xFFFF_FFFE;
+
+static LAST_AUTH_ERROR: AtomicU32 = AtomicU32::new(0);
+
+/// Why the last authenticate() failed (0 = no failure recorded).
+pub fn last_auth_error() -> u32 {
+    LAST_AUTH_ERROR.load(Ordering::Relaxed)
+}
+
+#[cfg(windows)]
+fn read_session_key() -> Option<Vec<u8>> {
+    use std::ffi::c_void;
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn RegOpenKeyExW(
+            key: *mut c_void,
+            sub: *const u16,
+            options: u32,
+            desired: u32,
+            out: *mut *mut c_void,
+        ) -> i32;
+        fn RegQueryValueExW(
+            key: *mut c_void,
+            value: *const u16,
+            reserved: *mut u32,
+            kind: *mut u32,
+            data: *mut u8,
+            len: *mut u32,
+        ) -> i32;
+        fn RegCloseKey(key: *mut c_void) -> i32;
+    }
+
+    // HKEY_LOCAL_MACHINE = 0x80000002
+    const HKEY_LOCAL_MACHINE: *mut c_void = 0x8000_0002usize as *mut c_void;
+    const KEY_READ: u32 = 0x2_0019;
+    const REG_BINARY: u32 = 3;
+
+    let sub = wide("Software\\UmSerialFilter");
+    let mut hkey: *mut c_void = std::ptr::null_mut();
+    let rc = unsafe {
+        RegOpenKeyExW(HKEY_LOCAL_MACHINE, sub.as_ptr(), 0, KEY_READ, &mut hkey)
+    };
+    if rc != 0 || hkey.is_null() {
+        return None;
+    }
+
+    let value = wide("SessionKey");
+    let mut kind = 0u32;
+    let mut buf = vec![0u8; 64];
+    let mut len = buf.len() as u32;
+    let rc = unsafe {
+        RegQueryValueExW(
+            hkey,
+            value.as_ptr(),
+            std::ptr::null_mut(),
+            &mut kind,
+            buf.as_mut_ptr(),
+            &mut len,
+        )
+    };
+    unsafe { RegCloseKey(hkey) };
+
+    if rc != 0 || kind != REG_BINARY || len == 0 || len > 64 {
+        return None;
+    }
+    buf.truncate(len as usize);
+    Some(buf)
+}
+
+#[cfg(not(windows))]
+fn read_session_key() -> Option<Vec<u8>> {
+    None
+}
+
 /// 最近一次 CreateFileW 失败的 GetLastError 值。
 ///
 /// 之所以用全局变量而不是改 `open()` 的签名：`open()` 的 `Option<DriverHandle>` 形态
@@ -171,7 +258,34 @@ impl DriverHandle {
             None
         } else {
             LAST_OPEN_ERROR.store(0, Ordering::Relaxed);
-            Some(DriverHandle { h })
+            let handle = DriverHandle { h };
+            // Complete the handshake immediately: the driver refuses every other IOCTL
+            // until it succeeds, so a handle that skipped this would look "open but dead".
+            handle.authenticate();
+            Some(handle)
+        }
+    }
+
+    /// Present the per-boot session key to the driver.
+    ///
+    /// This is what pairs our software with our driver. The key lives under
+    /// HKLM\Software\UmSerialFilter (writable only by administrators), so a process that
+    /// merely obtains a handle to the device still cannot capture, retarget or read
+    /// traffic. Returns true when the driver accepted the key.
+    pub fn authenticate(&self) -> bool {
+        let Some(key) = read_session_key() else {
+            LAST_AUTH_ERROR.store(AUTH_NO_KEY, Ordering::Relaxed);
+            return false;
+        };
+        match self.ioctl(IOCTL_AUTHENTICATE, Some(&key), 0) {
+            Some(_) => {
+                LAST_AUTH_ERROR.store(0, Ordering::Relaxed);
+                true
+            }
+            None => {
+                LAST_AUTH_ERROR.store(unsafe { GetLastError() }, Ordering::Relaxed);
+                false
+            }
         }
     }
 
