@@ -190,6 +190,8 @@ static UM_CAPTURE g_Capture;
 // the definitions, so the prototypes have to live here).
 static BOOLEAN UmAlreadyAttached(PDEVICE_OBJECT physical);
 static LONG UmRegisterAttached(PDEVICE_OBJECT physical, PWSTR name);
+static BOOLEAN UmIsOwnFilterDevice(PDEVICE_OBJECT devObj);
+static PDEVICE_OBJECT UmLowestDevice(PDEVICE_OBJECT devObj);
 static VOID UmFreeSlotResources(ULONG index);
 static PWSTR UmDuplicateName(PCUNICODE_STRING name);
 
@@ -922,14 +924,31 @@ static ULONG UmAttachAllPorts(VOID)
                             continue;
                         }
 
-                        // The scan can be re-run by user mode, so skip devices we already
-                        // filter rather than stacking a second filter on them.
-                        if (!UmAlreadyAttached(devObj)) {
+                        // Skip devices we already filter.
+                        //
+                        // IoGetDeviceObjectPointer returns the TOP of the stack. After our
+                        // first attach the top IS our filter device, so comparing that
+                        // against the recorded physical device never matched and every
+                        // ATTACH_PORTS call stacked another filter — captured bytes were
+                        // then reported once per layer (port ids 2, 6, 10, 14... for a
+                        // single write).
+                        //
+                        // Two checks are needed: never attach above our own filter, and
+                        // only register a device that is not already in the table.
+                        if (UmIsOwnFilterDevice(devObj)) {
+                            ObDereferenceObject(devObj);
+                            continue;
+                        }
+                        // Record and compare the LOWEST device of the stack, so repeated
+                        // scans recognise the same physical port regardless of how many
+                        // filters are already stacked on it.
+                        PDEVICE_OBJECT physical = UmLowestDevice(devObj);
+                        if (!UmAlreadyAttached(physical)) {
                             // Owned copy of the device path. Passing NULL here (as an
                             // earlier version did) made AttachedNames always NULL, so
                             // IOCTL_UM_GET_PORT_NAME could never answer.
                             PWSTR nameCopy = UmDuplicateName(&devName);
-                            LONG idx = UmRegisterAttached(devObj, nameCopy);
+                            LONG idx = UmRegisterAttached(physical, nameCopy);
                             if (idx >= 0) {
                                 if (!NT_SUCCESS(UmAttachOne(devObj, (ULONG)idx, nameCopy))) {
                                     // Roll the slot back; it also frees nameCopy.
@@ -997,6 +1016,41 @@ static PWSTR UmDuplicateName(PCUNICODE_STRING name)
     RtlCopyMemory(copy, name->Buffer, chars * sizeof(WCHAR));
     copy[chars] = L'\0';
     return copy;
+}
+
+// Is this object one of OUR filter devices?
+//
+// IoGetDeviceObjectPointer returns the top of the stack, so on the second scan it hands
+// back the filter we installed on the first scan. Attaching above our own filter would
+// stack a second copy and every capture would be duplicated once per layer.
+static BOOLEAN UmIsOwnFilterDevice(PDEVICE_OBJECT devObj)
+{
+    PUM_DEVICE_CTX ctx;
+
+    if (devObj == NULL) {
+        return FALSE;
+    }
+    if (devObj->DriverObject != g_DriverObject) {
+        return FALSE;
+    }
+    ctx = (PUM_DEVICE_CTX)devObj->DeviceExtension;
+    // A filter device has a lower device; the control device does not.
+    return (ctx != NULL && ctx->Lower != NULL);
+}
+
+// Find the lowest device object of a stack (the physical device).
+//
+// Used so the duplicate check compares like with like: what we record is the physical
+// device, while IoGetDeviceObjectPointer keeps returning whatever sits on top now.
+static PDEVICE_OBJECT UmLowestDevice(PDEVICE_OBJECT devObj)
+{
+    PDEVICE_OBJECT cur = devObj;
+    ULONG guard = 0;
+
+    while (cur != NULL && cur->AttachedDevice != NULL && guard++ < 64) {
+        cur = cur->AttachedDevice;
+    }
+    return cur;
 }
 
 static BOOLEAN UmAlreadyAttached(PDEVICE_OBJECT physical)
