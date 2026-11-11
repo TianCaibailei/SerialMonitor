@@ -550,6 +550,55 @@ typedef struct _UM_DIRECTORY_INFORMATION {
     UNICODE_STRING TypeName;
 } UM_DIRECTORY_INFORMATION, *PUM_DIRECTORY_INFORMATION;
 
+// === UM_SAFE_TARGET_GATE ===
+// Forward declaration: defined just below, used by the gate above it.
+static BOOLEAN UmLooksLikeSerialPort(PCUNICODE_STRING name);
+// Decide whether it is safe to attach a filter above this device.
+//
+// A false positive here does not merely mis-capture data: it splices our dispatch into a
+// foreign driver's IRP chain, and that driver then bugchecks when it receives the IRPs we
+// rewrote. The machine already crashed once that way, with the fault attributed to an
+// unrelated vendor driver.
+//
+// Requirements (all must hold):
+//   1. The object really is a device object.
+//   2. DeviceType is FILE_DEVICE_SERIAL_PORT.
+//   3. It is not our own control device.
+//   4. The name still matches a serial-port family.
+static BOOLEAN UmIsSafeSerialTarget(PDEVICE_OBJECT Target, PCUNICODE_STRING Name)
+{
+    UNICODE_STRING ownName;
+
+    if (Target == NULL) {
+        return FALSE;
+    }
+    // 1. Confirm it is a device object. ObReferenceObjectByName can be handed a name whose
+    //    object type is not a device at all.
+    if (Target->Type != IO_TYPE_DEVICE) {
+        return FALSE;
+    }
+    // 2. The authoritative signal. Serial port drivers set FILE_DEVICE_SERIAL_PORT
+    //    (0x1b). Anything else is not ours to touch, regardless of its name.
+    if (Target->DeviceType != FILE_DEVICE_SERIAL_PORT) {
+        return FALSE;
+    }
+    // 3. Never our own control device.
+    if (Target == g_ControlDevice) {
+        return FALSE;
+    }
+    RtlInitUnicodeString(&ownName, L"UmSerialFilter");
+    if (Name != NULL && Name->Buffer != NULL && Name->Length == ownName.Length &&
+        RtlCompareUnicodeString(Name, &ownName, TRUE) == 0) {
+        return FALSE;
+    }
+    // 4. Belt and braces: the name must still look like a serial port. A driver that sets
+    //    the serial device type but is not a COM port would otherwise be filtered.
+    if (Name != NULL && !UmLooksLikeSerialPort(Name)) {
+        return FALSE;
+    }
+    return TRUE;
+}
+// === UM_SAFE_TARGET_GATE_END ===
 // Does this \Device child name look like a serial port device?
 //
 // Kept broad on purpose: the reference product matches its own serial namespaces, while
@@ -794,6 +843,12 @@ static ULONG UmAttachAllPorts(VOID)
                         &devName, OBJ_CASE_INSENSITIVE, NULL, 0,
                         *IoDeviceObjectType, NULL, (PVOID *)&devObj);
                     if (NT_SUCCESS(openStatus) && devObj != NULL) {
+                        // Refuse anything that is not demonstrably a serial port: splicing our
+                        // dispatch into a foreign IRP chain bugchecks inside that driver.
+                        if (!UmIsSafeSerialTarget(devObj, &entry->Name)) {
+                            ObDereferenceObject(devObj);
+                            continue;
+                        }
 
                         // The scan can be re-run by user mode, so skip devices we already
                         // filter rather than stacking a second filter on them.
@@ -950,14 +1005,21 @@ static NTSTATUS UmHotplugAttachLink(PUNICODE_STRING link)
     LONG index;
     PWSTR nameCopy;
 
-    status = IoGetDeviceObjectPointer(link, FILE_READ_DATA, &fileObj, &devObj);
-    if (!NT_SUCCESS(status)) {
-        return status;
+    // Same non-blocking reference as the scan path: opening the device here would wait for
+    // PnP completion inside a notification callback.
+    status = ObReferenceObjectByName(
+        link, OBJ_CASE_INSENSITIVE, NULL, 0,
+        *IoDeviceObjectType, NULL, (PVOID *)&devObj);
+    if (!NT_SUCCESS(status) || devObj == NULL) {
+        return STATUS_DEVICE_NOT_CONNECTED;
     }
-    // Keep our own reference: the file object was the only owner of the device object, and
-    // the driver stores devObj in its attach table.
-    ObReferenceObject(devObj);
-    ObDereferenceObject(fileObj);
+
+    // Same safety gate as the scan: never splice into a non-serial device, or that driver
+    // bugchecks on the IRPs we rewrote.
+    if (!UmIsSafeSerialTarget(devObj, link)) {
+        ObDereferenceObject(devObj);
+        return STATUS_DEVICE_NOT_CONNECTED;
+    }
 
     if (UmAlreadyAttached(devObj)) {
         ObDereferenceObject(devObj);
