@@ -56,6 +56,10 @@
 #define IOCTL_UM_AUTHENTICATE \
     CTL_CODE(UM_DEVICE_TYPE, 0x805, METHOD_BUFFERED, FILE_WRITE_DATA)
 
+// IoDeviceObjectType is exported by ntoskrnl but not declared by the WDK NuGet km headers.
+// ObReferenceObjectByName needs it to know we are asking for a device object.
+extern POBJECT_TYPE *IoDeviceObjectType;
+
 #define UM_CTX_AUTHENTICATED 0x00000001UL
 // Registry location where the session key is published.
 #define UM_PARAMS_KEY   L"\\Registry\\Machine\\Software\\UmSerialFilter"
@@ -695,6 +699,9 @@ static ULONG UmAttachAllPorts(VOID)
     ULONG attached = 0;
     ULONG context = 0;
     BOOLEAN first = TRUE;
+    // Hard iteration cap: a misbehaving enumeration must not be able to hang the IOCTL.
+    // \Device has a few hundred children at most; 4096 is generous.
+    ULONG guard = 0;
     ULONG bufLen = 32 * 1024;
     PVOID buf = NULL;
 
@@ -713,6 +720,9 @@ static ULONG UmAttachAllPorts(VOID)
     }
 
     for (;;) {
+        if (++guard > 4096) {
+            break;
+        }
         ULONG retLen = 0;
         ULONG i;
         status = ZwQueryDirectoryObject(
@@ -769,16 +779,21 @@ static ULONG UmAttachAllPorts(VOID)
                 RtlInitUnicodeString(&devName, pathBuf);
 
                 {
-                    PFILE_OBJECT fileObj = NULL;
                     PDEVICE_OBJECT devObj = NULL;
-                    NTSTATUS openStatus = IoGetDeviceObjectPointer(
-                        &devName, FILE_READ_DATA, &fileObj, &devObj);
-                    if (NT_SUCCESS(openStatus)) {
-                        // Hold our own reference on the device object: the file object was
-                        // the only thing keeping it alive, and the driver keeps using
-                        // devObj long after this point (ctx->Physical, the attach table).
-                        ObReferenceObject(devObj);
-                        ObDereferenceObject(fileObj);
+                    // Reference the device object BY NAME instead of opening it.
+                    //
+                    // IoGetDeviceObjectPointer performs a real open, which BLOCKS while the
+                    // target is still starting (exactly what hangs this IOCTL on a busy or
+                    // half-initialised serial stack), and it takes a FILE_READ_DATA right on
+                    // the port we promised never to touch.
+                    //
+                    // ObReferenceObjectByName just bumps a reference, so it neither opens the
+                    // port nor waits for PnP to finish. This is closer to what the reference
+                    // driver does.
+                    NTSTATUS openStatus = ObReferenceObjectByName(
+                        &devName, OBJ_CASE_INSENSITIVE, NULL, 0,
+                        *IoDeviceObjectType, NULL, (PVOID *)&devObj);
+                    if (NT_SUCCESS(openStatus) && devObj != NULL) {
 
                         // The scan can be re-run by user mode, so skip devices we already
                         // filter rather than stacking a second filter on them.
@@ -1334,7 +1349,7 @@ static VOID UmDriverUnload(PDRIVER_OBJECT DriverObject)
 
     // Drain the queue before destroying the lookaside: ExDeleteNPagedLookasideList does not
     // free items that are still checked out, so anything still queued leaked (up to 512
-    // records of 4 KB 鈮?2 MB of non-paged memory per unload).
+    // records of 4 KB, about 2 MB of non-paged memory per unload).
     for (;;) {
         KIRQL old;
         PLIST_ENTRY entry = NULL;
