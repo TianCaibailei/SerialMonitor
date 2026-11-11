@@ -83,6 +83,11 @@ pub struct DriverStats {
     pub enabled: u32,
     pub target_pid: u32,
     pub attached: u32,
+    /// Discovery diagnostics: how many candidates were rejected because the device type
+    /// was not a serial port, and how many because the name did not match.
+    pub rejected_type: u32,
+    pub rejected_name: u32,
+    pub accepted: u32,
 }
 
 impl DriverStats {
@@ -185,6 +190,88 @@ impl Record {
     pub fn dir_tx(&self) -> bool {
         self.kind == RecordKind::Tx
     }
+}
+
+/// Map NT device paths to the COM numbers users recognise.
+///
+/// The driver reports `\Device\VSerial8_2`; the user thinks in terms of COM6. Windows
+/// publishes the mapping under
+/// `HKLM\HARDWARE\DEVICEMAP\SERIALCOMM` (value name = device path, data = `COM6`), so the
+/// UI can read it once and label ports the way the user expects. Device paths that are
+/// not listed fall back to their own short name.
+pub fn com_names() -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn RegOpenKeyExW(
+            key: *mut c_void,
+            sub: *const u16,
+            options: u32,
+            desired: u32,
+            out: *mut *mut c_void,
+        ) -> i32;
+        fn RegEnumValueW(
+            key: *mut c_void,
+            index: u32,
+            name: *mut u16,
+            name_len: *mut u32,
+            reserved: *mut u32,
+            kind: *mut u32,
+            data: *mut u8,
+            data_len: *mut u32,
+        ) -> i32;
+        fn RegCloseKey(key: *mut c_void) -> i32;
+    }
+
+    const HKEY_LOCAL_MACHINE: *mut c_void = 0x8000_0002usize as *mut c_void;
+    const KEY_READ: u32 = 0x2_0019;
+
+    let sub = wide("HARDWARE\\DEVICEMAP\\SERIALCOMM");
+    let mut hkey: *mut c_void = std::ptr::null_mut();
+    if unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, sub.as_ptr(), 0, KEY_READ, &mut hkey) } != 0 {
+        return out;
+    }
+
+    let mut index = 0u32;
+    loop {
+        let mut name = vec![0u16; 512];
+        let mut name_len = name.len() as u32;
+        let mut data = vec![0u8; 256];
+        let mut data_len = data.len() as u32;
+        let mut kind = 0u32;
+        let rc = unsafe {
+            RegEnumValueW(
+                hkey,
+                index,
+                name.as_mut_ptr(),
+                &mut name_len,
+                std::ptr::null_mut(),
+                &mut kind,
+                data.as_mut_ptr(),
+                &mut data_len,
+            )
+        };
+        if rc != 0 {
+            break;
+        }
+        // Value name is the device path, data is a NUL-terminated wide "COMx".
+        let path = String::from_utf16_lossy(&name[..name_len as usize]);
+        let units: Vec<u16> = data[..data_len as usize]
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .take_while(|&u| u != 0)
+            .collect();
+        if !path.is_empty() && !units.is_empty() {
+            out.insert(path, String::from_utf16_lossy(&units));
+        }
+        index += 1;
+        if index > 256 {
+            break;
+        }
+    }
+    unsafe { RegCloseKey(hkey) };
+    out
 }
 
 /// An attached port the driver knows about.
@@ -441,8 +528,8 @@ impl DriverHandle {
     /// 线格式是 10 个 u32：队列 / 丢弃 / 收低 / 收高 / 发低 / 发高 / 启用 / 目标 PID /
     /// 已附加 / 保留。收发计数是 64 位的，分两格存放——只取低 32 位会在 4 GB 后回绕。
     pub fn stats(&self) -> Option<DriverStats> {
-        let (buf, n) = self.ioctl(IOCTL_GET_STATS, None, 40)?;
-        if n < 40 {
+        let (buf, n) = self.ioctl(IOCTL_GET_STATS, None, 48)?;
+        if n < 48 {
             return None;
         }
         let u = |o: usize| u32::from_le_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]]);
@@ -455,6 +542,9 @@ impl DriverHandle {
             enabled: u(24),
             target_pid: u(28),
             attached: u(32),
+            rejected_type: u(36),
+            rejected_name: u(40),
+            accepted: u(44),
         })
     }
 

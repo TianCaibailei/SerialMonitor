@@ -1,6 +1,11 @@
 // 万能串口监控 — serial / TCP / UDP / Modbus communication monitor.
 // CLI: --screenshot <file.png>  render ~110 frames, save a PNG, exit 0.
 
+// Build as a GUI-subsystem binary so double-clicking never flashes a console window.
+// CLI modes (--driver-test, --screenshot, …) still print: main() re-attaches to the
+// parent console when one exists, so running it from PowerShell keeps its output.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod autoattach;
 mod capture;
 mod diag;
@@ -58,6 +63,7 @@ fn parse_args() -> Option<String> {
         if args[i] == "--handles-self" {
             std::process::exit(diag::handles_self());
         }
+        // --driver-latency [seconds] — measure how promptly records arrive`r`n        if args[i] == "--driver-latency" {`r`n            let secs: u64 = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(15);`r`n            std::process::exit(diag::driver_latency(secs));`r`n        }
         // --driver-test [seconds] — verify the kernel filter driver end to end
         if args[i] == "--driver-test" {
             let secs: u64 = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(15);
@@ -126,7 +132,31 @@ fn load_cjk_fonts() -> egui::FontDefinitions {
     fonts
 }
 
+/// Re-attach to the parent console when we were started from one.
+///
+/// The binary is built for the Windows subsystem, so a double-click shows no console at
+/// all (which is what we want for the GUI). But the diagnostic modes print to stdout, and
+/// without this those prints would vanish when invoked from PowerShell or cmd. Attaching
+/// to the parent console makes them appear again, and creates nothing when there is no
+/// parent console (i.e. on a double-click).
+#[cfg(windows)]
+fn attach_parent_console() {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn AttachConsole(dwProcessId: u32) -> i32;
+    }
+    const ATTACH_PARENT_PROCESS: u32 = 0xFFFF_FFFF;
+    unsafe {
+        AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+}
+
+#[cfg(not(windows))]
+fn attach_parent_console() {}
+
 fn main() {
+    // Do this before any output so the CLI modes keep working.
+    attach_parent_console();
     let screenshot = parse_args();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

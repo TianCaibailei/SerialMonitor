@@ -1,10 +1,10 @@
-// UmSerialFilter 鈥?passive serial-port traffic capture (upper filter, no port ownership).
+// UmSerialFilter 閳?passive serial-port traffic capture (upper filter, no port ownership).
 //
 // WHY THIS EXISTS
 // ---------------
 // The user-mode approach (inject a DLL and patch the target's IAT) has a hard limit:
 // it only sees calls made *after* injection, while a serial tool typically opens its
-// port within milliseconds of starting. A kernel filter has no such race 鈥?it sits on
+// port within milliseconds of starting. A kernel filter has no such race 閳?it sits on
 // the device stack, so every IRP from every process passes through it from the moment
 // the filter loads.
 //
@@ -57,7 +57,7 @@
     CTL_CODE(UM_DEVICE_TYPE, 0x805, METHOD_BUFFERED, FILE_WRITE_DATA)
 
 // The WDK NuGet km headers do not declare these, so they would otherwise compile as
-// implicit int returns — which silently truncates 64-bit pointers and hand back garbage
+// implicit int returns 鈥?which silently truncates 64-bit pointers and hand back garbage
 // STATUS values. Declaring them explicitly is REQUIRED for correct code on x64.
 extern POBJECT_TYPE *IoDeviceObjectType;
 
@@ -175,7 +175,7 @@ typedef struct _UM_CAPTURE {
     PDEVICE_OBJECT AttachedFilters[UM_MAX_FILTERS];
     // Owned copy of the NT device path ("\Device\Serial0"), or NULL when unknown.
     PWSTR AttachedNames[UM_MAX_FILTERS];
-    // Slot bitmap. AttachedCount alone cannot express "slot 3 was freed" 鈥?without this,
+    // Slot bitmap. AttachedCount alone cannot express "slot 3 was freed" 閳?without this,
     // a device removal leaked its slot forever and 64 plug/unplug cycles permanently
     // exhausted the table, after which attaching silently did nothing.
     BOOLEAN SlotUsed[UM_MAX_FILTERS];
@@ -196,8 +196,8 @@ typedef struct _UM_CAPTURE {
 // These live in <initguid.h> territory: the WDK NuGet headers do not ship the
 // definitions, only declarations, so they are spelled out here. The values are the
 // documented ones from wdmguid.h / ntddser.h:
-//   GUID_DEVINTERFACE_COMPORT        鈥?every COM port driver registers this interface
-//   GUID_DEVICE_INTERFACE_ARRIVAL    鈥?an interface became available
+//   GUID_DEVINTERFACE_COMPORT        閳?every COM port driver registers this interface
+//   GUID_DEVICE_INTERFACE_ARRIVAL    閳?an interface became available
 static const GUID UmGuidComPort = {
     0x86E0D1E0, 0x8089, 0x11D0,
     { 0x9C, 0xE4, 0x08, 0x00, 0x3E, 0x30, 0x1F, 0x73 }
@@ -226,7 +226,6 @@ static VOID UmQueueControlRecord(ULONG ioctlCode, ULONG pid, ULONG portIndex,
                                   ULONG64 portId, ULONG baudRate, ULONG handFlow,
                                   const ULONG *timeouts, UCHAR dataBits,
                                   UCHAR stopBits, UCHAR parity);
-static PDEVICE_OBJECT UmLowestDevice(PDEVICE_OBJECT devObj);
 static VOID UmFreeSlotResources(ULONG index);
 static PWSTR UmDuplicateName(PCUNICODE_STRING name);
 
@@ -257,7 +256,7 @@ static KSPIN_LOCK g_AttachLock;
 //
 // KeQuerySystemTime returns FILETIME: 100 ns ticks since 1601-01-01. The GUI renders
 // Unix seconds/millis, so converting here once is far less error-prone than having every
-// consumer subtract the epoch itself — an earlier build passed raw FILETIME through and
+// consumer subtract the epoch itself 鈥?an earlier build passed raw FILETIME through and
 // every row showed 1970-01-01.
 static ULONGLONG UmNowUnixMillis(VOID)
 {
@@ -565,7 +564,7 @@ static NTSTATUS UmReadWriteComplete(PDEVICE_OBJECT DeviceObject, PIRP Irp, PVOID
             }
 
             // Buffer-source order matters. Serial drivers overwhelmingly use DO_DIRECT_IO,
-            // so the MDL is the normal case and SystemBuffer is usually NULL 鈥?checking
+            // so the MDL is the normal case and SystemBuffer is usually NULL 閳?checking
             // SystemBuffer first (as an earlier version did) missed every such transfer.
             // UserBuffer is the METHOD_NEITHER fallback and is valid for reads too.
             if ((DeviceObject != NULL && (DeviceObject->Flags & DO_DIRECT_IO) != 0 &&
@@ -629,7 +628,7 @@ static NTSTATUS UmFilterDispatch(PDEVICE_OBJECT DeviceObject, PIRP Irp)
             // location, so writing CompletionRoutine into it afterwards corrupts what the
             // lower driver reads. That broke every request on the port: IRP_MJ_CREATE
             // failed with "Incorrect function" (the port looked busy to every serial
-            // tool), and readers waited forever for a reply that never came 鈥?exactly the
+            // tool), and readers waited forever for a reply that never came 閳?exactly the
             // hang seen in both umfilter_reader and the GUI.
             IoCopyCurrentIrpStackLocationToNext(Irp);
             {
@@ -642,7 +641,7 @@ static NTSTATUS UmFilterDispatch(PDEVICE_OBJECT DeviceObject, PIRP Irp)
         } else {
             InterlockedIncrement((PLONG)&g_Capture.Dropped);
             // Allocation failed: fall through to a plain pass-through so the I/O still
-            // completes 鈥?losing one capture is better than losing the application's data.
+            // completes 閳?losing one capture is better than losing the application's data.
         }
     } else if (stack->MajorFunction == IRP_MJ_DEVICE_CONTROL) {
         // Serial parameter changes are reported, never altered.
@@ -692,7 +691,7 @@ static NTSTATUS UmFilterPower(PDEVICE_OBJECT DeviceObject, PIRP Irp);
 // Windows gives every device of a driver the SAME MajorFunction table, so the filter
 // devices and the control device necessarily share entry points. The original code put
 // the control handlers there for every device, so IRP_MJ_CREATE on a serial port was
-// answered by UmControlCreate 鈥?completing the open immediately 鈥?and the real serial
+// answered by UmControlCreate 閳?completing the open immediately 閳?and the real serial
 // driver never saw it. Consequences: every COM port looked occupied ("Incorrect
 // function"), no data ever flowed, and user-mode readers blocked forever waiting for a
 // reply that would never come (the umfilter_reader / GUI hang).
@@ -805,7 +804,7 @@ typedef struct _UM_DIRECTORY_INFORMATION {
 
 // === UM_DISCOVERY_V2 ===
 // ---------------------------------------------------------------------------
-// Device discovery — replicating the reference driver's approach
+// Device discovery 鈥?replicating the reference driver's approach
 // ---------------------------------------------------------------------------
 //
 // THE REFERENCE DRIVER'S RULES (recovered from ComDrv12x64.sys, sub_127b0 / sub_1140c):
@@ -821,7 +820,7 @@ typedef struct _UM_DIRECTORY_INFORMATION {
 //      IoGetDeviceObjectPointer. Discovery and attachment are therefore separate, and
 //      nothing is attached that was not opened by name.
 //
-// WHY THIS MATTERS — the reason for the two bugchecks:
+// WHY THIS MATTERS 鈥?the reason for the two bugchecks:
 //   Our old code matched substrings ("vcp", "vser"). Those fragments also occur in device
 //   names belonging to VPN, virtualisation and DLP products. Attaching a filter above such
 //   a device splices our dispatch into that driver's IRP chain; it then receives IRPs whose
@@ -836,6 +835,17 @@ typedef struct _UM_DIRECTORY_INFORMATION {
 //   "Serial"  (serial.sys / serenum.sys roots, e.g. \Device\Serial0)
 //   "VSerial" (virtual serial adapters, e.g. \Device\VSerial8_2)
 // Everything else is left alone, no matter what other vendors name their devices.
+// Diagnostic counters for the discovery gate.
+//
+// When IOCTL_UM_ATTACH_PORTS returns 0 the reason is one of these, and the difference
+// matters: a name mismatch means the namespace list needs extending, while a DeviceType
+// mismatch means the driver is not a real serial port. Exposing them through
+// IOCTL_UM_GET_STATS turns "附加到 0 个串口" from a mystery into a diagnosis.
+static ULONG g_seenEntries;
+static ULONG g_rejectedType;
+static ULONG g_rejectedName;
+static ULONG g_accepted;
+
 static BOOLEAN UmIsSerialNamespacePrefix(PCUNICODE_STRING Name)
 {
     static const PCWSTR prefixes[] = {
@@ -927,7 +937,7 @@ static BOOLEAN UmIsSafeSerialTarget(PDEVICE_OBJECT Target, PCUNICODE_STRING Name
 // The old substring-matching helper (UmLooksLikeSerialPort) has been REMOVED.
 // It matched fragments such as "vcp" and "vser" as substrings, which selected devices
 // belonging to VPN, virtualisation and DLP products. Attaching a filter above one of
-// those splices our dispatch into that driver IRP chain and bugchecks inside it — the
+// those splices our dispatch into that driver IRP chain and bugchecks inside it 鈥?the
 // cause of both 0x3B crashes. UmIsSerialNamespacePrefix() above is the only matcher now.
 
 
@@ -951,7 +961,7 @@ static NTSTATUS UmAttachOne(PDEVICE_OBJECT target, ULONG index, PWSTR name)
     // PDO owns. Passing target->Characteristics through verbatim made IoCreateDevice fail
     // with STATUS_INVALID_PARAMETER for stacks that set FILE_REMOVABLE_MEDIA /
     // FILE_DEVICE_IS_MOUNTABLE_DEVICE, and the failure was silent (attach just returned 0).
-    // ORDER MATTERS — this replicates the reference driver sub_11308 exactly:
+    // ORDER MATTERS 鈥?this replicates the reference driver sub_11308 exactly:
     //   0x1133e  IoCreateDevice(...)
     //   0x1134c  copy DO_BUFFERED_IO from the lower device
     //   0x11359  copy DO_DIRECT_IO from the lower device
@@ -1015,7 +1025,7 @@ static NTSTATUS UmAttachOne(PDEVICE_OBJECT target, ULONG index, PWSTR name)
 // filter devices and the control device necessarily share entry points. The original code
 // installed the control-device handlers for every device, which meant IRP_MJ_CREATE on a
 // serial port was answered by UmControlCreate (completing it immediately) instead of being
-// forwarded 鈥?that is what made every COM port unusable while the driver was loaded.
+// forwarded 閳?that is what made every COM port unusable while the driver was loaded.
 //
 // The fix: the shared entries branch on whether the device has a lower device attached.
 // A control device has Lower == NULL and owns the IOCTL interface; a filter device has
@@ -1098,7 +1108,7 @@ static ULONG UmAttachAllPorts(VOID)
             // Never attach to ourselves.
             //
             // Our own control device is \Device\UmSerialFilter, whose name contains
-            // "Serial" 鈥?so the fragment match above happily selects it. Attaching a
+            // "Serial" 閳?so the fragment match above happily selects it. Attaching a
             // filter above our own control device makes every IOCTL pass through an extra
             // copy of this driver, and a second ATTACH_PORTS call stacks another one.
             {
@@ -1154,16 +1164,23 @@ static ULONG UmAttachAllPorts(VOID)
                         // Refuse anything that is not demonstrably a serial port: splicing our
                         // dispatch into a foreign IRP chain bugchecks inside that driver.
                         if (!UmIsSafeSerialTarget(devObj, &entry->Name)) {
+                            // Record why, so a zero result can be explained rather than guessed.
+                            if (devObj->DeviceType != FILE_DEVICE_SERIAL_PORT) {
+                                g_rejectedType++;
+                            } else {
+                                g_rejectedName++;
+                            }
                             ObDereferenceObject(devObj);
                             continue;
                         }
+                        g_accepted++;
 
                         // Skip devices we already filter.
                         //
                         // IoGetDeviceObjectPointer returns the TOP of the stack. After our
                         // first attach the top IS our filter device, so comparing that
                         // against the recorded physical device never matched and every
-                        // ATTACH_PORTS call stacked another filter — captured bytes were
+                        // ATTACH_PORTS call stacked another filter 鈥?captured bytes were
                         // then reported once per layer (port ids 2, 6, 10, 14... for a
                         // single write).
                         //
@@ -1227,11 +1244,11 @@ static ULONG UmAttachAllPorts(VOID)
 //
 // Both the IOCTL scan and the hot-plug callback can reach the same device (an interface
 // arrival for a port the initial scan already covered), and attaching twice would put
-// two filters on one stack 鈥?doubling every captured byte.
+// two filters on one stack 閳?doubling every captured byte.
 // Copy a device path into a NUL-terminated buffer the attach table owns.
 //
 // The UNICODE_STRING handed in points into a stack buffer that dies with the scan, so the
-// name has to be copied 鈥?and freed when the slot is released.
+// name has to be copied 閳?and freed when the slot is released.
 static PWSTR UmDuplicateName(PCUNICODE_STRING name)
 {
     SIZE_T chars;
@@ -1297,7 +1314,7 @@ static BOOLEAN UmAlreadyAttached(PDEVICE_OBJECT physical)
     for (i = 0; i < UM_MAX_FILTERS; i++) {
         // Only slots that are actually in use. Scanning up to AttachedCount missed freed
         // slots in the middle, and a freed slot's pointer could match a recycled PDO
-        // address 鈥?which made a freshly plugged adapter look "already attached" and it
+        // address 閳?which made a freshly plugged adapter look "already attached" and it
         // was then never monitored.
         if (g_Capture.SlotUsed[i] && g_Capture.Attached[i] == physical) {
             found = TRUE;
@@ -1370,7 +1387,7 @@ static NTSTATUS UmHotplugAttachLink(PUNICODE_STRING link)
     //
     // ObReferenceObjectByName is deliberately NOT used: the WDK NuGet headers do not
     // declare it, so it compiled as an implicit int return and truncated the pointer to
-    // 32 bits on x64 — a guaranteed access violation the moment the result was used.
+    // 32 bits on x64 鈥?a guaranteed access violation the moment the result was used.
     status = IoGetDeviceObjectPointer(link, FILE_ALL_ACCESS, &fileObj, &devObj);
     if (!NT_SUCCESS(status) || fileObj == NULL || devObj == NULL) {
         return STATUS_DEVICE_NOT_CONNECTED;
@@ -1553,7 +1570,7 @@ static NTSTATUS UmControlClose(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 //
 // A filter driver MUST forward this. Windows delivers CLEANUP before CLOSE, and the
 // serial driver uses it to abort pending reads and release port resources. Without the
-// forward, an application that closes its port leaves stale state behind 鈥?which shows up
+// forward, an application that closes its port leaves stale state behind 閳?which shows up
 // as "the port is still busy" on the next open. The reference driver handles CLEANUP in
 // the same branch as CLOSE for exactly this reason.
 static NTSTATUS UmControlCleanup(PDEVICE_OBJECT DeviceObject, PIRP Irp)
@@ -1586,7 +1603,7 @@ static NTSTATUS UmControlIoctl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     // Gate everything behind the session-key handshake.
     //
     // The DACL already restricts who can open the device, but "can open" is a weaker
-    // property than "is our service" 鈥?the key check is what actually pairs this driver
+    // property than "is our service" 閳?the key check is what actually pairs this driver
     // with our software. A process that somehow obtains a handle still cannot start
     // capture, retarget it, or read traffic without the key.
     if (code == IOCTL_UM_AUTHENTICATE) {
@@ -1621,7 +1638,7 @@ static NTSTATUS UmControlIoctl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     // FILE_WRITE_DATA = 0x2), while IoValidateDeviceIoControlAccess expects the
     // GENERIC_MAPPING-derived set (FILE_READ_ACCESS / FILE_WRITE_ACCESS, which also
     // include FILE_EXECUTE / FILE_APPEND_DATA). The two are not interchangeable, so the
-    // check rejected legitimate handles with STATUS_ACCESS_DENIED — every ATTACH_PORTS
+    // check rejected legitimate handles with STATUS_ACCESS_DENIED 鈥?every ATTACH_PORTS
     // call failed with Win32 error 5 even though the opening process had full rights.
     //
     // The security that matters is already in place: the device DACL restricts who can
@@ -1685,8 +1702,8 @@ static NTSTATUS UmControlIoctl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 
     case IOCTL_UM_GET_STATS:
         // Layout: 8 x u32. The byte counters are 64-bit, so they are split across two
-        // slots each 鈥?truncating them to 32 bits would wrap after 4 GB of traffic.
-        if (buf != NULL && outLen >= 40) {
+        // slots each 閳?truncating them to 32 bits would wrap after 4 GB of traffic.
+        if (buf != NULL && outLen >= 48) {
             PULONG s = (PULONG)buf;
             s[0] = g_Capture.Count;
             s[1] = g_Capture.Dropped;
@@ -1697,8 +1714,11 @@ static NTSTATUS UmControlIoctl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
             s[6] = g_Capture.Enabled;
             s[7] = g_Capture.TargetPid;
             s[8] = g_Capture.AttachedCount;
-            s[9] = 0;
-            info = 40;
+            // Discovery diagnostics: why a scan attached nothing.
+            s[9] = g_rejectedType;      // device type was not FILE_DEVICE_SERIAL_PORT
+            s[10] = g_rejectedName;     // name did not match Serial/VSerial
+            s[11] = g_accepted;         // passed the gate
+            info = 48;
             status = STATUS_SUCCESS;
         } else {
             status = STATUS_BUFFER_TOO_SMALL;
@@ -1736,7 +1756,7 @@ static VOID UmDriverUnload(PDRIVER_OBJECT DriverObject)
     //
     // An earlier version only reset AttachedCount to zero, which leaked the device
     // objects AND left them attached to the serial stacks. Driver unload then freed the
-    // driver while live filter devices still pointed at its dispatch table 鈥?a guaranteed
+    // driver while live filter devices still pointed at its dispatch table 閳?a guaranteed
     // bugcheck on the next serial I/O. Each filter must be detached and deleted for real.
     //
     // The filter objects are recorded in AttachedFilters[] precisely so this loop does not
@@ -1866,7 +1886,7 @@ static NTSTATUS UmCreateControlDevice(
 // would like to open, so the control device must not be world-accessible.
 //
 // The reference product handles this with a security descriptor built from the SDDL
-// string "D:P(A;;GA;;;WD)" 鈥?GA to Everyone, i.e. no protection at all (verified in its
+// string "D:P(A;;GA;;;WD)" 閳?GA to Everyone, i.e. no protection at all (verified in its
 // binary). That weakness is deliberately NOT copied here. This driver uses two layers:
 //
 //   1. A DACL granting full access only to SYSTEM and Administrators, plus read/write to
@@ -1877,7 +1897,7 @@ static NTSTATUS UmCreateControlDevice(
 //
 // The descriptor is built directly with RtlCreateAcl / RtlSetDaclSecurityDescriptor
 // rather than IoCreateDeviceSecure, because those APIs exist identically from Windows 7
-// through 11 鈥?no dynamic resolution and no signed-driver requirement.
+// through 11 閳?no dynamic resolution and no signed-driver requirement.
 
 // Constant-time-ish comparison of the caller key with ours.
 static BOOLEAN UmKeyMatches(const UCHAR *candidate)
@@ -2011,7 +2031,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     // reaches serial.sys. The serial stack legitimately receives CLEANUP, FLUSH_BUFFERS,
     // SET_INFORMATION, SYSTEM_CONTROL, SHUTDOWN, INTERNAL_DEVICE_CONTROL and more; any of
     // them being swallowed at the filter is a real behavioural bug. CLEANUP in particular
-    // is what makes the serial driver cancel pending reads and drop its open state 鈥?when
+    // is what makes the serial driver cancel pending reads and drop its open state 閳?when
     // it never arrives, a closed port stays "busy" and the next open fails.
     {
         ULONG mj;
@@ -2035,7 +2055,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 
     // Do NOT attach here. DriverEntry runs while the I/O manager is still bringing the
     // boot device stack up, so calling IoGetDeviceObjectPointer / IoAttachDeviceToDeviceStack
-    // from this context can block on a device that is not ready yet 鈥?the service then sits
+    // from this context can block on a device that is not ready yet 閳?the service then sits
     // in START_PENDING and cannot even be deleted (a driver inside DriverEntry cannot be
     // unloaded), which is the 1072 the installer hit.
     //

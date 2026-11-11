@@ -135,6 +135,9 @@ pub struct MonitorApp {
     /// records from a port not in this set are dropped before they become rows.
     /// An empty set means "no restriction".
     pub drv_watch: std::collections::HashSet<String>,
+    /// Device path -> "COM6". Read once when capture starts so the UI can show the number
+    /// the user recognises next to the device name.
+    pub drv_com: HashMap<String, String>,
     /// 最近一次可用性检测的结果与错误码（错误码用于给签名/权限问题分类）。
     pub drv_avail: bool,
     pub drv_err: u32,
@@ -254,6 +257,7 @@ impl MonitorApp {
             drv_note: String::new(),
             drv_names: HashMap::new(),
             drv_watch: std::collections::HashSet::new(),
+            drv_com: HashMap::new(),
             drv_avail: false,
             drv_err: 0,
             drv_probe_at: None,
@@ -509,23 +513,15 @@ impl MonitorApp {
         let target = self.drv_pid.unwrap_or(0);
         h.set_target(target);
         self.drv_names = ports.iter().cloned().collect();
-        // Build the watch set from the ports the user selected when creating the session.
+        // Device path -> COM number, so the port list can show both.
+        self.drv_com = crate::driver::com_names();
+        // Default: watch EVERY attached port.
         //
-        // Channel names are the short device names ("VSerial8_2"), which is also how
-        // drain_driver identifies an incoming record, so the two line up without any extra
-        // mapping. When the session has no explicit serial channels every port is allowed,
-        // which keeps the "just show me everything" case working.
-        self.drv_watch.clear();
-        if let Some(s) = self.sessions.get(self.active) {
-            for c in &s.channels {
-                if c.kind == ChanKind::HookSerial {
-                    let n = c.name.trim();
-                    if !n.is_empty() {
-                        self.drv_watch.insert(n.to_string());
-                    }
-                }
-            }
-        }
+        // The driver attaches to all serial ports (by design — matching the reference
+        // product), so the natural default is to show everything and let the user narrow
+        // it down. Port selection lives in the session's port list, where each entry shows
+        // both the device name and the COM number the user actually recognises.
+        // `drv_watch` stays empty until the user unchecks something.
         self.set_driver_note_for_ports(attached, &ports);
 
         // Move the handle into a capture thread and stream records back over a channel.
@@ -635,6 +631,8 @@ impl MonitorApp {
             self.drv_err = 0;
             self.drv_checked = true;
             self.drv_names = ports.iter().cloned().collect();
+        // Device path -> COM number, so the port list can show both.
+        self.drv_com = crate::driver::com_names();
             self.set_driver_note_for_ports(n, &ports);
             self.toast(self.drv_note.clone());
         } else {
@@ -1734,6 +1732,77 @@ impl MonitorApp {
             if let Some(h) = crate::driver::DriverHandle::open() {
                 if let Some(st) = h.stats() {
                     ui.label(RichText::new(st.summary()).small().color(Color32::GRAY));
+                    // When a scan attaches nothing, say why instead of leaving the user
+                    // with a bare "0". The counters come from the driver's discovery gate.
+                    if st.attached == 0 && (st.rejected_type > 0 || st.rejected_name > 0) {
+                        ui.label(
+                            RichText::new(format!(
+                                "扫描结果：类型不符 {} 个，名称不符 {} 个。\
+                                 名称不符说明串口设备名不在 Serial/VSerial 命名空间内。",
+                                st.rejected_type, st.rejected_name
+                            ))
+                            .small()
+                            .color(C_FAIL),
+                        );
+                    }
+                }
+            }
+        }
+
+        // --- 端口勾选：默认全选，取消勾选即过滤 ---
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("监视端口").strong());
+            ui.label(
+                RichText::new("（取消勾选即过滤该端口；默认监视全部）")
+                    .small()
+                    .color(Color32::GRAY),
+            );
+            if ui.small_button("全选").clicked() {
+                self.drv_watch.clear();
+            }
+        });
+        if self.drv_names.is_empty() {
+            ui.label(RichText::new("尚未扫描到端口").small().color(Color32::GRAY));
+        } else {
+            // Sorted by COM number so the list reads the way the user thinks.
+            let mut rows: Vec<(u32, String, String)> = self
+                .drv_names
+                .iter()
+                .map(|(idx, path)| {
+                    let short = path.rsplit('\\').next().unwrap_or(path).to_string();
+                    let com = self
+                        .drv_com
+                        .get(path)
+                        .cloned()
+                        .unwrap_or_else(|| short.clone());
+                    (*idx, com, short)
+                })
+                .collect();
+            rows.sort_by(|a, b| a.1.cmp(&b.1));
+
+            for (_idx, com, short) in rows {
+                // `drv_watch` holds short device names; empty means "no restriction".
+                let watched = self.drv_watch.is_empty() || self.drv_watch.contains(&short);
+                let mut on = watched;
+                let label = format!("{com}  ({short})");
+                if ui.checkbox(&mut on, label).changed() {
+                    if self.drv_watch.is_empty() {
+                        // First narrowing action: start from "everything selected".
+                        for (_i, _p) in self.drv_names.iter() {
+                            let s = _p.rsplit('\\').next().unwrap_or(_p).to_string();
+                            self.drv_watch.insert(s);
+                        }
+                    }
+                    if on {
+                        self.drv_watch.insert(short.clone());
+                    } else {
+                        self.drv_watch.remove(&short);
+                    }
+                    // All selected again -> back to "no restriction".
+                    if self.drv_watch.len() >= self.drv_names.len() {
+                        self.drv_watch.clear();
+                    }
                 }
             }
         }

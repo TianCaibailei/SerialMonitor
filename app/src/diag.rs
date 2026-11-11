@@ -200,6 +200,48 @@ fn is_module_loaded(pid: u32, prefix: &str) -> bool {
 /// --driver-test [seconds] — check the kernel driver: open it, attach ports, print what
 /// it reports, then collect records for a while. Quickest way to see whether the filter
 /// is loaded and whether it found any serial devices.
+/// Poll the driver exactly the way the GUI capture thread does, printing the wall-clock
+/// time each record is READ. This separates "the driver is not delivering promptly" from
+/// "the GUI is not repainting promptly": if read time matches send time, the delay is above.
+pub fn driver_latency(seconds: u64) -> i32 {
+    let Some(h) = crate::driver::DriverHandle::open() else {
+        println!("latency: 无法打开驱动");
+        return 1;
+    };
+    let n = h.attach_ports();
+    h.set_target(0);
+    println!("latency: 已附加 {n} 个端口，观察 {seconds} 秒…");
+    println!("latency: 现在发送数据，注意每条的读取时刻");
+
+    let start = std::time::Instant::now();
+    let mut count = 0usize;
+    while start.elapsed().as_secs() < seconds {
+        match h.next_record() {
+            Some(rec) => {
+                count += 1;
+                let d = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default();
+                let ms = d.as_millis() % 100_000;
+                let preview: String = rec
+                    .data
+                    .iter()
+                    .take(24)
+                    .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' })
+                    .collect();
+                println!(
+                    "latency: [{}ms] #{count} port={} {} 字节: {preview}",
+                    ms,
+                    rec.port_index,
+                    rec.data.len()
+                );
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(15)),
+        }
+    }
+    println!("latency: 共 {count} 条");
+    if count > 0 { 0 } else { 1 }
+}
 pub fn driver_test(seconds: u64) -> i32 {
     let Some(h) = crate::driver::DriverHandle::open() else {
         println!("driver-test: 无法打开 \\\\.\\UmSerialFilter");
