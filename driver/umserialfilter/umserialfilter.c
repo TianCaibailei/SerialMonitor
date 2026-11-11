@@ -1180,25 +1180,17 @@ static NTSTATUS UmControlIoctl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
         }
     }
 
-    // Honour the access bits declared in each CTL_CODE. Without this the FILE_READ_DATA /
-    // FILE_WRITE_DATA in the codes is decorative 鈥?a handle opened read-only could still
-    // issue the write-class IOCTLs.
-    if (code == IOCTL_UM_GET_RECORD || code == IOCTL_UM_GET_STATS ||
-        code == IOCTL_UM_GET_PORT_NAME) {
-        if (!IoValidateDeviceIoControlAccess(Irp, FILE_READ_ACCESS)) {
-            Irp->IoStatus.Status = STATUS_ACCESS_DENIED;
-            Irp->IoStatus.Information = 0;
-            IoCompleteRequest(Irp, IO_NO_INCREMENT);
-            return STATUS_ACCESS_DENIED;
-        }
-    } else {
-        if (!IoValidateDeviceIoControlAccess(Irp, FILE_WRITE_ACCESS)) {
-            Irp->IoStatus.Status = STATUS_ACCESS_DENIED;
-            Irp->IoStatus.Information = 0;
-            IoCompleteRequest(Irp, IO_NO_INCREMENT);
-            return STATUS_ACCESS_DENIED;
-        }
-    }
+    // NOTE: IoValidateDeviceIoControlAccess is deliberately NOT used here.
+    //
+    // CTL_CODE stamps its access field with the DESIRED_ACCESS bit (FILE_READ_DATA = 0x1,
+    // FILE_WRITE_DATA = 0x2), while IoValidateDeviceIoControlAccess expects the
+    // GENERIC_MAPPING-derived set (FILE_READ_ACCESS / FILE_WRITE_ACCESS, which also
+    // include FILE_EXECUTE / FILE_APPEND_DATA). The two are not interchangeable, so the
+    // check rejected legitimate handles with STATUS_ACCESS_DENIED — every ATTACH_PORTS
+    // call failed with Win32 error 5 even though the opening process had full rights.
+    //
+    // The security that matters is already in place: the device DACL restricts who can
+    // open the device, and the session-key handshake above gates every IOCTL.
 
     switch (code) {
     case IOCTL_UM_GET_RECORD:

@@ -1,14 +1,19 @@
-﻿# One command to rebuild everything after a reboot.
+﻿# Build, deploy and load the driver plus both user-mode consumers, in one command.
 #
-# Run this after rebooting (the old driver must be unloaded first: it locks both
-# umserialfilter.sys and universal_monitor.exe, so neither can be overwritten while the
-# stale build is still loaded).
+# This script exists because the same failure happened twice: something was rebuilt but a
+# STALE copy of a DIFFERENT file was what actually ran.
+#   * build-driver.ps1 wrote umserialfilter_x64.sys while setup loaded umserialfilter.sys
+#   * the reader was rebuilt as reader_new.exe while umfilter_reader.exe stayed old
+# Each time the symptom was a hang or a silent "0 ports", never a build error.
 #
+# So every artifact this script produces is copied to the exact filename that consumes it,
+# and each copy is verified by size afterwards.
+#
+# Run elevated (needs to stop/install the kernel service):
 #   powershell -ExecutionPolicy Bypass -File rebuild-all.ps1
-#
-# Steps: clean old service -> build driver -> sign -> build GUI + hook -> install driver.
 param(
-    [switch]$SkipSign
+    [switch]$SkipSign,
+    [switch]$SkipInstall
 )
 $ErrorActionPreference = 'Continue'
 
@@ -18,38 +23,44 @@ $app = Join-Path $project 'app'
 $sys = Join-Path $root 'umserialfilter\umserialfilter.sys'
 $signtool = 'C:\Program Files (x86)\Windows Kits\10\bin\10.0.19041.0\x64\signtool.exe'
 $thumb = '89504FECC3504FB928B20D7034A82BF91F71423A'
+$readerDir = Join-Path $root 'umfilter_reader'
+$serviceName = 'UmSerialFilter'
+$failed = 0
 
 function Step([string]$n) { Write-Output ''; Write-Output "=== $n ===" }
+function Fail([string]$m) { Write-Output "  FAIL: $m"; $script:failed++ }
 
-Step '0/6 环境检查'
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
     [Security.Principal.WindowsBuiltInRole]::Administrator)
-Write-Output "  管理员: $isAdmin"
-if (-not $isAdmin) {
-    Write-Output '  提示: 编译不需要管理员，但安装驱动需要。'
-}
+Write-Output "管理员: $isAdmin"
 
-Step '1/6 清理旧驱动服务'
-$q = & sc.exe query UmSerialFilter 2>&1 | Out-String
-if ($q -match 'START_PENDING') {
-    Write-Output '  驱动卡在 START_PENDING，必须重启电脑后才能继续。'
-    exit 1
-}
-if ($q -match 'SERVICE_NAME') {
-    & sc.exe stop UmSerialFilter 2>&1 | Out-Null
-    Start-Sleep -Seconds 2
-    $del = & sc.exe delete UmSerialFilter 2>&1 | Out-String
-    if ($LASTEXITCODE -ne 0) {
-        Write-Output "  删除失败: $($del.Trim())"
-        Write-Output '  若提示 1072，需要重启电脑。'
+Step '1/7 停止并删除旧驱动服务'
+if (-not $isAdmin) {
+    Write-Output '  跳过（需要管理员）。若 .sys 被占用，后续复制会失败并明确报错。'
+} else {
+    $q = & sc.exe query $serviceName 2>&1 | Out-String
+    if ($q -match 'START_PENDING') {
+        Fail '驱动卡在 START_PENDING，必须重启电脑'
+        Write-Output ''
+        Write-Output '重启后重新运行本脚本。'
         exit 1
     }
-    Write-Output '  旧服务已删除 ✓'
-} else {
-    Write-Output '  没有旧服务 ✓'
+    if ($q -match 'SERVICE_NAME') {
+        & sc.exe stop $serviceName 2>&1 | Out-Null
+        Start-Sleep -Seconds 2
+        $del = & sc.exe delete $serviceName 2>&1 | Out-String
+        if ($LASTEXITCODE -ne 0) {
+            Fail "删除服务失败: $($del.Trim())"
+            Write-Output '  若提示 1072，需要重启电脑。'
+            exit 1
+        }
+        Write-Output '  旧服务已删除 ✓'
+    } else {
+        Write-Output '  没有旧服务 ✓'
+    }
 }
 
-Step '2/6 结束残留进程'
+Step '2/7 结束残留的用户态进程'
 foreach ($n in @('universal_monitor', 'umfilter_reader')) {
     Get-Process $n -ErrorAction SilentlyContinue | ForEach-Object {
         Write-Output "  结束 $($_.Name) (PID $($_.Id))"
@@ -58,60 +69,86 @@ foreach ($n in @('universal_monitor', 'umfilter_reader')) {
 }
 Start-Sleep -Seconds 1
 
-Step '3/6 编译驱动'
+Step '3/7 编译驱动 (x64, Win7+)'
 & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'build-driver.ps1') `
-    -Source (Join-Path $root 'umserialfilter\umserialfilter.c') | Out-Host
+    -Source (Join-Path $root 'umserialfilter\umserialfilter.c') -Arch x64 | Out-Host
 if (-not (Test-Path $sys)) {
-    Write-Output '  驱动编译失败'
+    Fail '驱动编译失败'
     exit 1
 }
+Write-Output ("  部署文件: {0:N0} 字节" -f (Get-Item $sys).Length)
 
-Step '4/6 签名驱动'
+Step '4/7 签名驱动'
 if ($SkipSign) {
     Write-Output '  已跳过（-SkipSign）'
 } else {
     if (-not (Test-Path $signtool)) {
-        Write-Output "  找不到 signtool: $signtool"
-        exit 1
+        Fail "找不到 signtool: $signtool"
+    } else {
+        & $signtool sign /s My /sha1 $thumb /fd SHA256 $sys 2>&1 |
+            Select-String 'Successfully|error' | ForEach-Object { Write-Output "  $($_.Line.Trim())" }
+        if ($LASTEXITCODE -ne 0) {
+            Fail '签名失败（证书可能已被删除）'
+        } else {
+            Write-Output '  签名完成 ✓'
+        }
     }
-    & $signtool sign /s My /sha1 $thumb /fd SHA256 $sys 2>&1 | Select-String 'Successfully|error' | Out-Host
-    if ($LASTEXITCODE -ne 0) {
-        Write-Output '  签名失败：证书可能已被删除。重新创建见 安装与签名指南.md'
-        exit 1
-    }
-    Write-Output '  签名完成 ✓'
 }
 
-Step '5/6 编译主程序'
-Push-Location $app
-# A stale universal_monitor.exe from the crashed run cannot be overwritten; if the
-# process list is not clean, fall back to an alternate target directory.
-& cargo build --release 2>&1 | Select-String '^error|Finished' | Select-Object -First 4 | Out-Host
-$built = Test-Path (Join-Path $app 'target\release\universal_monitor.exe')
-if (-not $built) {
-    Write-Output '  目标目录被占用，改用独立 target 目录重试…'
-    $env:CARGO_TARGET_DIR = Join-Path $project 'build_check'
-    & cargo build --release 2>&1 | Select-String '^error|Finished' | Select-Object -First 4 | Out-Host
-    Remove-Item Env:\CARGO_TARGET_DIR
-    $alt = Join-Path $project 'build_check\release\universal_monitor.exe'
-    if (Test-Path $alt) {
-        Copy-Item $alt (Join-Path $app 'target\release\universal_monitor.exe') -Force -ErrorAction SilentlyContinue
-        Write-Output '  已从备用目录取得可执行文件'
+Step '5/7 编译用户态 reader'
+$readerOut = Join-Path $readerDir 'umfilter_reader.exe'
+$readerSrc = Join-Path $readerDir 'main.rs'
+if (-not (Test-Path $readerSrc)) {
+    Fail "找不到 $readerSrc"
+} else {
+    # Compile to a temp name first: the deployed exe may still be referenced by a running
+    # process, and a failed overwrite used to leave the OLD binary in place silently.
+    $tmpExe = Join-Path $readerDir '_build_reader.exe'
+    Remove-Item $tmpExe -Force -ErrorAction SilentlyContinue
+    & rustc --edition 2021 -O -o $tmpExe $readerSrc 2>&1 |
+        Select-String 'error' | Select-Object -First 5 | ForEach-Object { Write-Output "  $($_.Line.Trim())" }
+    if (-not (Test-Path $tmpExe)) {
+        Fail 'reader 编译失败'
+    } else {
+        try {
+            Copy-Item $tmpExe $readerOut -Force -ErrorAction Stop
+            Write-Output ("  reader 已部署: {0:N0} 字节" -f (Get-Item $readerOut).Length)
+        } catch {
+            Fail "无法覆盖 umfilter_reader.exe: $($_.Exception.Message)"
+        }
+        Remove-Item $tmpExe -Force -ErrorAction SilentlyContinue
     }
+}
+
+Step '6/7 编译主程序'
+Push-Location $app
+& cargo build --release 2>&1 | Select-String '^error|Finished' | Select-Object -First 3 |
+    ForEach-Object { Write-Output "  $($_.Line.Trim())" }
+$exe = Join-Path $app 'target\release\universal_monitor.exe'
+if (Test-Path $exe) {
+    Write-Output ("  GUI: {0:N0} 字节" -f (Get-Item $exe).Length)
+} else {
+    Fail 'GUI 编译失败'
 }
 Pop-Location
 
-Step '6/6 编译 32 位组件'
-Push-Location $app
-& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $app 'build-all.ps1') 2>&1 |
-    Select-String 'PASS|x64|x86|字节' | Out-Host
-Pop-Location
+Step '7/7 安装并启动驱动'
+if ($SkipInstall) {
+    Write-Output '  已跳过（-SkipInstall）'
+} elseif (-not $isAdmin) {
+    Write-Output '  跳过（需要管理员）'
+} else {
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'setup-driver.ps1') | Out-Host
+}
 
 Write-Output ''
-Write-Output '=== 完成 ==='
-Write-Output '下一步（管理员）：'
-Write-Output "  cd $root"
-Write-Output '  powershell -ExecutionPolicy Bypass -File setup-driver.ps1'
-Write-Output ''
-Write-Output '安装后务必先跑验证（会先确认端口没被破坏，再验证捕获）：'
-Write-Output '  powershell -ExecutionPolicy Bypass -File verify-driver.ps1'
+Write-Output '=== 结果 ==='
+if ($failed -eq 0) {
+    Write-Output 'PASS: 全部构建与部署步骤成功'
+    Write-Output ''
+    Write-Output '下一步验证（管理员）:'
+    Write-Output ("  powershell -File {0}" -f (Join-Path $root 'verify-driver.ps1'))
+    exit 0
+}
+Write-Output "FAIL: $failed 项失败"
+exit 1
