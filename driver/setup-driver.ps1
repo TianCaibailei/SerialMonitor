@@ -77,10 +77,23 @@ if (-not (Test-Path $sys)) {
 }
 $existing = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
 if ($existing) {
+    $state = (& sc.exe query $serviceName 2>&1 | Out-String)
+    if ($state -match 'START_PENDING') {
+        Write-Output '  服务卡在 START_PENDING，无法删除（1072）。'
+        Write-Output '  请重启电脑后再运行本脚本。'
+        exit 1
+    }
     Write-Output '  服务已存在，删除后重建'
     & sc.exe stop $serviceName 2>&1 | Out-Null
     Start-Sleep -Seconds 1
-    & sc.exe delete $serviceName 2>&1 | Out-Null
+    $del = & sc.exe delete $serviceName 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+        Write-Output "  删除失败: $($del.Trim())"
+        if ($del -match '1072|标记为删除') {
+            Write-Output '  1072 = 服务已标记删除但未生效，需要重启电脑。'
+        }
+        exit 1
+    }
     Start-Sleep -Seconds 1
 }
 $out = & sc.exe create $serviceName type= kernel start= demand binPath= $sys DisplayName= 'Universal Serial Monitor Filter' 2>&1 | Out-String
@@ -91,8 +104,28 @@ if ($LASTEXITCODE -ne 0) {
 Write-Output '  服务已创建 ✓'
 
 Write-Step '4/5 启动驱动'
+# A driver whose DriverEntry never returns sits in START_PENDING forever, can be neither
+# stopped nor deleted (1072), and keeps its .sys file locked. Detect that state explicitly
+# instead of letting `sc start` look like a hang.
 $out = & sc.exe start $serviceName 2>&1 | Out-String
-Start-Sleep -Seconds 1
+$pending = $false
+for ($i = 0; $i -lt 12; $i++) {
+    Start-Sleep -Milliseconds 500
+    $q = & sc.exe query $serviceName 2>&1 | Out-String
+    if ($q -match 'START_PENDING') { $pending = $true; continue }
+    if ($q -match 'RUNNING') { $pending = $false; break }
+    if ($q -match 'STOPPED') { $pending = $false; break }
+}
+if ($pending) {
+    Write-Output '  驱动卡在 START_PENDING —— DriverEntry 没有返回。'
+    Write-Output ''
+    Write-Output '  这是驱动内部的死循环或阻塞，不是权限/签名问题。'
+    Write-Output '  此时服务既不能停止也不能删除（会返回 1072），只能:'
+    Write-Output '    1. 重启电脑'
+    Write-Output '    2. 重启后重新运行本脚本'
+    exit 1
+}
+
 $svc = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
 if ($svc -and $svc.Status -eq 'Running') {
     Write-Output '  驱动已运行 ✓'

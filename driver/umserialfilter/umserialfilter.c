@@ -430,11 +430,28 @@ static BOOLEAN UmLooksLikeSerialPort(PCUNICODE_STRING name)
 }
 
 // Attach one filter device above `target`, recording its friendly name.
+// Forward declarations: UmAttachAllPorts (below) uses these, while their definitions
+// follow it. Without the declarations C assumes an implicit `int` return and then
+// conflicts with the real BOOLEAN/LONG definitions.
+static BOOLEAN UmAlreadyAttached(PDEVICE_OBJECT physical);
+static LONG UmRegisterAttached(PDEVICE_OBJECT physical, PCWSTR name);
+
 static NTSTATUS UmAttachOne(PDEVICE_OBJECT target, ULONG index, PCWSTR name)
 {
     PDEVICE_OBJECT filter = NULL;
     PUM_DEVICE_CTX ctx;
     NTSTATUS status;
+    KIRQL old;
+
+    // Reserve the index under the lock first: the hot-plug callback (system thread) and
+    // the IOCTL handler (user thread) can run concurrently and must not both claim the
+    // same slot.
+    KeAcquireSpinLock(&g_AttachLock, &old);
+    if (index >= UM_MAX_FILTERS) {
+        KeReleaseSpinLock(&g_AttachLock, old);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    KeReleaseSpinLock(&g_AttachLock, old);
 
     status = IoCreateDevice(
         g_DriverObject, sizeof(UM_DEVICE_CTX), NULL,
@@ -494,8 +511,15 @@ static ULONG UmAttachAllPorts(VOID)
         ULONG i;
         PUM_DIRECTORY_INFORMATION info = (PUM_DIRECTORY_INFORMATION)buf;
 
+        // RestartScan MUST be FALSE after the first call: the enumeration position comes
+        // from `context`, which the previous call updates. Passing TRUE on every call
+        // re-read the same entry forever — that is exactly what hung DriverEntry and left
+        // the service stuck in START_PENDING, and it also explains why the service could
+        // not be deleted afterwards (a driver mid-DriverEntry cannot be unloaded).
         status = ZwQueryDirectoryObject(
-            dirHandle, buf, bufLen, TRUE /* restart */, TRUE /* single entry */,
+            dirHandle, buf, bufLen,
+            (context == 0) ? TRUE : FALSE, // restart only on the very first call
+            TRUE /* one entry per call */,
             &context, &retLen);
         if (!NT_SUCCESS(status)) {
             break; // STATUS_NO_MORE_ENTRIES ends the walk
@@ -537,10 +561,21 @@ static ULONG UmAttachAllPorts(VOID)
                         &devName, FILE_READ_DATA, &fileObj, &devObj);
                     if (NT_SUCCESS(openStatus)) {
                         ObDereferenceObject(fileObj);
-                        if (NT_SUCCESS(UmAttachOne(devObj, g_Capture.AttachedCount, NULL))) {
-                            g_Capture.Attached[g_Capture.AttachedCount] = devObj;
-                            g_Capture.AttachedCount++;
-                            attached++;
+                        // The scan can be re-run by user mode, so skip devices we already
+                        // filter rather than stacking a second filter on them.
+                        if (!UmAlreadyAttached(devObj)) {
+                            LONG idx = UmRegisterAttached(devObj, NULL);
+                            if (idx >= 0) {
+                                if (NT_SUCCESS(UmAttachOne(devObj, (ULONG)idx, NULL))) {
+                                    attached++;
+                                } else {
+                                    KIRQL old;
+                                    KeAcquireSpinLock(&g_AttachLock, &old);
+                                    g_Capture.Attached[(ULONG)idx] = NULL;
+                                    g_Capture.AttachedNames[(ULONG)idx] = NULL;
+                                    KeReleaseSpinLock(&g_AttachLock, old);
+                                }
+                            }
                         }
                     }
                 }
@@ -565,11 +600,51 @@ static ULONG UmAttachAllPorts(VOID)
 // symbolic link name in EventData (a UNICODE_STRING), so the device can be opened
 // without re-enumerating \Device.
 
+// Is this physical device already filtered?
+//
+// Both the IOCTL scan and the hot-plug callback can reach the same device (an interface
+// arrival for a port the initial scan already covered), and attaching twice would put
+// two filters on one stack — doubling every captured byte.
+static BOOLEAN UmAlreadyAttached(PDEVICE_OBJECT physical)
+{
+    ULONG i;
+    BOOLEAN found = FALSE;
+    KIRQL old;
+
+    KeAcquireSpinLock(&g_AttachLock, &old);
+    for (i = 0; i < g_Capture.AttachedCount; i++) {
+        if (g_Capture.Attached[i] == physical) {
+            found = TRUE;
+            break;
+        }
+    }
+    KeReleaseSpinLock(&g_AttachLock, old);
+    return found;
+}
+
+// Register a successfully attached device. Returns its index, or -1 when full.
+static LONG UmRegisterAttached(PDEVICE_OBJECT physical, PCWSTR name)
+{
+    LONG index = -1;
+    KIRQL old;
+
+    KeAcquireSpinLock(&g_AttachLock, &old);
+    if (g_Capture.AttachedCount < UM_MAX_FILTERS) {
+        index = (LONG)g_Capture.AttachedCount;
+        g_Capture.Attached[(ULONG)index] = physical;
+        g_Capture.AttachedNames[(ULONG)index] = name;
+        g_Capture.AttachedCount++;
+    }
+    KeReleaseSpinLock(&g_AttachLock, old);
+    return index;
+}
+
 static NTSTATUS UmHotplugAttachLink(PUNICODE_STRING link)
 {
     PFILE_OBJECT fileObj = NULL;
     PDEVICE_OBJECT devObj = NULL;
     NTSTATUS status;
+    LONG index;
 
     status = IoGetDeviceObjectPointer(link, FILE_READ_DATA, &fileObj, &devObj);
     if (!NT_SUCCESS(status)) {
@@ -577,13 +652,21 @@ static NTSTATUS UmHotplugAttachLink(PUNICODE_STRING link)
     }
     ObDereferenceObject(fileObj);
 
-    if (g_Capture.AttachedCount >= UM_MAX_FILTERS) {
+    if (UmAlreadyAttached(devObj)) {
+        return STATUS_SUCCESS; // already filtered by the initial scan
+    }
+    index = UmRegisterAttached(devObj, NULL);
+    if (index < 0) {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
-    status = UmAttachOne(devObj, g_Capture.AttachedCount, NULL);
-    if (NT_SUCCESS(status)) {
-        g_Capture.Attached[g_Capture.AttachedCount] = devObj;
-        g_Capture.AttachedCount++;
+    status = UmAttachOne(devObj, (ULONG)index, NULL);
+    if (!NT_SUCCESS(status)) {
+        // Roll the reservation back so the slot can be reused.
+        KIRQL old;
+        KeAcquireSpinLock(&g_AttachLock, &old);
+        g_Capture.Attached[(ULONG)index] = NULL;
+        g_Capture.AttachedNames[(ULONG)index] = NULL;
+        KeReleaseSpinLock(&g_AttachLock, old);
     }
     return status;
 }
@@ -803,6 +886,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 
     RtlZeroMemory(&g_Capture, sizeof(g_Capture));
     KeInitializeSpinLock(&g_Capture.Lock);
+    KeInitializeSpinLock(&g_AttachLock);
     InitializeListHead(&g_Capture.Queue);
     ExInitializeNPagedLookasideList(
         &g_Capture.Lookaside, NULL, NULL, POOL_NX_ALLOCATION,
@@ -844,9 +928,15 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     DriverObject->MajorFunction[IRP_MJ_POWER] = UmFilterPower;
     DriverObject->DriverUnload = UmDriverUnload;
 
-    // Attach to the ports that already exist, then keep watching for arrivals so a
-    // USB-serial adapter plugged in later is filtered without user action.
-    UmAttachAllPorts();
+    // Do NOT attach here. DriverEntry runs while the I/O manager is still bringing the
+    // boot device stack up, so calling IoGetDeviceObjectPointer / IoAttachDeviceToDeviceStack
+    // from this context can block on a device that is not ready yet — the service then sits
+    // in START_PENDING and cannot even be deleted (a driver inside DriverEntry cannot be
+    // unloaded), which is the 1072 the installer hit.
+    //
+    // Attaching is instead driven by user mode, which calls IOCTL_UM_ATTACH_PORTS once the
+    // driver reports RUNNING; UmRegisterHotplug still runs from DriverEntry because
+    // registering a notification only queues work for a system thread.
     UmRegisterHotplug();
 
     return STATUS_SUCCESS;
