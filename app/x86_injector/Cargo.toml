@@ -1,0 +1,24 @@
+[package]
+name = "universal_injector_x86"
+version = "1.0.0"
+edition = "2021"
+
+# Separate crate on purpose.
+#
+# This helper exists because a 64-bit process cannot reliably call LoadLibraryW inside a
+# WOW64 target: even with the correct 32-bit kernel32 base and a verified path buffer, the
+# remote LoadLibrary returns NULL. Running the injector itself as 32-bit makes every address
+# it computes natively valid.
+#
+# It used to live in app/src/bin/, where `cargo build --release` built it for the HOST
+# architecture (x64) and silently overwrote the deployed 32-bit binary. The symptom was
+# "32 位注入器失败 ... LoadLibraryW=0x7ffe..." — a 64-bit address in a 32-bit target.
+# Keeping it out of the main package means the main build can never touch it.
+
+[[bin]]
+name = "universal_injector_x86"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 2
+panic = "abort"

@@ -20,5 +20,5 @@ opt-level = 2
 panic = "abort"
 
 [workspace]
-members = ["hook"]
+members = ["hook", "x86_injector"]
 
