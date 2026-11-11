@@ -99,6 +99,29 @@ foreach ($f in @('monitor_hook.dll', 'monitor_hook_x86.dll', 'universal_injector
     if (Test-Path $p) { Write-Output ('  {0,-28} {1}' -f $f, (Get-Arch $p)) } else { Write-Output ('  {0,-28} 缺失' -f $f) }
 }
 
+# The probes are source-only in git (binaries are gitignored), so build them here.
+# rustc works for a single-file program and needs no cargo project, which keeps the
+# acceptance test independent of the main build.
+Write-Output ''
+Write-Output '=== 0b. 构建探针 ==='
+$probes = @(
+    @{ src = 'tests\order_loop.rs'; out = 'tests\order_loop32.exe'; target = 'i686-pc-windows-msvc' },
+    @{ src = 'tests\order_loop.rs'; out = 'tests\order_loop64.exe'; target = $null }
+)
+foreach ($pr in $probes) {
+    $src = Join-Path $root $pr.src
+    $out = Join-Path $root $pr.out
+    if ((Test-Path $out) -and ((Get-Item $out).LastWriteTime -gt (Get-Item $src).LastWriteTime)) {
+        Write-Output ('  {0,-24} 已是最新' -f $pr.out)
+        continue
+    }
+    $rustArgs = @('-O', $src, '-o', $out)
+    if ($pr.target) { $rustArgs = @('--target', $pr.target) + $rustArgs }
+    & rustc @rustArgs 2>&1 | Out-Null
+    if (Test-Path $out) { Write-Output ('  {0,-24} 已构建' -f $pr.out) }
+    else { Write-Output ('  {0,-24} 构建失败（需要 rustup target add {1}）' -f $pr.out, $pr.target); exit 1 }
+}
+
 Write-Output ''
 Write-Output '=== 1. 端口占用检查 ==='
 $free = @()
