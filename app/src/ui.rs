@@ -3,7 +3,8 @@
 use crate::inject::{self, CapMsg};
 use crate::protocol::{self, REQUEST_PRESETS, RESPONSE_PRESETS};
 use crate::session::{
-    bytes_hex, escape_text, fmt_time, now_wall, seed_demo, Autosave, ChanKind, ChannelCfg, Filters, RowOrigin,
+    bytes_hex, escape_text, fmt_time, now_wall, pw_allowed, pw_invert, pw_select_all,
+    pw_select_none, pw_toggle, seed_demo, Autosave, ChanKind, ChannelCfg, Filters, RowOrigin,
     ProtoType, Session, ViewToggles,
 };
 use egui::{
@@ -12,7 +13,7 @@ use egui::{
 };
 use egui_extras::{Column, TableBuilder};
 use egui_plot::{Legend, Line, Plot, PlotPoints};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::Receiver;
 
 const C_REQ: Color32 = Color32::from_rgb(0x1F, 0x6F, 0xEB);
@@ -135,6 +136,28 @@ pub struct MonitorApp {
     /// records from a port not in this set are dropped before they become rows.
     /// An empty set means "no restriction".
     pub drv_watch: std::collections::HashSet<String>,
+    // ---- 会话级「监视端口」过滤（过滤设置对话框）----
+    //
+    // 端口过滤是**会话**属性（两个会话可以分别盯不同端口），所以真正生效的状态在
+    // `Session::port_watch` / `Session::port_watch_on` 上；这里只放两份副本：
+    //
+    //  * `fport_*`       —— 上一次「应用」的结果，同时是新建会话的默认值和 config.ini 的落盘值
+    //                       （本程序不落盘会话本身，config.ini 是它唯一能跨重启保留的位置）；
+    //  * `fport_draft_*` —— 对话框里正在编辑、还没点「应用」的草稿。
+    /// 端口白名单的默认/落盘状态：是否启用端口过滤。
+    pub fport_on: bool,
+    /// 端口白名单的默认/落盘状态：勾选的端口名（空集合 = 不限制）。
+    pub fport_sel: HashSet<String>,
+    /// 对话框草稿是从哪个会话同步来的（`self.active` 的下标）。
+    ///
+    /// 记下标而不是记 bool，是为了处理"对话框开着的时候切了会话标签页"：
+    /// 那样草稿必须重新同步，否则点「应用」会把 A 会话的端口表写进 B 会话。
+    /// `None` 表示草稿还没同步过（对话框是关着的）。
+    pub fport_draft_sess: Option<usize>,
+    /// 对话框草稿：是否启用端口过滤。
+    pub fport_draft_on: bool,
+    /// 对话框草稿：勾选的端口名。
+    pub fport_draft_sel: HashSet<String>,
     /// Device path -> "COM6". Read once when capture starts so the UI can show the number
     /// the user recognises next to the device name.
     pub drv_com: HashMap<String, String>,
@@ -194,6 +217,24 @@ pub struct MonitorApp {
 
 fn b(v: bool) -> &'static str {
     if v { "1" } else { "0" }
+}
+
+/// 端口白名单在 config.ini 里的编码：逗号分隔（`COM6,COM7`）。
+///
+/// 之所以不用空格：config.ini 的解析是按空白切分的 `k=v`，值里带空格会被拆成
+/// 两个 token。空字符串表示空集合。
+fn fmt_port_list(sel: &HashSet<String>) -> String {
+    let mut names: Vec<&String> = sel.iter().collect();
+    names.sort(); // 稳定输出，避免每次保存都改文件内容
+    names.iter().map(|s| s.as_str()).collect::<Vec<&str>>().join(",")
+}
+
+fn parse_port_list(v: &str) -> HashSet<String> {
+    v.split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
 }
 
 /// Rough "is this a user application rather than a service/broker" test, used to keep
@@ -257,6 +298,11 @@ impl MonitorApp {
             drv_note: String::new(),
             drv_names: HashMap::new(),
             drv_watch: std::collections::HashSet::new(),
+            fport_on: false,
+            fport_sel: HashSet::new(),
+            fport_draft_sess: None,
+            fport_draft_on: false,
+            fport_draft_sel: HashSet::new(),
             drv_com: HashMap::new(),
             drv_avail: false,
             drv_err: 0,
@@ -352,6 +398,10 @@ impl MonitorApp {
                             "lineView" => self.views_new.line = on,
                             "autoMon" => self.auto_mon = on,
                             "modbusType" => self.proto_sel = v.parse().unwrap_or(1),
+                            // 端口白名单：两个键各管一件事，互不覆盖。
+                            // 缺省（历史配置里没有这两项）= 不限制。
+                            "portFilter" => self.fport_on = on,
+                            "portWatch" => self.fport_sel = parse_port_list(v),
                             _ => {}
                         }
                     }
@@ -362,14 +412,16 @@ impl MonitorApp {
 
     fn save_cfg(&self) {
         let t = format!(
-            "[NewMon]\ntableView={} terminalView={} dumpView={} modbusView={} lineView={} autoMon={} modbusType={}\n",
+            "[NewMon]\ntableView={} terminalView={} dumpView={} modbusView={} lineView={} autoMon={} modbusType={} portFilter={} portWatch={}\n",
             b(self.views_new.table),
             b(self.views_new.terminal),
             b(self.views_new.dump),
             b(self.views_new.modbus),
             b(self.views_new.line),
             b(self.auto_mon),
-            self.proto_sel
+            self.proto_sel,
+            b(self.fport_on),
+            fmt_port_list(&self.fport_sel)
         );
         let _ = std::fs::write("config.ini", t);
     }
@@ -451,6 +503,17 @@ impl MonitorApp {
             text: self.ftext.clone(),
             text_on: self.ftext_on,
         };
+        // 端口白名单沿用「过滤设置」里上一次应用的选择（持久化在 config.ini）：
+        // 用户连续开几个会话时，不必每次都重新勾一遍端口。
+        //
+        // 但只在**新会话确实包含这些端口**时才继承：否则一个只勾了 COM6 的旧白名单
+        // 会让新建的 COM3 会话一条数据都显示不出来，而用户看到的只是一个空窗口。
+        // （"取消选择 + 应用"会留下启用但空的白名单，那种配置同样不继承。）
+        let inherited_any = s.channels.iter().any(|c| self.fport_sel.contains(&c.name));
+        if self.fport_on && inherited_any {
+            s.port_watch = self.fport_sel.clone();
+            s.port_watch_on = true;
+        }
         if self.auto_mon {
             s.running = true;
         }
@@ -603,6 +666,21 @@ impl MonitorApp {
         self.drv_ports.clear();
     }
 
+    /// 驱动端口序号 → 会话通道名（也是「监视端口」白名单里用来比对的那个名字）。
+    ///
+    /// 优先用 COM 号：用户勾选时看到的是 `COM6`，而驱动报的是 `\Device\VSerial8_2`。
+    /// 拿不到 COM 映射时退回设备短名。**建通道和做过滤必须都走这里**，
+    /// 否则两边的名字对不上，白名单会静默失效（要么什么都过滤不掉，要么全丢）。
+    fn channel_port_name(&self, port_index: u32) -> String {
+        let Some(path) = self.drv_names.get(&port_index) else {
+            return format!("端口{}", port_index);
+        };
+        self.drv_com
+            .get(path)
+            .cloned()
+            .unwrap_or_else(|| short_dev(path))
+    }
+
     /// Format the "attached N ports" note shared by start and rescan.
     fn set_driver_note_for_ports(&mut self, attached: u32, ports: &[(u32, String)]) {
         self.drv_note = if attached == 0 || ports.is_empty() {
@@ -745,6 +823,21 @@ impl MonitorApp {
                     continue;
                 }
             }
+            // 第二道闸：「过滤设置」→「监视端口」里的会话级白名单。
+            //
+            // drv_watch 是"驱动这次连上的哪些端口值得看"（全局、驱动采集期间有效），
+            // 会话白名单是"这个会话想收哪些端口"（每会话一份，跟着会话走）。
+            // 两层都要过：用户可能在驱动设置里开了全部，然后只在某个会话里取消勾选 COM7。
+            //
+            // 注意白名单的实际丢弃发生在**建通道之后**（见下面 ingest 之前那次判断）：
+            // 通道列表就是「监视端口」勾选区的数据源，如果被过滤的端口连通道都不建，
+            // 那个端口就永远不会出现在列表里，用户也就没法把它勾回来 —— 单向门。
+            //
+            // 判断用的是**通道名**，必须和建通道时用的是同一个名字：驱动采集优先用
+            // COM 号（用户认得的那个），拿不到 COM 映射才退回设备短名。两处不一致会让
+            // 白名单永远匹配不上（表现是"什么都没过滤掉"或"全被丢弃"），所以统一走
+            // channel_port_name。
+            let chan_port = self.channel_port_name(rec.port_index);
             let key = (sess_idx, rec.port_index);
             let chan = match self.drv_ports.get(&key) {
                 Some(&c) => c,
@@ -753,22 +846,31 @@ impl MonitorApp {
                     // 新端口就要重新查询整张端口表（O(N) 次 IOCTL），在 8 口以上、
                     // 每帧都有新端口时会把 UI 线程拖住；而端口名在驱动的生命周期内
                     // 不会变，查一次就够。
-                    let name = self
-                        .drv_names
-                        .get(&rec.port_index)
-                        .map(|d| short_dev(d))
-                        .unwrap_or_else(|| format!("端口{}", rec.port_index));
+                    let name = chan_port.clone();
                     let s = &mut self.sessions[sess_idx];
-                    let idx = s.channels.len();
-                    s.channels.push(ChannelCfg {
-                        kind: ChanKind::HookSerial,
-                        name: name.clone(),
-                        baud: 0,
-                        data_bits: 8,
-                        parity: 0,
-                        stop_bits: 1,
-                    });
-                    s.notices.push(format!("驱动捕获端口: {name}"));
+                    // 会话里可能已经有同名的「串口监听」通道（新建会话时勾的端口）。
+                    // 复用它而不是再建一条：否则同一个 COM6 会出现两个通道，
+                    // 用户看到的通道列和「监视端口」列表都会变得难以对应。
+                    let idx = match s
+                        .channels
+                        .iter()
+                        .position(|c| c.kind == ChanKind::HookSerial && c.name == name)
+                    {
+                        Some(i) => i,
+                        None => {
+                            let i = s.channels.len();
+                            s.channels.push(ChannelCfg {
+                                kind: ChanKind::HookSerial,
+                                name: name.clone(),
+                                baud: 0,
+                                data_bits: 8,
+                                parity: 0,
+                                stop_bits: 1,
+                            });
+                            s.notices.push(format!("驱动捕获端口: {name}"));
+                            i
+                        }
+                    };
                     self.drv_ports.insert(key, idx);
                     // 驱动自己在记录里带有句柄，但通道是按端口聚合的：同一端口上不同
                     // 进程的读写都进这一路，和「串口监听」会话的行为保持一致。
@@ -776,6 +878,11 @@ impl MonitorApp {
                     idx
                 }
             };
+            // 白名单在这里生效：通道已经建好（所以端口会出现在「监视端口」列表里，
+            // 用户可以随时勾回来），但不在白名单上的端口，字节根本不进 rows。
+            if !self.sessions[sess_idx].port_allowed(&chan_port) {
+                continue;
+            }
             // The driver now reports Unix milliseconds, which is exactly what fmt_time
             // expects. (An earlier build passed raw FILETIME through here and every row
             // showed 1970-01-01.)
@@ -2310,16 +2417,33 @@ impl MonitorApp {
     /// Deliver hook-captured bytes to the PID capture session and to every
     /// hook-watch session whose channel names that port. Name routing works even
     /// when the port was opened before the watch session was created.
+    ///
+    /// 端口白名单（`Session::port_watch`，见「过滤设置」→「监视端口」）在这里生效：
+    /// 每个会话在把字节喂进 `ingest` 之前先问一句 `port_allowed(端口名)`，被取消
+    /// 勾选的端口连行都不会产生 —— 不只是界面上看不见，数据根本没进 `rows`。
     fn route_hook_data(&mut self, pid: u32, handle: u64, data: Vec<u8>, tx: bool) {
         let (secs, ms) = now_wall();
+        // 端口名先取出来：PID 会话走 handle 映射，但过滤条件只认端口名，
+        // 这样两条路由分支用的是同一份白名单判断。
+        let port = self.hook_ports.get(&(pid, handle)).cloned();
         if let Some(s) = self.sessions.iter_mut().find(|s| s.cap_pid == Some(pid)) {
             if let Some(&idx) = s.cap_map.get(&handle) {
-                s.ingest(idx, data.clone(), secs, ms, tx);
+                // 端口名取不到时只能放行：没有名字就无从判断，宁可多显示也不要静默丢数据。
+                let allowed = match &port {
+                    Some(p) => s.port_allowed(p),
+                    None => true,
+                };
+                if allowed {
+                    s.ingest(idx, data.clone(), secs, ms, tx);
+                }
             }
         }
-        if let Some(port) = self.hook_ports.get(&(pid, handle)).cloned() {
+        if let Some(port) = port {
             for s in self.sessions.iter_mut() {
                 if s.cap_pid.is_some() {
+                    continue;
+                }
+                if !s.port_allowed(&port) {
                     continue;
                 }
                 if let Some(idx) = s
@@ -2452,7 +2576,33 @@ impl MonitorApp {
         }
     }
 
+    /// 「过滤设置」对话框。
+    ///
+    /// 除了 方向 / Modbus 功能码 / 内容查找，这里还有「监视端口」—— 会话级端口白名单。
+    /// 编辑走草稿（`fport_draft_*`），点「应用」才写回会话和 config.ini，和功能码同一套模型；
+    /// 草稿在对话框打开时从当前会话同步一次（`fport_draft_sess`），所以每次打开看到的都是
+    /// 真正生效的状态，而不是上一次遗留的默认值。
     fn dlg_filter_ui(&mut self, ui: &mut Ui) {
+        // 打开对话框的第一帧（或切换了会话标签页）把草稿拉到当前会话的真实状态。
+        if self.fport_draft_sess != Some(self.active) {
+            match self.sessions.get(self.active) {
+                Some(s) => {
+                    self.fport_draft_on = s.port_watch_on;
+                    self.fport_draft_sel = s.port_watch.clone();
+                }
+                None => {
+                    self.fport_draft_on = self.fport_on;
+                    self.fport_draft_sel = self.fport_sel.clone();
+                }
+            }
+            self.fport_draft_sess = Some(self.active);
+        }
+        // 端口候选来自当前会话的 HookSerial 通道名（COM6 这种）。
+        let port_all: Vec<String> = match self.sessions.get(self.active) {
+            Some(s) => s.port_choices(),
+            None => Vec::new(),
+        };
+
         ui.label("数据方向:");
         ui.horizontal(|ui| {
             for (i, t) in ["全部", "读", "写"].iter().enumerate() {
@@ -2493,6 +2643,67 @@ impl MonitorApp {
             }
         });
         ui.separator();
+        // --- 监视端口：会话级端口白名单 ---
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("监视端口:").strong());
+            ui.label(
+                RichText::new("（取消勾选即过滤该端口，两条捕获路径都生效；默认监视全部）")
+                    .small()
+                    .color(Color32::GRAY),
+            );
+        });
+        if port_all.is_empty() {
+            ui.label(
+                RichText::new(
+                    "该会话还没有端口通道。串口监听/驱动捕获的通道建立后，这里会列出端口名。",
+                )
+                .small()
+                .color(Color32::GRAY),
+            );
+            // 没有端口可勾时仍要留一条出路：白名单可能是从 config.ini 继承来的
+            // （启用 + 空集合 = 全部丢弃），否则这个会话会一直空白而用户无从恢复。
+            if ui.button("清除端口过滤").clicked() {
+                pw_select_all(&mut self.fport_draft_sel, &mut self.fport_draft_on);
+                ui.close_menu();
+            }
+        } else {
+            ScrollArea::vertical().id_source("filter_ports").max_height(120.0).show(ui, |ui| {
+                for name in &port_all {
+                    let mut on = pw_allowed(&self.fport_draft_sel, self.fport_draft_on, name);
+                    if ui.checkbox(&mut on, name).changed() {
+                        pw_toggle(
+                            &mut self.fport_draft_sel,
+                            &mut self.fport_draft_on,
+                            &port_all,
+                            name,
+                            on,
+                        );
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
+                if ui.button("全选").clicked() {
+                    pw_select_all(&mut self.fport_draft_sel, &mut self.fport_draft_on);
+                    ui.close_menu();
+                }
+                if ui.button("反选").clicked() {
+                    pw_invert(&mut self.fport_draft_sel, &mut self.fport_draft_on, &port_all);
+                    ui.close_menu();
+                }
+                if ui.button("取消选择").clicked() {
+                    pw_select_none(&mut self.fport_draft_sel, &mut self.fport_draft_on);
+                    ui.close_menu();
+                }
+            });
+            if self.fport_draft_on && self.fport_draft_sel.is_empty() {
+                ui.label(
+                    RichText::new("已取消全部端口：该会话将不显示任何端口数据。")
+                        .small()
+                        .color(C_FAIL),
+                );
+            }
+        }
+        ui.separator();
         ui.horizontal(|ui| {
             ui.label("内容查找:");
             ui.add(TextEdit::singleline(&mut self.ftext).desired_width(180.0));
@@ -2508,18 +2719,28 @@ impl MonitorApp {
                         text: self.ftext.clone(),
                         text_on: self.ftext_on,
                     };
+                    // 端口白名单写进会话 —— 这一步才让两条数据路径真正按端口过滤。
+                    s.port_watch = self.fport_draft_sel.clone();
+                    s.port_watch_on = self.fport_draft_on;
                 }
+                // 同时作为"默认设置"和 config.ini 的落盘值。
+                self.fport_sel = self.fport_draft_sel.clone();
+                self.fport_on = self.fport_draft_on;
+                self.save_cfg();
                 self.dlg_filter = false;
+                self.fport_draft_sess = None;
                         ui.close_menu();
             }
             if ui.button("关闭").clicked() {
                 self.dlg_filter = false;
+                self.fport_draft_sess = None;
                         ui.close_menu();
             }
         });
         ui.separator();
         if ui.button("关闭").clicked() {
             self.dlg_filter = false;
+            self.fport_draft_sess = None;
                         ui.close_menu();
         }
     }

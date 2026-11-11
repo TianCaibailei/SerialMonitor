@@ -2,7 +2,7 @@
 // row storage, filters, rate history, auto-save logging.
 
 use crate::protocol::{self, FrameKind, ModbusParsed};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -157,6 +157,72 @@ impl Filters {
     }
 }
 
+/// 端口白名单的共用判定。
+///
+/// 未启用（`on == false`）= 不限制，这正是与 `drv_watch` 对齐的那半语义：
+/// 默认状态、config.ini 里缺这一项、以及"全选"都是这个状态。
+///
+/// 一旦启用就严格按白名单走 —— 空集合表示"一个端口都不放行"，而不是"放行全部"。
+/// 只有这样才能让「取消选择」按钮有意义；否则它和「全选」会变成同一个动作。
+/// 做成自由函数是因为「过滤设置」对话框的草稿和 `Session` 上真正生效的状态
+/// 必须用同一套规则，否则用户会看到"勾了却没生效"这种自相矛盾的界面。
+pub fn pw_allowed(sel: &HashSet<String>, on: bool, name: &str) -> bool {
+    if !on {
+        return true;
+    }
+    sel.contains(name)
+}
+
+/// 全选 = 回到"不限制"。
+pub fn pw_select_all(sel: &mut HashSet<String>, on: &mut bool) {
+    sel.clear();
+    *on = false;
+}
+
+/// 取消选择 = 有意的"一个都不看"（空集合 + 已启用）。这正是需要 `on` 标志的原因。
+pub fn pw_select_none(sel: &mut HashSet<String>, on: &mut bool) {
+    sel.clear();
+    *on = true;
+}
+
+/// 反选：以当前生效的勾选状态为基准取补集；补集覆盖全部端口时回到"不限制"。
+pub fn pw_invert(sel: &mut HashSet<String>, on: &mut bool, all: &[String]) {
+    if all.is_empty() {
+        return;
+    }
+    let next: HashSet<String> = all
+        .iter()
+        .filter(|n| !pw_allowed(sel, *on, n))
+        .cloned()
+        .collect();
+    if next.len() >= all.len() {
+        pw_select_all(sel, on);
+    } else {
+        *sel = next;
+        *on = true;
+    }
+}
+
+/// 勾选/取消勾选单个端口，交互对齐「驱动捕获设置」里的 drv_watch：
+/// 第一次收窄时先把当前全部端口塞进白名单再移除；全部选回则清空集合恢复"不限制"。
+pub fn pw_toggle(sel: &mut HashSet<String>, on: &mut bool, all: &[String], name: &str, checked: bool) {
+    // 第一次收窄：从"全部勾选"出发，把现有端口都算进去。
+    if !*on {
+        *sel = all.iter().cloned().collect();
+        *on = true;
+    }
+    if checked {
+        sel.insert(name.to_string());
+    } else {
+        sel.remove(name);
+    }
+    // 全部选回 -> 回到"不限制"。用"覆盖了当前所有端口"判断而不是比 len：
+    // 白名单里可能还留着已经不存在的旧端口名。
+    if !all.is_empty() && all.iter().all(|n| sel.contains(n)) {
+        pw_select_all(sel, on);
+    }
+}
+
 #[derive(Clone)]
 pub struct Autosave {
     pub on: bool,
@@ -206,6 +272,14 @@ pub struct Session {
     pub cap_pid: Option<u32>,
     /// hook handle (u64 from the pipe) -> channel index.
     pub cap_map: HashMap<u64, usize>,
+    /// 会话级端口白名单：只有**勾选**的端口名（通道名，如 "COM6"）才进入本会话。
+    ///
+    /// 语义对齐驱动路径上的 `drv_watch`（ui.rs）：**没启用 / 空 = 不限制**。
+    /// 额外多一个 `port_watch_on` 开关，是因为「取消选择」必须能表达
+    /// 「一个端口都不监视」—— 那在集合上也是空的，只有靠这个开关和"不限制"区分。
+    pub port_watch: HashSet<String>,
+    /// 端口过滤是否已启用。`false` → 不限制（新会话的默认状态，等价于"全部勾选"）。
+    pub port_watch_on: bool,
 }
 
 pub fn now_wall() -> (u64, u32) {
@@ -314,6 +388,8 @@ impl Session {
             auto_scroll: true,
             cap_pid: None,
             cap_map: HashMap::new(),
+            port_watch: HashSet::new(),
+            port_watch_on: false,
         };
         for (idx, ch) in sess.channels.clone().iter().enumerate() {
             match ch.kind {
@@ -355,6 +431,28 @@ impl Session {
         self.serial_writes.push(None);
         self.udp_sends.push(None);
         idx
+    }
+
+    /// 会话级端口白名单：这个端口名目前是否允许进入本会话。
+    ///
+    /// 未启用 = 不限制（对齐 ui.rs 里 `drv_watch` 的"空/缺省 = 全部"语义）；
+    /// 启用之后严格按白名单走，不在集合里的端口一律丢弃。
+    pub fn port_allowed(&self, name: &str) -> bool {
+        pw_allowed(&self.port_watch, self.port_watch_on, name)
+    }
+
+    /// 会话里可以出现在「监视端口」列表中的端口名（HookSerial 通道名，如 COM6）。
+    ///
+    /// 去重并保持通道顺序：驱动路径按端口建通道，同一端口不会重复，
+    /// 但手工新建 + 自动附加有可能撞名，重复的 checkbox 会让人以为可以分别勾选。
+    pub fn port_choices(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for c in &self.channels {
+            if c.kind == ChanKind::HookSerial && !out.iter().any(|n| n == &c.name) {
+                out.push(c.name.clone());
+            }
+        }
+        out
     }
 
     fn open_serial(&mut self, idx: usize, ch: ChannelCfg, tx: Sender<Ev>, stop: Arc<AtomicBool>) {

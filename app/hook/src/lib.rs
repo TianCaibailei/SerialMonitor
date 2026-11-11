@@ -459,7 +459,10 @@ fn pipe_write_blocking(payload: &[u8]) -> bool {
     if h == INVALID_HANDLE {
         return false;
     }
-    let orig = ORIG_WRITEFILE.load(Ordering::Relaxed);
+    // MUST be the trampoline when the entry point is patched: ORIG_WRITEFILE then
+    // points at our own jump, so calling it would re-enter hook_WriteFile and recurse
+    // until the stack dies — inside the monitored program.
+    let orig = orig_call_addr(&INLINE_WRITEFILE, &ORIG_WRITEFILE);
     if orig == 0 {
         return false;
     }
@@ -517,9 +520,32 @@ fn send_io(tag: u32, handle: usize, data: &[u8]) {
     send_record(tag, &p);
 }
 
-/// Look up (and register) the port label for a handle. Handles opened after
-/// injection are known from CreateFile; handles already open are classified once
-/// via GetFileInformationByHandleEx(FileNameInfo) and then cached either way.
+/// Look up (and register) the port label for a handle.
+///
+/// Two ways a serial handle becomes known:
+///  1. CreateFileW/A was called *after* injection — the path is right there, and the
+///     hooks record it directly.
+///  2. The handle was opened BEFORE injection — the common case for a tool the user
+///     attached to, and the only case that ever needed discovery.
+///
+/// For case 2 the original implementation asked the object for its name with
+/// GetFileInformationByHandleEx(FileNameInfo). MEASURED ON THIS MACHINE, that call
+/// FAILS on serial handles with ERROR_INVALID_PARAMETER (87), in both architectures:
+///
+///   GetFileInformationByHandleEx(FileNameInfo) ok=0 err=87
+///   GetFileType = 0x2 (FILE_TYPE_CHAR)
+///   IOCTL_SERIAL_GET_COMMSTATUS        ok=1
+///
+/// So case 2 could never be identified, and because the failure path deliberately
+/// does not write the negative cache (a transient failure must not blacklist a
+/// handle), every single I/O re-probed, re-failed, and discarded the bytes. The
+/// visible symptom is exactly the reported one: the process is injected, its writes
+/// are going through our WriteFile hook, and the monitor shows nothing.
+///
+/// The fix is to identify the port the way a serial API does: query a serial-only
+/// IOCTL. Only a real serial device answers IOCTL_SERIAL_GET_COMMSTATUS, which makes
+/// it a positive, unambiguous test — no name parsing, no false positives on console
+/// handles (which are also FILE_TYPE_CHAR).
 unsafe fn com_label(h: *mut std::ffi::c_void) -> Option<String> {
     if h.is_null() || h as isize == INVALID_HANDLE {
         return None;
@@ -530,35 +556,156 @@ unsafe fn com_label(h: *mut std::ffi::c_void) -> Option<String> {
         Some(None) => return None, // negatively cached
         None => {}
     }
-    let mut buf = [0u8; 1024];
-    if GetFileInformationByHandleEx(h, FILE_NAME_INFO_CLASS, buf.as_mut_ptr() as _, 1024) == 0 {
-        // Transient failure: do NOT cache, the handle may just be busy.
-        return None;
+    // --- case 2: probe the device directly ---
+    if let Some(label) = probe_serial_port(h) {
+        handles_lock().insert(key, Some(label.clone()));
+        dbg_note(&format!("com_label: h={:x} 串口探测命中 {}", key, label));
+        send_open(key, &label);
+        return Some(label);
     }
-    let chars_len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize / 2;
-    if chars_len == 0 || chars_len > 500 {
-        return None;
-    }
-    let mut wide_chars = Vec::with_capacity(chars_len);
-    for i in 0..chars_len {
-        let b = i * 2 + 4;
-        if b + 1 >= 1024 {
-            return None;
-        }
-        wide_chars.push(u16::from_le_bytes([buf[b], buf[b + 1]]));
-    }
-    let path = String::from_utf16_lossy(&wide_chars).to_lowercase();
-    if !is_serial_path(&path) {
-        handles_lock().insert(key, None); // negative cache: not a serial port
-        dbg_note(&format!("com_label: h={:x} not serial: {}", key, path));
-        return None;
-    }
-    let label = serial_label_from_path(&path);
-    handles_lock().insert(key, Some(label.clone()));
-    dbg_note(&format!("com_label: h={:x} serial {} ({})", key, label, path));
-    send_open(key, &label);
-    Some(label)
+    // Not a serial port. Cache it so ordinary file traffic costs one probe, ever.
+    //
+    // No log line here on purpose: a program touches dozens of ordinary files, and one
+    // line per handle drowned the port-open events that actually matter.
+    handles_lock().insert(key, None);
+    None
 }
+
+/// IOCTL_SERIAL_GET_COMMSTATUS — answered only by a serial driver.
+const IOCTL_SERIAL_GET_COMMSTATUS: u32 = 0x001B_0058;
+
+extern "system" {
+    fn DeviceIoControl(
+        h: *mut std::ffi::c_void,
+        code: u32,
+        inbuf: *mut std::ffi::c_void,
+        insize: u32,
+        outbuf: *mut std::ffi::c_void,
+        outsize: u32,
+        ret: *mut u32,
+        ov: *mut std::ffi::c_void,
+    ) -> i32;
+    /// DOS device name of a COM port, e.g. `\\.\COM6` -> `\Device\VSerial8_2`.
+    /// This only reads the device map; it does NOT open the port.
+    fn QueryDosDeviceW(name: *const u16, target: *mut u16, max: u32) -> u32;
+    fn NtQueryObject(
+        h: *mut std::ffi::c_void,
+        class: u32,
+        info: *mut std::ffi::c_void,
+        len: u32,
+        ret: *mut u32,
+    ) -> i32;
+}
+
+/// Is this handle a serial port, and which COM number is it?
+///
+/// `IOCTL_SERIAL_GET_COMMSTATUS` is the discriminator: a console handle, a pipe, or
+/// a file does not answer it, while every serial driver does. That makes it a
+/// positive, unambiguous test — no name guessing, no false positives on
+/// FILE_TYPE_CHAR handles like conhost's.
+///
+/// The label has to be "COM6" (not "\Device\VSerial8_2") because that is what the
+/// session's channel is named, and routing matches on it.
+unsafe fn probe_serial_port(h: *mut std::ffi::c_void) -> Option<String> {
+    let mut status = [0u8; 32];
+    let mut ret = 0u32;
+    let ok = DeviceIoControl(
+        h,
+        IOCTL_SERIAL_GET_COMMSTATUS,
+        std::ptr::null_mut(),
+        0,
+        status.as_mut_ptr() as *mut std::ffi::c_void,
+        status.len() as u32,
+        &mut ret,
+        std::ptr::null_mut(),
+    );
+    if ok == 0 {
+        return None; // not a serial port
+    }
+    // Resolve the device path of THIS handle, then translate it to a COM number.
+    //
+    // NtQueryObject is safe here because the handle is our own, in our own process:
+    // the well-known way it deadlocks is when it is called on another process's file
+    // handle that has a pending I/O. A serial device object answers immediately.
+    let device = object_device_name(h);
+    if let Some(dev) = &device {
+        if let Some(com) = com_number_for_device(dev) {
+            return Some(com);
+        }
+    }
+    // Could not name it: use a stable per-device label so captured bytes still reach
+    // a channel instead of being dropped.
+    let label = device
+        .as_deref()
+        .map(serial_label_from_path)
+        .filter(|s| !s.is_empty());
+    Some(label.unwrap_or_else(|| "COM?".to_string()))
+}
+
+/// `\Device\VSerial8_2` for a device handle, via NtQueryObject.
+unsafe fn object_device_name(h: *mut std::ffi::c_void) -> Option<String> {
+    let mut buf = [0u8; 1024];
+    let mut ret = 0u32;
+    let st = NtQueryObject(
+        h,
+        1, // ObjectNameInformation
+        buf.as_mut_ptr() as *mut std::ffi::c_void,
+        buf.len() as u32,
+        &mut ret,
+    );
+    if st < 0 {
+        return None;
+    }
+    // UNICODE_STRING { USHORT Length; USHORT MaximumLength; PWSTR Buffer; }
+    //
+    // Buffer follows the two USHORTs and is pointer-aligned, so its offset is
+    // round_up(4, sizeof(usize)): 8 on x64, 4 on x86 — i.e. exactly sizeof(usize).
+    // Hand-picked indices would silently read the wrong bytes on the other
+    // architecture, and this code is compiled for both.
+    let len = u16::from_le_bytes([buf[0], buf[1]]) as usize;
+    if len == 0 || len > 512 {
+        return None;
+    }
+    let buf_off = std::mem::size_of::<usize>();
+    let ptr = *(buf.as_ptr().add(buf_off) as *const usize);
+    if ptr == 0 {
+        return None;
+    }
+    let mut units = Vec::with_capacity(len / 2);
+    for i in 0..(len / 2) {
+        units.push(*(ptr as *const u16).add(i));
+    }
+    // NtQueryObject returns the NT object path (`\Device\VSerial8_0`); strip any
+    // trailing NUL/space so it compares equal to what QueryDosDevice reports.
+    let s = String::from_utf16_lossy(&units);
+    Some(s.trim_end_matches(['\0', ' ']).to_lowercase())
+}
+
+/// Translate `\device\vserial8_2` to `COM6` via the DOS device map.
+///
+/// MEASURED: the bare name works and the `\\.\`-prefixed form does not.
+///
+///   QueryDosDevice("COM1")     -> "\Device\VSerial8_0"
+///   QueryDosDevice("\\.\COM1") -> (fails)
+///
+/// Reading this table never opens or disturbs a port, which is what a passive
+/// monitor requires. The result also carries a trailing space, hence the trim.
+unsafe fn com_number_for_device(device: &str) -> Option<String> {
+    let want = device.trim_end_matches(['\0', ' ']);
+    for n in 1..=256u32 {
+        let mut target = [0u16; 512];
+        let len = QueryDosDeviceW(wide(&format!("COM{n}")).as_ptr(), target.as_mut_ptr(), 512) as usize;
+        if len == 0 {
+            continue;
+        }
+        let name = String::from_utf16_lossy(&target[..len.saturating_sub(1)]).to_lowercase();
+        if name.trim_end_matches(['\0', ' ']) == want {
+            return Some(format!("COM{n}"));
+        }
+    }
+    None
+}
+
 
 // ---------------- I/O hooks ----------------
 
@@ -574,6 +721,10 @@ unsafe extern "system" fn hook_CreateFileW(
     let f: CreateFileWFn =
         std::mem::transmute(orig_call_addr(&INLINE_CREATEFILEW, &ORIG_CREATEFILEW));
     let h = f(name, access, share, sa, disp, flags, tmpl);
+    // Diagnostic: every port open the target performs, whether or not it is a serial
+    // device. Kept because "the hook is loaded but the program never opened anything"
+    // and "it opened a path we did not classify as serial" look identical without it.
+    dbg_note(&format!("createfilew: {:?} -> h={:x}", wide_to_string(name), h as usize));
     let err = GetLastError(); // .NET and others inspect it right after we return
     if h as isize != INVALID_HANDLE {
         let s = wide_to_string(name);
@@ -596,7 +747,10 @@ unsafe extern "system" fn hook_CreateFileA(
     flags: u32,
     tmpl: *mut std::ffi::c_void,
 ) -> *mut std::ffi::c_void {
-    let f: CreateFileAFn = std::mem::transmute(ORIG_CREATEFILEA.load(Ordering::Relaxed));
+    // Trampoline, not the raw pointer: CreateFileA is entry-patched too, so calling
+    // ORIG_CREATEFILEA directly would re-enter this hook.
+    let f: CreateFileAFn =
+        std::mem::transmute(orig_call_addr(&INLINE_CREATEFILEA, &ORIG_CREATEFILEA));
     let h = f(name, access, share, sa, disp, flags, tmpl);
     let err = GetLastError();
     if h as isize != INVALID_HANDLE {
@@ -804,7 +958,8 @@ unsafe extern "system" fn hook_ReadFileEx(
     ov: *mut std::ffi::c_void,
     completion: Option<unsafe extern "system" fn(u32, u32, *mut std::ffi::c_void)>,
 ) -> i32 {
-    let orig = ORIG_READFILEEX.load(Ordering::Relaxed);
+    // Trampoline, not the raw pointer: these entries are patched too.
+    let orig = orig_call_addr(&INLINE_READFILEEX, &ORIG_READFILEEX);
     let f: ReadFileExFn = std::mem::transmute(orig);
     // Non-serial handles go straight through with the caller's own routine: no
     // allocation and no context, so ordinary async file I/O is untouched.
@@ -836,7 +991,8 @@ unsafe extern "system" fn hook_WriteFileEx(
     ov: *mut std::ffi::c_void,
     completion: Option<unsafe extern "system" fn(u32, u32, *mut std::ffi::c_void)>,
 ) -> i32 {
-    let orig = ORIG_WRITEFILEEX.load(Ordering::Relaxed);
+    // Trampoline, not the raw pointer: these entries are patched too.
+    let orig = orig_call_addr(&INLINE_WRITEFILEEX, &ORIG_WRITEFILEEX);
     let f: WriteFileExFn = std::mem::transmute(orig);
     if ov.is_null() || com_label(h).is_none() {
         return f(h, buf, len, ov, completion);
@@ -921,6 +1077,33 @@ unsafe fn resolve_kernel32(name: &[u8]) -> usize {
     GetProcAddress(h, cname.as_ptr()) as usize
 }
 
+/// Offset of the Import Directory entry inside the Optional Header.
+///
+/// This MUST depend on the image's own optional-header magic, not on the build
+/// architecture of this DLL:
+///
+///   PE32  (magic 0x10B, every 32-bit module)  → 96 + 1*8  = 104
+///   PE32+ (magic 0x20B, every 64-bit module)  → 112 + 1*8 = 120
+///
+/// DataDirectory[1] is the import table; each entry is 8 bytes.
+///
+/// History: this used to hard-code the PE32+ offset behind a `if magic != 0x20B
+/// { return; }` guard. Inside a WOW64 target *every* module is PE32, so the guard
+/// skipped every single module and the injected hook patched nothing at all — the
+/// DLL loaded, logged "patched" and stayed silent forever. That is exactly the
+/// "32-bit injection succeeds but nothing is ever captured" failure.
+///
+/// Returns None for an optional header this code does not understand.
+unsafe fn import_dir_offset(opt: *const u8) -> Option<isize> {
+    let magic = *(opt as *const u16);
+    let dd = match magic {
+        0x10B => 96,  // PE32
+        0x20B => 112, // PE32+
+        _ => return None,
+    };
+    Some(dd + 8) // DataDirectory[0] is the export table, [1] is imports
+}
+
 unsafe fn patch_iat(base: *mut u8, targets: &[(usize, usize)]) {
     if base.is_null() {
         return;
@@ -930,10 +1113,10 @@ unsafe fn patch_iat(base: *mut u8, targets: &[(usize, usize)]) {
     }
     let e_lfanew = *(base.offset(0x3C) as *const u32) as isize;
     let opt = base.offset(e_lfanew).offset(0x18);
-    if *(opt as *const u16) != 0x20B {
-        return; // PE32+ (x64) only
-    }
-    let imp_rva = *(opt.offset(112 + 8) as *const u32) as isize;
+    let Some(imp_off) = import_dir_offset(opt) else {
+        return; // unrecognised optional header: leave the module alone
+    };
+    let imp_rva = *(opt.offset(imp_off) as *const u32) as isize;
     if imp_rva == 0 {
         return;
     }
@@ -962,21 +1145,54 @@ unsafe fn patch_iat(base: *mut u8, targets: &[(usize, usize)]) {
 
 // ---------------- byte-level entry patching ----------------
 //
-// IAT hooking only redirects calls that go through a module's import slot. .NET's
-// SerialStream (and any binder that caches a resolved address) calls the function
-// pointer it obtained earlier, so those calls bypass the IAT entirely — verified on
-// this machine: a .NET process injected while still starting showed
-// `pipe connected / patched` but never `cfw: \\.\COMn`, i.e. its CreateFileW call
-// went straight to kernel32.
+// WHY THIS IS THE LOAD-BEARING MECHANISM
+// --------------------------------------
+// IAT hooking only redirects calls that go through a module's import slot, and
+// GetProcAddress hooking only redirects bindings made *after* injection. Neither
+// helps the case that actually matters here:
 //
-// Patching the function's first bytes closes that gap: `mov rax, <hook>; jmp rax`
-// covers every caller regardless of how it got the address. The stolen bytes are
-// copied into a trampoline that jumps back, so the original behaviour is preserved.
+//   a serial tool started BEFORE the monitor, which resolved its kernel32 pointers
+//   at start-up and keeps them in its own table.
 //
-// The patch is only installed when the first bytes are the well-known Windows
-// prologue of those exports (`mov r10, rcx; mov eax, <syscall>` / `jmp`), because
-// replacing 12 bytes of arbitrary instructions would corrupt the function.
-const PATCH_LEN: usize = 12;
+// The tool the user reported (UartAssist) is the extreme version of this: it is
+// UPX-packed and its KERNEL32 import table contains only
+//     LoadLibraryA, ExitProcess, GetProcAddress, VirtualProtect
+// — no CreateFileW / ReadFile / WriteFile at all. It binds them at runtime with
+// GetProcAddress and caches the results. Measured on this machine:
+//
+//   UPX0 va=001C7000 vs=1C7000 rs=0   ← unpacking target, empty on disk
+//   UPX1 va=001C8000 vs=9C000  rs=9BA00 entropy 8.00
+//
+// For a target like that the ONLY thing that works is overwriting the first bytes
+// of the real kernel32 functions: whatever address the caller cached, it points at
+// the same entry point, and that entry point now jumps to us.
+//
+// WHAT IS PATCHED, AND WHY ONLY THAT SHAPE
+// ----------------------------------------
+// kernel32's file APIs are API-set forwarder stubs. Measured in BOTH architectures
+// on this machine:
+//
+//   x64  CreateFileW  0x7ffe28cd72c0  FF 25 E2 3C 03 00 CC CC CC ...
+//   x86  CreateFileW  0x75dcea50      FF 25 74 12 E3 75 CC CC CC ...
+//
+// i.e. a 6-byte `FF 25 <disp>` indirect jump followed by int3 padding up to the next
+// export. Every other prologue shape is refused: displacing instructions this code
+// has not decoded would corrupt the function, and a crash inside the monitored
+// program is far worse than missing a capture.
+//
+// The patch does not need a register (the arguments are already in rcx/rdx/r8/r9 on
+// x64 and on the stack on x86), so it jumps through a pointer stored in the stub's
+// own int3 padding:
+//
+//   target+0 .. +6   FF 25 <disp>        ; jmp [target+8]
+//   target+8 .. +8+W the absolute hook address (W = 8 on x64, 4 on x86)
+//
+// Placing the pointer inside the padding is what makes this portable: the old code
+// jumped through a pointer in the trampoline with a RIP-relative disp32, which only
+// works when VirtualAlloc happens to return memory within ±2 GB of kernel32 — it
+// usually does not. It is also why the previous version silently did nothing useful
+// for longer prologues.
+const PATCH_LEN: usize = 6;
 
 #[repr(C)]
 struct PatchSlot {
@@ -986,9 +1202,15 @@ struct PatchSlot {
 
 static INLINE_CREATEFILEW: PatchSlot =
     PatchSlot { target: AtomicUsize::new(0), trampoline: AtomicUsize::new(0) };
+static INLINE_CREATEFILEA: PatchSlot =
+    PatchSlot { target: AtomicUsize::new(0), trampoline: AtomicUsize::new(0) };
 static INLINE_READFILE: PatchSlot =
     PatchSlot { target: AtomicUsize::new(0), trampoline: AtomicUsize::new(0) };
 static INLINE_WRITEFILE: PatchSlot =
+    PatchSlot { target: AtomicUsize::new(0), trampoline: AtomicUsize::new(0) };
+static INLINE_READFILEEX: PatchSlot =
+    PatchSlot { target: AtomicUsize::new(0), trampoline: AtomicUsize::new(0) };
+static INLINE_WRITEFILEEX: PatchSlot =
     PatchSlot { target: AtomicUsize::new(0), trampoline: AtomicUsize::new(0) };
 
 extern "system" {
@@ -1005,157 +1227,168 @@ const MEM_COMMIT_RESERVE: u32 = 0x3000;
 const PAGE_EXECUTE_READWRITE_INLINE: u32 = 0x40;
 const PAGE_EXECUTE_READ_INLINE: u32 = 0x20;
 
-/// Does the function start like a Windows syscall stub we can safely displace?
-///
-/// Measured on this machine, kernel32's file APIs begin with
-///     FF 25 <rel32>      jmp qword ptr [rip+rel32]
-///     CC CC CC ...       int3 padding to the next export
-/// i.e. a 6-byte indirect jump followed by padding. That is the easiest case to patch:
-/// only those 6 bytes are used, so a 12-byte write would clobber a neighbouring export's
-/// padding (harmless) but a 6-byte-safe write keeps the change minimal and exact.
-///
-/// Also accepted: `4C 8B D1` (mov r10, rcx — the ntdll syscall stub) and `E9` (a jmp
-/// rel32 forwarder). Anything else is refused: replacing unknown instructions would
-/// corrupt the function.
+/// Wide enough for the absolute pointer the patch stores after the jump.
+const PTR_LEN: usize = std::mem::size_of::<usize>();
+/// Bytes the target patch occupies: 6-byte jump + 2 alignment bytes + the pointer.
+const PATCH_TOTAL: usize = 8 + PTR_LEN;
+
+/// Is this the 6-byte `FF 25` indirect-jump forwarder, with enough int3 padding
+/// after it to hold our pointer without touching the next export?
 unsafe fn is_patchable_prologue(p: *const u8) -> bool {
-    let b: [u8; 4] = [*p, *p.add(1), *p.add(2), *p.add(3)];
-    if b[0] == 0xFF && b[1] == 0x25 {
-        return true; // jmp qword ptr [rip+rel32] — API-set forwarder stub
+    if *p != 0xFF || *p.add(1) != 0x25 {
+        return false; // not the forwarder shape we know how to displace
     }
-    if b[0] == 0x4C && b[1] == 0x8B && b[2] == 0xD1 {
-        return true; // mov r10, rcx
+    // The pointer goes at +8, so +6..+8+P must all be padding.
+    for i in PATCH_LEN..PATCH_TOTAL {
+        if *p.add(i) != 0xCC {
+            return false; // not padding: patching here could clobber real code
+        }
     }
-    if b[0] == 0xE9 || b[0] == 0xEB {
-        return true; // jmp rel32/rel8 forwarder
-    }
-    false
+    true
 }
 
-/// How many bytes must be displaced for this prologue.
-fn prologue_len(p: *const u8) -> usize {
-    let b = unsafe { [*p, *p.add(1)] };
-    if b[0] == 0xFF && b[1] == 0x25 {
-        return 6; // jmp qword ptr [rip+rel32]
-    }
-    12 // mov r10,rcx / jmp rel32
-}
-
-/// Resolve the absolute destination of an `FF 25 rel32` stub.
+/// Read the address a forwarder stub actually calls.
 ///
-/// The displaced bytes cannot be copied into a trampoline verbatim: `[rip+rel32]` is
-/// relative to the *original* instruction's address, so the copy would read the wrong
-/// memory (and crash). Reading the destination now and jumping to it absolutely is the
-/// correct equivalent, and these stubs are pure forwarders so nothing else is lost.
-unsafe fn resolve_ff25_target(p: *const u8) -> usize {
-    let rel = i32::from_le_bytes([*p.add(2), *p.add(3), *p.add(4), *p.add(5)]) as isize;
-    // [rip + rel32] where rip is the address of the *next* instruction (p + 6).
-    let slot = (p as isize) + 6 + rel;
-    let dest = *(slot as *const u64);
-    dest as usize
+/// x64 stub: `FF 25 rel32` — jmp qword ptr [rip+rel32], rip = address of next insn.
+/// x86 stub: `FF 25 abs32` — jmp dword ptr [abs32], the operand IS the slot address.
+///
+/// These must not be confused: treating the x86 form as RIP-relative reads a garbage
+/// address and the trampoline jumps into nowhere.
+unsafe fn resolve_forwarder(p: *const u8) -> usize {
+    #[cfg(target_pointer_width = "64")]
+    {
+        let rel = i32::from_le_bytes([*p.add(2), *p.add(3), *p.add(4), *p.add(5)]) as isize;
+        let slot = (p as isize) + 6 + rel;
+        *(slot as *const usize)
+    }
+    #[cfg(target_pointer_width = "32")]
+    {
+        let slot = u32::from_le_bytes([*p.add(2), *p.add(3), *p.add(4), *p.add(5)]) as usize;
+        *(slot as *const usize)
+    }
 }
 
-/// Install `hook` at `target`, preserving the displaced instructions in a trampoline.
-/// Returns the trampoline address, or 0 when the patch was refused.
+/// Build a trampoline that jumps to `dest` without touching any register.
+///
+/// x64: `FF 25 00 00 00 00` (jmp qword ptr [rip+0]) followed by the 8-byte address —
+///      14 bytes, position independent, no register clobbered.
+/// x86: `68 <imm32> C3` (push imm32; ret) — 6 bytes. Equivalent to a jump and the
+///      stack ends up exactly as it was, so the callee's return still works.
+unsafe fn write_trampoline(tramp: *mut u8, dest: usize) -> usize {
+    #[cfg(target_pointer_width = "64")]
+    {
+        tramp.write(0xFF);
+        tramp.add(1).write(0x25);
+        tramp.add(2).write(0x00);
+        tramp.add(3).write(0x00);
+        tramp.add(4).write(0x00);
+        tramp.add(5).write(0x00);
+        std::ptr::write_unaligned(tramp.add(6) as *mut u64, dest as u64);
+        14
+    }
+    #[cfg(target_pointer_width = "32")]
+    {
+        tramp.write(0x68); // push imm32
+        std::ptr::write_unaligned(tramp.add(1) as *mut u32, dest as u32);
+        tramp.add(5).write(0xC3); // ret
+        6
+    }
+}
+
+/// Install `hook` at `target`, preserving the original destination in a trampoline.
+///
+/// Returns the trampoline address (what callers must use to reach the real function),
+/// or 0 when the patch was refused. Idempotent: calling it twice returns the existing
+/// trampoline instead of re-patching an already patched entry point.
 unsafe fn patch_entry(target: usize, hook: usize, slot: &PatchSlot) -> usize {
     if target == 0 || hook == 0 {
         return 0;
     }
-    if !is_patchable_prologue(target as *const u8) {
-        let p = target as *const u8;
+    // Already installed: the prologue now looks patchable too, so without this guard a
+    // second call would displace our own jump and break the trampoline. This matters
+    // because worker() and the re-patch loop both run.
+    let existing = slot.trampoline.load(Ordering::Relaxed);
+    if existing != 0 {
+        return existing;
+    }
+    let p = target as *const u8;
+    if !is_patchable_prologue(p) {
         dbg_note(&format!(
             "inline: 拒绝 patch {target:#x}, 前16字节 = {:02X?}",
             unsafe { std::slice::from_raw_parts(p, 16) }
         ));
-        return 0; // unexpected prologue: leave the function untouched
+        return 0;
     }
-    let patch_len = prologue_len(target as *const u8);
+    let dest = resolve_forwarder(p);
+    if dest == 0 {
+        dbg_note(&format!("inline: {target:#x} 转发目标为 0，放弃"));
+        return 0;
+    }
+
     let tramp = VirtualAlloc(
         std::ptr::null_mut(),
-        patch_len + 16,
+        64,
         MEM_COMMIT_RESERVE,
         PAGE_EXECUTE_READWRITE_INLINE,
     ) as *mut u8;
     if tramp.is_null() {
         return 0;
     }
-    if patch_len == 6 {
-        // FF 25 stub: jump to the resolved destination, then jump back to target+6.
-        let dest = resolve_ff25_target(target as *const u8) as u64;
-        let mut code = [0u8; 12];
-        code[0] = 0x48;
-        code[1] = 0xB8;
-        code[2..10].copy_from_slice(&dest.to_le_bytes());
-        code[10] = 0xFF;
-        code[11] = 0xE0;
-        std::ptr::copy_nonoverlapping(code.as_ptr(), tramp, 12);
-        // The stub never returns to target+6 (it jump'd away); a return jump is
-        // unreachable but harmless, so none is emitted.
-    } else {
-        // Position-independent prologue (mov r10,rcx / jmp rel32 of the ntdll stub):
-        // copy verbatim and jump back. These contain no RIP-relative operand.
-        std::ptr::copy_nonoverlapping(target as *const u8, tramp, patch_len);
-        let back = (target + patch_len) as u64;
-        let mut jmp_back = [0u8; 12];
-        jmp_back[0] = 0x48;
-        jmp_back[1] = 0xB8;
-        jmp_back[2..10].copy_from_slice(&back.to_le_bytes());
-        jmp_back[10] = 0xFF;
-        jmp_back[11] = 0xE0;
-        std::ptr::copy_nonoverlapping(jmp_back.as_ptr(), tramp.add(patch_len), 12);
-    }
+    let n = write_trampoline(tramp, dest);
 
-    // Overwrite the target's prologue with a jump to our hook.
-    //
-    // The patch MUST NOT clobber a register: the displaced stub is called with the
-    // real arguments already in rcx/rdx/r8/r9, and `mov rax, hook; jmp rax` destroys
-    // rax. Using `FF 25 <disp32>` (jmp qword ptr [rip+disp32]) touches no register at
-    // all, which is exactly how the original API-set stub works. A 6-byte displacement
-    // covers the 6-byte stub case; for the longer prologues 8 bytes of code are
-    // needed, so a `jmp rel32` to a nearby stub is used instead.
+    // Overwrite the stub: jump through the pointer we place in its own padding.
+    let slot_addr = target + 8;
     let mut old = 0u32;
-    if VirtualProtect(target as *mut std::ffi::c_void, patch_len, PAGE_EXECUTE_READWRITE_INLINE, &mut old) == 0 {
+    if VirtualProtect(
+        target as *mut std::ffi::c_void,
+        PATCH_TOTAL,
+        PAGE_EXECUTE_READWRITE_INLINE,
+        &mut old,
+    ) == 0
+    {
         return 0;
     }
-    if patch_len == 6 {
-        // Reserve a pointer slot in the trampoline and jump through it.
-        // Layout: [6 or 12 bytes: original prologue] [8 bytes: hook address]
-        let hook_slot = tramp.add(patch_len + 12);
-        std::ptr::write_unaligned(hook_slot as *mut u64, hook as u64);
-        let disp = (hook_slot as isize) - ((target as isize) + 6);
-        let mut jmp = [0u8; 6];
-        jmp[0] = 0xFF;
-        jmp[1] = 0x25;
-        jmp[2..6].copy_from_slice(&(disp as i32).to_le_bytes());
-        std::ptr::copy_nonoverlapping(jmp.as_ptr(), target as *mut u8, 6);
-    } else {
-        let mut jmp = [0u8; 12];
-        jmp[0] = 0xFF;
-        jmp[1] = 0x25;
-        jmp[2] = 0x00;
-        jmp[3] = 0x00;
-        jmp[4] = 0x00;
-        jmp[5] = 0x00;
-        // For the 12-byte case the slot cannot be embedded in 6 bytes, so fall back to
-        // a register-free `push [rip]; ret` shape via the trampoline pointer slot.
-        let hook_slot = tramp.add(patch_len + 12);
-        std::ptr::write_unaligned(hook_slot as *mut u64, hook as u64);
-        let disp = (hook_slot as isize) - ((target as isize) + 6);
-        jmp[2..6].copy_from_slice(&(disp as i32).to_le_bytes());
-        // Pad the remaining bytes with int3 so a stray fall-through traps.
-        for b in jmp.iter_mut().skip(6) {
-            *b = 0xCC;
-        }
-        std::ptr::copy_nonoverlapping(jmp.as_ptr(), target as *mut u8, 12);
+    std::ptr::write_unaligned(slot_addr as *mut usize, hook);
+
+    let mut jmp = [0u8; PATCH_LEN];
+    jmp[0] = 0xFF;
+    jmp[1] = 0x25;
+    #[cfg(target_pointer_width = "64")]
+    {
+        // RIP-relative: the next instruction starts at target+6, the slot is at target+8.
+        let disp: i32 = 2;
+        jmp[2..6].copy_from_slice(&disp.to_le_bytes());
     }
+    #[cfg(target_pointer_width = "32")]
+    {
+        // Absolute: the operand is the address of the pointer itself.
+        jmp[2..6].copy_from_slice(&(slot_addr as u32).to_le_bytes());
+    }
+    std::ptr::copy_nonoverlapping(jmp.as_ptr(), target as *mut u8, PATCH_LEN);
+
     let mut rel = 0u32;
-    VirtualProtect(target as *mut std::ffi::c_void, patch_len, old.max(PAGE_EXECUTE_READ_INLINE), &mut rel);
-    FlushInstructionCache(GetCurrentProcess(), target as *const std::ffi::c_void, patch_len);
+    VirtualProtect(
+        target as *mut std::ffi::c_void,
+        PATCH_TOTAL,
+        old.max(PAGE_EXECUTE_READ_INLINE),
+        &mut rel,
+    );
+    FlushInstructionCache(GetCurrentProcess(), target as *const std::ffi::c_void, PATCH_TOTAL);
 
     slot.target.store(target, Ordering::Relaxed);
     slot.trampoline.store(tramp as usize, Ordering::Relaxed);
+    dbg_note(&format!(
+        "inline: patch {target:#x} -> hook {hook:#x}, 原目标 {dest:#x}, trampoline {:#x} ({n} 字节)",
+        tramp as usize
+    ));
     tramp as usize
 }
 
+/// Install the entry-point patches.
+///
+/// `silent_ok` is false for the first attempt (its refusal is worth a log line) and
+/// true for the periodic retries, which would otherwise spam the log with the same
+/// rejection every 3 seconds.
 unsafe fn patch_all() {
     let targets: [(usize, usize); 9] = [
         (ORIG_CREATEFILEW.load(Ordering::Relaxed), hook_CreateFileW as usize),
@@ -1270,45 +1503,71 @@ unsafe fn worker() {
     std::thread::spawn(|| unsafe { pipe_connect_loop() });
     patch_all();
     dbg_note("patched");
-    // Byte-level patches are OPT-IN (create %TEMP%\um_hook_inline). They close the gap
-    // for callers that cache API pointers (.NET P/Invoke), but displacing live kernel32
-    // stubs is invasive: a mistake in the trampoline crashes the host process. Until the
-    // trampoline is verified against every stub shape on a test machine, IAT hooking is
-    // the default and this stays behind a marker file.
-    if std::env::temp_dir().join("um_hook_inline").exists() {
-        let t1 = patch_entry(
-            ORIG_CREATEFILEW.load(Ordering::Relaxed),
-            hook_CreateFileW as usize,
-            &INLINE_CREATEFILEW,
-        );
-        let t2 = patch_entry(
-            ORIG_READFILE.load(Ordering::Relaxed),
-            hook_ReadFile as usize,
-            &INLINE_READFILE,
-        );
-        let t3 = patch_entry(
-            ORIG_WRITEFILE.load(Ordering::Relaxed),
-            hook_WriteFile as usize,
-            &INLINE_WRITEFILE,
-        );
-        dbg_note(&format!(
-            "inline: CreateFileW tramp={:#x} ReadFile tramp={:#x} WriteFile tramp={:#x}",
-            t1, t2, t3
-        ));
-        // Verify the patch really landed: the target's first bytes must now be our
-        // jump (`48 B8 <hook>`), otherwise the write silently did not take effect.
-        let p = ORIG_CREATEFILEW.load(Ordering::Relaxed) as *const u8;
-        if t1 != 0 {
-            let b = unsafe { std::slice::from_raw_parts(p, 12) };
-            dbg_note(&format!("inline: CreateFileW 现字节 = {:02X?}", b));
-        }
-    }
+    patch_entries();
     // Re-patch every 3 s: modules loaded after injection have untouched IATs.
     std::thread::spawn(|| loop {
         std::thread::sleep(std::time::Duration::from_millis(3000));
         unsafe { patch_all() };
     });
     dbg_note("worker ready");
+}
+
+/// Install the entry-point patches on the four file APIs that decide whether a
+/// serial operation is visible at all.
+///
+/// THIS IS NOT OPTIONAL ANY MORE. It used to sit behind a `%TEMP%\um_hook_inline`
+/// marker file, and the result was the failure the user reported: injection reported
+/// success, the hook logged "patched"/"worker ready", and nothing was ever captured,
+/// because IAT hooking alone cannot see a tool that cached its kernel32 pointers
+/// before injection. UartAssist (UPX-packed, binds everything through GetProcAddress
+/// at runtime) imports none of these functions, so without entry patches there is
+/// literally nothing to redirect.
+///
+/// The patch is safe by construction: it only displaces the 6-byte `FF 25` forwarder
+/// stub when the following bytes are int3 padding, it preserves the real destination
+/// in a trampoline, and it does not touch a single register — so the target's calls
+/// keep working with identical semantics whether or not capture is happening.
+unsafe fn patch_entries() {
+    let sites: [(&str, &AtomicUsize, usize, &PatchSlot); 6] = [
+        (
+            "CreateFileW",
+            &ORIG_CREATEFILEW,
+            hook_CreateFileW as usize,
+            &INLINE_CREATEFILEW,
+        ),
+        (
+            "CreateFileA",
+            &ORIG_CREATEFILEA,
+            hook_CreateFileA as usize,
+            &INLINE_CREATEFILEA,
+        ),
+        ("ReadFile", &ORIG_READFILE, hook_ReadFile as usize, &INLINE_READFILE),
+        ("WriteFile", &ORIG_WRITEFILE, hook_WriteFile as usize, &INLINE_WRITEFILE),
+        // Qt's QSerialPort and several industrial C++ libraries use the asynchronous
+        // pair; a tool that caches these pointers before injection is exactly the case
+        // entry patching exists for.
+        ("ReadFileEx", &ORIG_READFILEEX, hook_ReadFileEx as usize, &INLINE_READFILEEX),
+        (
+            "WriteFileEx",
+            &ORIG_WRITEFILEEX,
+            hook_WriteFileEx as usize,
+            &INLINE_WRITEFILEEX,
+        ),
+    ];
+    for (name, orig, hook, slot) in sites {
+        let target = orig.load(Ordering::Relaxed);
+        let tramp = patch_entry(target, hook, slot);
+        if tramp != 0 {
+            // Prove the patch landed: the entry point must now begin with our jump.
+            let now = std::slice::from_raw_parts(target as *const u8, PATCH_LEN);
+            dbg_note(&format!(
+                "inline {name}: trampoline={tramp:#x} 现指令={:02X?}",
+                now
+            ));
+        } else {
+            dbg_note(&format!("inline {name}: 未安装（形态不受支持），仅靠 IAT 挂钩"));
+        }
+    }
 }
 
 #[no_mangle]

@@ -479,13 +479,29 @@ impl DriverHandle {
         }
     }
 
-    /// Ask the driver to attach to every serial device it can find.
+    /// Ask the driver to attach to every serial device it can find, and return how
+    /// many ports are attached in TOTAL.
+    ///
+    /// The driver's IOCTL returns how many it attached *during this call*, which is 0
+    /// on every scan after the first — the ports are already attached, so nothing new
+    /// happens. Every caller here wants "how many ports do I have", and treating the
+    /// delta as a total made the program report "附加到 0 个串口设备" while it was in
+    /// fact attached to all four and capturing perfectly.
+    ///
+    /// The total is read from the stats block, where the driver maintains it as a
+    /// running count.
     pub fn attach_ports(&self) -> u32 {
-        match self.ioctl(IOCTL_ATTACH_PORTS, None, 4) {
+        let newly = match self.ioctl(IOCTL_ATTACH_PORTS, None, 4) {
             Some((out, _)) if out.len() >= 4 => {
                 u32::from_le_bytes([out[0], out[1], out[2], out[3]])
             }
             _ => 0,
+        };
+        // Prefer the authoritative total; fall back to the delta only if stats are
+        // unavailable (an older driver without IOCTL_UM_GET_STATS).
+        match self.stats() {
+            Some(st) => st.attached,
+            None => newly,
         }
     }
 
