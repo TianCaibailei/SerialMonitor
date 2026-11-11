@@ -898,13 +898,16 @@ impl MonitorApp {
                 ui.menu_button("文件", |ui| {
                     if ui.button("新建监控会话…").clicked() {
                         self.dlg_new = true;
+                        ui.close_menu();
                     }
                     if ui.button("保存当前会话").clicked() {
                         self.save_active();
+                        ui.close_menu();
                     }
                     ui.separator();
                     if ui.button("退出").clicked() {
                         std::process::exit(0);
+                        ui.close_menu();
                     }
                 });
                 let has = !self.sessions.is_empty();
@@ -913,24 +916,29 @@ impl MonitorApp {
                         if let Some(s) = self.sessions.get_mut(self.active) {
                             s.running = true;
                         }
+                        ui.close_menu();
                     }
                     if ui.add_enabled(has, egui::Button::new("暂停监控")).clicked() {
                         if let Some(s) = self.sessions.get_mut(self.active) {
                             s.running = false;
                         }
+                        ui.close_menu();
                     }
                     if ui.add_enabled(has, egui::Button::new("关闭会话")).clicked() {
                         self.close_active();
+                        ui.close_menu();
                     }
                     ui.separator();
                     if ui.button("过滤设置…").clicked() {
                         self.dlg_filter = true;
+                        ui.close_menu();
                     }
                     ui.separator();
                     if ui.button("附加到进程(拦截)…").clicked() {
                         self.procs = inject::list_processes();
                         self.attach_sel = None;
                         self.dlg_attach = true;
+                        ui.close_menu();
                     }
                     ui.separator();
                     // Kernel-driver capture: the reliable path — no injection race, and
@@ -940,6 +948,7 @@ impl MonitorApp {
                             self.stop_driver_capture();
                             self.drv_note = "驱动捕获已停止".into();
                             self.toast("已停止驱动捕获");
+                        ui.close_menu();
                         }
                         ui.label("  驱动捕获运行中");
                     } else if ui.button("启用驱动捕获(推荐)").clicked() {
@@ -949,36 +958,44 @@ impl MonitorApp {
                             // 失败时把完整指引塞进对话框，状态栏只放一句摘要。
                             self.dlg_drv = true;
                             self.toast("驱动不可用，已打开设置对话框查看原因");
+                        ui.close_menu();
                         }
                     }
                     if ui.button("驱动捕获设置…").clicked() {
                         self.dlg_drv = true;
                         self.probe_driver_availability(true);
+                        ui.close_menu();
                     }
                 });
                 ui.menu_button("编辑", |ui| {
                     if ui.add_enabled(has, egui::Button::new("复制")).clicked() {
                         self.copy_selected(ctx);
+                        ui.close_menu();
                     }
                     if ui.button("查找…").clicked() {
                         self.dlg_find = true;
+                        ui.close_menu();
                     }
                     if ui.add_enabled(has, egui::Button::new("查找下一个")).clicked() {
                         self.find_next();
+                        ui.close_menu();
                     }
                     ui.separator();
                     if ui.add_enabled(has, egui::Button::new("清空数据")).clicked() {
                         if let Some(s) = self.sessions.get_mut(self.active) {
                             s.clear();
                         }
+                        ui.close_menu();
                     }
                 });
                 ui.menu_button("设置", |ui| {
                     if ui.button("自动保存日志设置…").clicked() {
                         self.dlg_redir = true;
+                        ui.close_menu();
                     }
                     if ui.button("显示设置…").clicked() {
                         self.dlg_prefs = true;
+                        ui.close_menu();
                     }
                     ui.separator();
                     ui.menu_button("编码方式", |ui| {
@@ -992,6 +1009,7 @@ impl MonitorApp {
                 ui.menu_button("帮助", |ui| {
                     if ui.button("关于…").clicked() {
                         self.dlg_about = true;
+                        ui.close_menu();
                     }
                 });
                 // session tabs
@@ -1014,6 +1032,7 @@ impl MonitorApp {
                 }
                 if ui.button("＋ 新建").clicked() {
                     self.dlg_new = true;
+                        ui.close_menu();
                 }
                 if let Some(i) = click_tab {
                     self.active = i;
@@ -1117,6 +1136,7 @@ impl MonitorApp {
                 ui.add_space(12.0);
                 if ui.button(RichText::new("新建监控会话…").size(18.0)).clicked() {
                     self.dlg_new = true;
+                        ui.close_menu();
                 }
             });
             return;
@@ -1565,13 +1585,16 @@ impl MonitorApp {
                     None => s.notices.push("HEX格式错误".into()),
                 }
                 let _ = resp;
+                        ui.close_menu();
             }
             ui.separator();
             if ui.button("请求预设").clicked() {
                 s.preset_req = true;
+                        ui.close_menu();
             }
             if ui.button("响应预设").clicked() {
                 s.preset_req = false;
+                        ui.close_menu();
             }
             let list = if s.preset_req { REQUEST_PRESETS } else { RESPONSE_PRESETS };
             if s.preset_sel >= list.len() {
@@ -1605,10 +1628,12 @@ impl MonitorApp {
                     Ok(()) => {}
                     Err(e) => s.notices.push(format!("发送失败: {}", e)),
                 }
+                        ui.close_menu();
             }
             ui.separator();
             if ui.button("清空数据").clicked() {
                 s.clear();
+                        ui.close_menu();
             }
             ui.checkbox(&mut s.auto_scroll, "滚屏显示");
         });
@@ -1653,12 +1678,15 @@ impl MonitorApp {
                     ui.horizontal(|ui| {
                         if ui.button("查找").clicked() {
                             self.find_next();
+                        ui.close_menu();
                         }
                         if ui.button("查找下一个").clicked() {
                             self.find_next();
+                        ui.close_menu();
                         }
                         if ui.button("关闭").clicked() {
                             self.dlg_find = false;
+                        ui.close_menu();
                         }
                     });
                 });
@@ -1719,6 +1747,7 @@ impl MonitorApp {
             }
             if ui.button("重新检测").clicked() {
                 self.probe_driver_availability(true);
+                        ui.close_menu();
             }
         });
         ui.label(
@@ -1820,6 +1849,7 @@ impl MonitorApp {
             if ui.button("复制安装命令").clicked() {
                 let cmd = "sc create UmSerialFilter type= kernel binPath= <umserialfilter.sys 完整路径>\r\nsc start UmSerialFilter\r\nsc query UmSerialFilter";
                 ui.output_mut(|o| o.copied_text = cmd.to_string());
+                        ui.close_menu();
             }
             ui.add_space(4.0);
             ui.label(
@@ -1843,6 +1873,7 @@ impl MonitorApp {
             );
             if ui.button("重新扫描端口").clicked() {
                 self.rescan_driver_ports();
+                        ui.close_menu();
             }
         });
         if self.drv_names.is_empty() {
@@ -1895,10 +1926,12 @@ impl MonitorApp {
             if ui.button("应用").clicked() {
                 let pid: u32 = self.drv_pid_text.trim().parse().unwrap_or(0);
                 self.apply_driver_pid(pid);
+                        ui.close_menu();
             }
             if ui.button("所有进程").clicked() {
                 self.drv_pid_text = "0".into();
                 self.apply_driver_pid(0);
+                        ui.close_menu();
             }
             let cur = self.drv_pid.unwrap_or(0);
             ui.label(
@@ -1925,6 +1958,7 @@ impl MonitorApp {
                     self.stop_driver_capture();
                     self.drv_note = "驱动捕获已停止".into();
                     self.toast("已停止驱动捕获");
+                        ui.close_menu();
                 }
             } else if ui
                 .add_enabled(self.drv_avail, egui::Button::new("开始捕获"))
@@ -1940,6 +1974,7 @@ impl MonitorApp {
             }
             if ui.button("关闭").clicked() {
                 self.dlg_drv = false;
+                        ui.close_menu();
             }
         });
         // 驱动不可用时上面已经完整显示过 open_failure_hint，底部不再重复一遍；
@@ -1949,6 +1984,11 @@ impl MonitorApp {
             ScrollArea::vertical().id_source("drv_note").max_height(90.0).show(ui, |ui| {
                 ui.label(RichText::new(&self.drv_note).small());
             });
+        }
+        ui.separator();
+        if ui.button("关闭").clicked() {
+            self.dlg_drv = false;
+                        ui.close_menu();
         }
     }
 
@@ -2033,12 +2073,14 @@ impl MonitorApp {
             }
             if ui.button("清空").clicked() {
                 self.attach_filter.clear();
+                        ui.close_menu();
             }
             ui.checkbox(&mut self.attach_only_apps, "只看应用进程");
             if ui.button("刷新").clicked() {
                 self.procs = inject::list_processes();
                 self.holders_at = 0;
                 self.attach_sel = None;
+                        ui.close_menu();
             }
         });
 
@@ -2133,6 +2175,7 @@ impl MonitorApp {
             }
             if ui.button("关闭").clicked() {
                 self.dlg_attach = false;
+                        ui.close_menu();
             }
         });
         ui.add_space(2.0);
@@ -2145,6 +2188,11 @@ impl MonitorApp {
             .weak()
             .small(),
         );
+        ui.separator();
+        if ui.button("关闭").clicked() {
+            self.dlg_attach = false;
+                        ui.close_menu();
+        }
     }
 
     /// Inject the hook into the selected process and report the outcome.
@@ -2390,11 +2438,18 @@ impl MonitorApp {
         ui.horizontal(|ui| {
             if ui.button("确定").clicked() {
                 self.new_session();
+                        ui.close_menu();
             }
             if ui.button("取消").clicked() {
                 self.dlg_new = false;
+                        ui.close_menu();
             }
         });
+        ui.separator();
+        if ui.button("关闭").clicked() {
+            self.dlg_new = false;
+                        ui.close_menu();
+        }
     }
 
     fn dlg_filter_ui(&mut self, ui: &mut Ui) {
@@ -2421,16 +2476,20 @@ impl MonitorApp {
         ui.horizontal(|ui| {
             if ui.button("全选").clicked() {
                 self.fcs_sel.iter_mut().for_each(|v| *v = true);
+                        ui.close_menu();
             }
             if ui.button("反选").clicked() {
                 self.fcs_sel.iter_mut().for_each(|v| *v = !*v);
+                        ui.close_menu();
             }
             if ui.button("取消选择").clicked() {
                 self.fcs_sel.iter_mut().for_each(|v| *v = false);
+                        ui.close_menu();
             }
             if ui.button("默认设置").clicked() {
                 self.fcs_sel.iter_mut().for_each(|v| *v = false);
                 self.fdir = 0;
+                        ui.close_menu();
             }
         });
         ui.separator();
@@ -2451,11 +2510,18 @@ impl MonitorApp {
                     };
                 }
                 self.dlg_filter = false;
+                        ui.close_menu();
             }
             if ui.button("关闭").clicked() {
                 self.dlg_filter = false;
+                        ui.close_menu();
             }
         });
+        ui.separator();
+        if ui.button("关闭").clicked() {
+            self.dlg_filter = false;
+                        ui.close_menu();
+        }
     }
 
     fn dlg_redir_ui(&mut self, ui: &mut Ui) {
@@ -2510,11 +2576,18 @@ impl MonitorApp {
                     }
                 }
                 self.dlg_redir = false;
+                        ui.close_menu();
             }
             if ui.button("取消").clicked() {
                 self.dlg_redir = false;
+                        ui.close_menu();
             }
         });
+        ui.separator();
+        if ui.button("关闭").clicked() {
+            self.dlg_redir = false;
+                        ui.close_menu();
+        }
     }
 
     fn dlg_prefs_ui(&mut self, ui: &mut Ui) {
@@ -2553,11 +2626,18 @@ impl MonitorApp {
                     s.auto_scroll = self.p_scroll;
                 }
                 self.dlg_prefs = false;
+                        ui.close_menu();
             }
             if ui.button("取消").clicked() {
                 self.dlg_prefs = false;
+                        ui.close_menu();
             }
         });
+        ui.separator();
+        if ui.button("关闭").clicked() {
+            self.dlg_prefs = false;
+                        ui.close_menu();
+        }
     }
     /// True while any session is actively collecting. A passive (串口监听) channel
     /// counts as live even when idle, because a row can arrive at any moment.

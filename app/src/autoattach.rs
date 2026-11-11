@@ -830,9 +830,10 @@ impl AutoAttach {
                             fresh.push((*pid, name.clone()));
                         }
                     }
-                    if ticks % 10 == 1 || !fresh.is_empty() {
-                        // Log a compact summary: dumping every process name made the
-                        // result JSON unwieldy and hard to read.
+                    // Only log when there is something new to act on. Logging every 10th tick
+                    // flooded the status bar with constantly-changing counters that told the
+                    // user nothing; a real attach event is what matters.
+                    if !fresh.is_empty() {
                         let names: Vec<String> = fresh
                             .iter()
                             .take(6)
