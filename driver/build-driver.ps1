@@ -86,6 +86,9 @@ foreach ($target in $targets) {
         $machine = 'X86'
     }
 
+    # Emit BOTH the per-arch name and the canonical name for the primary (x64) target:
+    # setup-driver.ps1 loads umserialfilter.sys, and a mismatch here silently deployed a stale
+    # driver — the symptom was a driver that ran but refused every IOCTL.
     $outName = "${baseName}_$target.sys"
     $objName = "$baseName.obj"
 
@@ -139,6 +142,18 @@ foreach ($target in $targets) {
         $size = (Get-Item $outFull).Length
         Write-Output ("  PASS {0} ({1:N0} 字节)" -f $outName, $size)
         $results += [pscustomobject]@{ Arch = $target; File = $outName; Bytes = $size; Ok = $true }
+        # x64 is the canonical build: copy it to the name the installer expects.
+        if ($target -eq 'x64') {
+            $canonical = Join-Path $workDir "$baseName.sys"
+            try {
+                Copy-Item $outFull $canonical -Force -ErrorAction Stop
+                Write-Output "      已同步为 $baseName.sys"
+            } catch {
+                Write-Output "      警告: 无法覆盖 $baseName.sys"
+                Write-Output "        （$($_.Exception.Message)）"
+                Write-Output "        文件可能被已加载的驱动占用 —— 先 sc stop UmSerialFilter"
+            }
+        }
     } else {
         Write-Output "  FAIL $target (退出码 $rc)"
         $results += [pscustomobject]@{ Arch = $target; File = '-'; Bytes = 0; Ok = $false }
