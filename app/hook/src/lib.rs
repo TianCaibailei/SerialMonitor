@@ -417,7 +417,12 @@ fn dbg_note(msg: &str) {
     }
     let create = orig_call_addr(&INLINE_CREATEFILEW, &ORIG_CREATEFILEW);
     let write = orig_call_addr(&INLINE_WRITEFILE, &ORIG_WRITEFILE);
-    let close = ORIG_CLOSEHANDLE.load(Ordering::Relaxed);
+    // Trampoline, not ORIG_CLOSEHANDLE: CloseHandle is entry-patched (see
+    // INLINE_CLOSEHANDLE), so the raw pointer now holds our own jump. Calling it would
+    // re-enter hook_CloseHandle from inside every diagnostic write — and, worse, would
+    // run the hook's map removal while a caller may still be reasoning about that
+    // handle. Always go through the trampoline for a function we have patched.
+    let close = orig_call_addr(&INLINE_CLOSEHANDLE, &ORIG_CLOSEHANDLE);
     if create == 0 || write == 0 || close == 0 {
         return;
     }
@@ -520,11 +525,13 @@ fn send_io(tag: u32, handle: usize, data: &[u8]) {
     send_record(tag, &p);
 }
 
+/// FILE_TYPE_DISK — the classification that keeps ordinary files out of capture.
+const FILE_TYPE_DISK: u32 = 0x0001;
+
 /// Look up (and register) the port label for a handle.
 ///
 /// Two ways a serial handle becomes known:
-///  1. CreateFileW/A was called *after* injection — the path is right there, and the
-///     hooks record it directly.
+///  1. CreateFileW/A was called *after* injection — the path is right there.
 ///  2. The handle was opened BEFORE injection — the common case for a tool the user
 ///     attached to, and the only case that ever needed discovery.
 ///
@@ -538,14 +545,16 @@ fn send_io(tag: u32, handle: usize, data: &[u8]) {
 ///
 /// So case 2 could never be identified, and because the failure path deliberately
 /// does not write the negative cache (a transient failure must not blacklist a
-/// handle), every single I/O re-probed, re-failed, and discarded the bytes. The
-/// visible symptom is exactly the reported one: the process is injected, its writes
-/// are going through our WriteFile hook, and the monitor shows nothing.
+/// handle), every single I/O re-probed, re-failed, and discarded the bytes.
 ///
-/// The fix is to identify the port the way a serial API does: query a serial-only
-/// IOCTL. Only a real serial device answers IOCTL_SERIAL_GET_COMMSTATUS, which makes
-/// it a positive, unambiguous test — no name parsing, no false positives on console
+/// The fix identifies the port the way a serial API does: query a serial-only IOCTL.
+/// Only a real serial device answers IOCTL_SERIAL_GET_COMMSTATUS, which makes it a
+/// positive, unambiguous test — no name parsing, no false positives on console
 /// handles (which are also FILE_TYPE_CHAR).
+///
+/// A handle that has been CLOSED is a different matter and is handled separately:
+/// Windows reuses handle values, so a stale "this is COM6" entry would mislabel an
+/// unrelated file that happens to get the same number. See reuse_guard below.
 unsafe fn com_label(h: *mut std::ffi::c_void) -> Option<String> {
     if h.is_null() || h as isize == INVALID_HANDLE {
         return None;
@@ -588,6 +597,10 @@ extern "system" {
     /// DOS device name of a COM port, e.g. `\\.\COM6` -> `\Device\VSerial8_2`.
     /// This only reads the device map; it does NOT open the port.
     fn QueryDosDeviceW(name: *const u16, target: *mut u16, max: u32) -> u32;
+    /// Cheap handle classification: FILE_TYPE_DISK(1), FILE_TYPE_CHAR(2),
+    /// FILE_TYPE_PIPE(3). Costs a syscall, so it is only consulted for handles the
+    /// probe is about to test anyway.
+    fn GetFileType(h: *mut std::ffi::c_void) -> u32;
     fn NtQueryObject(
         h: *mut std::ffi::c_void,
         class: u32,
@@ -607,6 +620,12 @@ extern "system" {
 /// The label has to be "COM6" (not "\Device\VSerial8_2") because that is what the
 /// session's channel is named, and routing matches on it.
 unsafe fn probe_serial_port(h: *mut std::ffi::c_void) -> Option<String> {
+    // Cheap pre-filter first: a disk file can never be a serial port, and this saves
+    // the IOCTL on the (very common) case of a program reading its own log or config.
+    // MEASURED: serial = FILE_TYPE_CHAR(2), disk file = FILE_TYPE_DISK(1).
+    if GetFileType(h) == FILE_TYPE_DISK {
+        return None;
+    }
     let mut status = [0u8; 32];
     let mut ret = 0u32;
     let ok = DeviceIoControl(
@@ -1016,12 +1035,16 @@ unsafe extern "system" fn hook_WriteFileEx(
 }
 
 unsafe extern "system" fn hook_CloseHandle(h: *mut std::ffi::c_void) -> i32 {
-    let was_serial = matches!(handles_lock().remove(&(h as usize)), Some(Some(_)));
-    if was_serial {
+    // Remove the handle from BOTH caches before it is released, so its number can be
+    // reused by an unrelated file without inheriting the serial label.
+    let had = handles_lock().remove(&(h as usize));
+    if matches!(had, Some(Some(_))) {
         send_close(h as usize);
     }
     pending_lock().retain(|_, v| v.0 != h as usize);
-    let f: CloseHandleFn = std::mem::transmute(ORIG_CLOSEHANDLE.load(Ordering::Relaxed));
+    // Trampoline, not the raw pointer: CloseHandle is entry-patched too, so calling
+    // ORIG_CLOSEHANDLE directly would re-enter this hook forever.
+    let f: CloseHandleFn = std::mem::transmute(orig_call_addr(&INLINE_CLOSEHANDLE, &ORIG_CLOSEHANDLE));
     f(h)
 }
 
@@ -1211,6 +1234,20 @@ static INLINE_WRITEFILE: PatchSlot =
 static INLINE_READFILEEX: PatchSlot =
     PatchSlot { target: AtomicUsize::new(0), trampoline: AtomicUsize::new(0) };
 static INLINE_WRITEFILEEX: PatchSlot =
+    PatchSlot { target: AtomicUsize::new(0), trampoline: AtomicUsize::new(0) };
+/// CloseHandle MUST be entry-patched, not merely IAT-hooked.
+///
+/// A target that binds its imports at run time (UartAssist: UPX-packed, its
+/// KERNEL32 import table holds only LoadLibraryA/ExitProcess/GetProcAddress/
+/// VirtualProtect) never goes through any IAT slot, so the IAT hook for CloseHandle
+/// never fires. The consequence is not a missed log line: the handle→port entry is
+/// never removed from HANDLES, and because Windows reuses handle VALUES, a later file
+/// opened at the same number inherits the stale "COM6" label. Its bytes are then
+/// reported as serial traffic on that port.
+///
+/// That is exactly the reported symptom: closing the program produced one spurious
+/// read whose content was the program's own log file.
+static INLINE_CLOSEHANDLE: PatchSlot =
     PatchSlot { target: AtomicUsize::new(0), trampoline: AtomicUsize::new(0) };
 
 extern "system" {
@@ -1528,7 +1565,7 @@ unsafe fn worker() {
 /// in a trampoline, and it does not touch a single register — so the target's calls
 /// keep working with identical semantics whether or not capture is happening.
 unsafe fn patch_entries() {
-    let sites: [(&str, &AtomicUsize, usize, &PatchSlot); 6] = [
+    let sites: [(&str, &AtomicUsize, usize, &PatchSlot); 7] = [
         (
             "CreateFileW",
             &ORIG_CREATEFILEW,
@@ -1552,6 +1589,14 @@ unsafe fn patch_entries() {
             &ORIG_WRITEFILEEX,
             hook_WriteFileEx as usize,
             &INLINE_WRITEFILEEX,
+        ),
+        // See INLINE_CLOSEHANDLE: without this, closed serial handles stay in the map
+        // and a reused handle number makes an unrelated file look like port traffic.
+        (
+            "CloseHandle",
+            &ORIG_CLOSEHANDLE,
+            hook_CloseHandle as usize,
+            &INLINE_CLOSEHANDLE,
         ),
     ];
     for (name, orig, hook, slot) in sites {

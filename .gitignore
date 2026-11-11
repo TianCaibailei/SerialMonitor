@@ -24,3 +24,6 @@ usage.json
 *.log
 *.tmp
 .um_hook_debug
+
+# Alternate cargo target dir used when the deployed DLLs are locked by live processes
+app/target-build/
