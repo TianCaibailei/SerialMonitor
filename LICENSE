@@ -1,0 +1,45 @@
+MIT License
+
+Copyright (c) 2026 MonitorAnything contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---
+
+## Scope and compliance notes
+
+This project is a **clean-room reimplementation of observable behaviour**, written to
+interoperate with standard serial / Modbus devices. It is not affiliated with, endorsed
+by, or derived from the source code of any commercial serial-monitor product.
+
+* No code, icons, strings or other assets were copied from third-party software.
+* Protocol behaviour (Modbus RTU/ASCII/TCP) follows the public Modbus specification.
+* The UI layout was studied from publicly observable behaviour for interoperability and
+  usability parity; all implementation is original.
+
+Names of third-party products are used only for factual reference (e.g. describing a
+file format they produce) and remain the trademarks of their respective owners.
+
+If you intend to redistribute a **built binary** that includes the kernel driver, your
+own code-signing certificate is required; the test certificate used locally must not be
+shipped (see `.gitignore` and `docs/签名与认证方案.md`).
+
+## Security
+
+See `SECURITY.md` for how to report a vulnerability.

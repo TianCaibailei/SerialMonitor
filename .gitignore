@@ -14,6 +14,28 @@ app/target/
 *.tlog
 *.idb
 
+# Compiled drivers — build artefacts, not sources. Rebuild with driver/build-driver.ps1.
+*.sys
+
+# Signing material — NEVER versioned.
+#
+# `umfilter-test.pfx` is a self-signed test certificate *including its private key*.
+# Committing it hands every clone the ability to sign a kernel driver in this project's
+# name. Both the key and its public certificate stay out of the repository; regenerate
+# locally with:
+#     New-SelfSignedCertificate -Type CodeSigningCert -Subject "CN=umfilter-test" `
+#         -CertStoreLocation Cert:\CurrentUser\My
+#     Export-PfxCertificate -Cert <thumbprint> -FilePath driver\umfilter-test.pfx `
+#         -Password (Read-Host -AsSecureString)
+*.pfx
+*.pvk
+*.key
+*.snk
+
+# A published certificate (.cer) is not itself a secret, but it is generated alongside
+# the key and must not outlive it in the history — keep it local too.
+driver/umfilter-test.cer
+
 # Craft Anything session / run artefacts
 agent-session.jsonl
 build-activity.log
@@ -22,6 +44,7 @@ usage.json
 
 # Local scratch
 *.log
+*.umses
 *.tmp
 .um_hook_debug
 
