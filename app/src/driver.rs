@@ -95,7 +95,11 @@ impl DriverStats {
     pub fn summary(&self) -> String {
         format!(
             "{} · 已附加 {} 个端口 · 队列 {} 条 · 丢弃 {} 条 · 收 {} / 发 {} 字节 · 目标 PID {}",
-            if self.enabled != 0 { "采集已启用" } else { "采集已停用" },
+            if self.enabled != 0 {
+                "采集已启用"
+            } else {
+                "采集已停用"
+            },
             self.attached,
             self.records,
             self.dropped,
@@ -164,8 +168,11 @@ impl ControlInfo {
             }
             TO_SET | TO_GET => format!(
                 "超时 {}/{}/{}/{}/{}",
-                self.timeouts[0], self.timeouts[1], self.timeouts[2],
-                self.timeouts[3], self.timeouts[4]
+                self.timeouts[0],
+                self.timeouts[1],
+                self.timeouts[2],
+                self.timeouts[3],
+                self.timeouts[4]
             ),
             HF_SET | HF_GET => format!("流控 0x{:X}", self.hand_flow),
             other => format!("串口参数 0x{other:08X}"),
@@ -334,9 +341,7 @@ fn read_session_key() -> Option<Vec<u8>> {
 
     let sub = wide("Software\\UmSerialFilter");
     let mut hkey: *mut c_void = std::ptr::null_mut();
-    let rc = unsafe {
-        RegOpenKeyExW(HKEY_LOCAL_MACHINE, sub.as_ptr(), 0, KEY_READ, &mut hkey)
-    };
+    let rc = unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, sub.as_ptr(), 0, KEY_READ, &mut hkey) };
     if rc != 0 || hkey.is_null() {
         return None;
     }
@@ -592,7 +597,9 @@ impl DriverHandle {
         ts.copy_from_slice(&buf[24..32]);
         let handle = u64::from_le_bytes(handle);
         let timestamp = u64::from_le_bytes(ts);
-        let take = size.min(MAX_PAYLOAD).min(buf.len().saturating_sub(RECORD_HEADER));
+        let take = size
+            .min(MAX_PAYLOAD)
+            .min(buf.len().saturating_sub(RECORD_HEADER));
         let payload = &buf[RECORD_HEADER..RECORD_HEADER + take];
 
         // Direction 2 is a serial parameter change, not captured bytes. It travels in the
@@ -602,9 +609,7 @@ impl DriverHandle {
             let mut info = ControlInfo::default();
             if payload.len() >= CTRL_SIZE {
                 let u = |o: usize| {
-                    u32::from_le_bytes([
-                        payload[o], payload[o + 1], payload[o + 2], payload[o + 3],
-                    ])
+                    u32::from_le_bytes([payload[o], payload[o + 1], payload[o + 2], payload[o + 3]])
                 };
                 info.ioctl_code = u(0);
                 info.baud_rate = u(4);
@@ -676,7 +681,9 @@ pub fn open_failure_hint(err: u32) -> String {
         }
     }
     s.push_str("手动加载驱动（管理员命令行）：\n");
-    s.push_str("    sc create UmSerialFilter type= kernel binPath= <umserialfilter.sys 的完整路径>\n");
+    s.push_str(
+        "    sc create UmSerialFilter type= kernel binPath= <umserialfilter.sys 的完整路径>\n",
+    );
     s.push_str("    sc start UmSerialFilter\n");
     s.push_str("    sc query UmSerialFilter            (确认 STATE = RUNNING)\n");
     s.push_str("也可以直接运行 driver\\install-driver.ps1。");

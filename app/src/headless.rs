@@ -30,7 +30,13 @@ pub fn headless_watch(port: &str, result_path: &str) -> i32 {
         format!("监听 {port}"),
         chans,
         ProtoType::None,
-        ViewToggles { table: true, terminal: true, dump: true, line: true, modbus: true },
+        ViewToggles {
+            table: true,
+            terminal: true,
+            dump: true,
+            line: true,
+            modbus: true,
+        },
     );
     session.running = true;
 
@@ -53,7 +59,11 @@ pub fn headless_watch(port: &str, result_path: &str) -> i32 {
                     let short = exe.rsplit(['\\', '/']).next().unwrap_or("").to_string();
                     attached.push(format!("{short} (PID {pid})"));
                 }
-                CapMsg::Open { pid, handle, port: p } => {
+                CapMsg::Open {
+                    pid,
+                    handle,
+                    port: p,
+                } => {
                     hook_ports.insert((pid, handle), p);
                 }
                 CapMsg::Close { pid, handle } => {
@@ -98,7 +108,11 @@ pub fn headless_watch(port: &str, result_path: &str) -> i32 {
             std::thread::sleep(Duration::from_millis(500));
             while let Ok(msg) = rx.try_recv() {
                 match msg {
-                    CapMsg::Open { pid, handle, port: p } => {
+                    CapMsg::Open {
+                        pid,
+                        handle,
+                        port: p,
+                    } => {
                         hook_ports.insert((pid, handle), p);
                     }
                     CapMsg::Rx { pid, handle, data } => {
@@ -159,7 +173,10 @@ pub fn headless_watch(port: &str, result_path: &str) -> i32 {
         eprintln!("写结果失败: {e}");
         return 1;
     }
-    println!("headless-watch: rows={rows} tx={tx} rx={rxc} attached=[{}]", attached.join(", "));
+    println!(
+        "headless-watch: rows={rows} tx={tx} rx={rxc} attached=[{}]",
+        attached.join(", ")
+    );
     if rows > 0 {
         0
     } else {

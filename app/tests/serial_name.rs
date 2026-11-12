@@ -21,7 +21,8 @@ extern "system" {
         flags: u32,
         tmpl: *mut c_void,
     ) -> *mut c_void;
-    fn GetFileInformationByHandleEx(h: *mut c_void, class: u32, buf: *mut c_void, size: u32) -> i32;
+    fn GetFileInformationByHandleEx(h: *mut c_void, class: u32, buf: *mut c_void, size: u32)
+        -> i32;
     fn GetFileType(h: *mut c_void) -> u32;
     fn DeviceIoControl(
         h: *mut c_void,
@@ -73,7 +74,9 @@ fn main() {
 
     // 1) The call the hook relies on.
     let mut buf = [0u8; 1024];
-    let ok = unsafe { GetFileInformationByHandleEx(h, 2 /* FileNameInfo */, buf.as_mut_ptr() as _, 1024) };
+    let ok = unsafe {
+        GetFileInformationByHandleEx(h, 2 /* FileNameInfo */, buf.as_mut_ptr() as _, 1024)
+    };
     let err = unsafe { GetLastError() };
     println!("GetFileInformationByHandleEx(FileNameInfo) ok={ok} err={err}");
     if ok != 0 {
@@ -90,7 +93,9 @@ fn main() {
     }
 
     // 2) Generic handle classification.
-    println!("GetFileType = {:#x} (2 = FILE_TYPE_CHAR)", unsafe { GetFileType(h) });
+    println!("GetFileType = {:#x} (2 = FILE_TYPE_CHAR)", unsafe {
+        GetFileType(h)
+    });
 
     // 3) A serial-only IOCTL: succeeds iff this really is a serial port.
     let mut cs = [0u8; 32];

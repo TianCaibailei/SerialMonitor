@@ -17,7 +17,13 @@ extern "system" {
         flags: u32,
         tmpl: *mut c_void,
     ) -> *mut c_void;
-    fn WriteFile(h: *mut c_void, buf: *const u8, len: u32, written: *mut u32, ov: *mut c_void) -> i32;
+    fn WriteFile(
+        h: *mut c_void,
+        buf: *const u8,
+        len: u32,
+        written: *mut u32,
+        ov: *mut c_void,
+    ) -> i32;
     fn ReadFile(h: *mut c_void, buf: *mut u8, len: u32, read: *mut u32, ov: *mut c_void) -> i32;
     fn CloseHandle(h: *mut c_void) -> i32;
     fn Sleep(ms: u32);
@@ -66,10 +72,24 @@ pub fn run(com: &str, millis: u64, marker: &str) -> i32 {
     while start.elapsed().as_millis() < millis as u128 {
         let msg = format!("DLY{i};");
         let mut written = 0u32;
-        unsafe { WriteFile(h, msg.as_ptr(), msg.len() as u32, &mut written, std::ptr::null_mut()) };
+        unsafe {
+            WriteFile(
+                h,
+                msg.as_ptr(),
+                msg.len() as u32,
+                &mut written,
+                std::ptr::null_mut(),
+            )
+        };
         let mut read = 0u32;
         unsafe {
-            if ReadFile(h, rbuf.as_mut_ptr(), rbuf.len() as u32, &mut read, std::ptr::null_mut()) != 0
+            if ReadFile(
+                h,
+                rbuf.as_mut_ptr(),
+                rbuf.len() as u32,
+                &mut read,
+                std::ptr::null_mut(),
+            ) != 0
                 && read > 0
             {
                 rx_total += read as usize;

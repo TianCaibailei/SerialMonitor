@@ -124,7 +124,10 @@ fn list_device() -> (usize, Vec<String>, Vec<String>) {
     let mut dir: *mut c_void = std::ptr::null_mut();
     let st = unsafe { NtOpenDirectoryObject(&mut dir, 0x1 | 0x2, oa.as_mut_ptr() as *mut u8) };
     if st != 0 {
-        println!("list_device: NtOpenDirectoryObject 失败 status=0x{st:08X} (name={:p})", name.as_ptr());
+        println!(
+            "list_device: NtOpenDirectoryObject 失败 status=0x{st:08X} (name={:p})",
+            name.as_ptr()
+        );
         return (0, Vec::new(), Vec::new());
     }
 
@@ -287,7 +290,9 @@ fn main() {
         )
     };
     if h as isize == INVALID {
-        println!("无法打开控制设备, err={}", unsafe { GetLastError() });
+        println!("无法打开控制设备, err={}", unsafe {
+            GetLastError()
+        });
         return;
     }
     let Some(key) = session_key() else {

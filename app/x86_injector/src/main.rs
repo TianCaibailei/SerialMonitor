@@ -20,7 +20,13 @@ use std::ffi::c_void;
 
 extern "system" {
     fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut c_void;
-    fn VirtualAllocEx(h: *mut c_void, addr: *mut c_void, size: usize, ty: u32, prot: u32) -> *mut c_void;
+    fn VirtualAllocEx(
+        h: *mut c_void,
+        addr: *mut c_void,
+        size: usize,
+        ty: u32,
+        prot: u32,
+    ) -> *mut c_void;
     fn WriteProcessMemory(
         h: *mut c_void,
         addr: *mut c_void,
@@ -142,7 +148,10 @@ fn main() {
             std::process::exit(1);
         }
         if code == 0 {
-            eprintln!("LoadLibraryW 返回 NULL (GetLastError=0x{:X})", GetLastError());
+            eprintln!(
+                "LoadLibraryW 返回 NULL (GetLastError=0x{:X})",
+                GetLastError()
+            );
             std::process::exit(1);
         }
         println!("注入成功, HMODULE = 0x{code:X}");

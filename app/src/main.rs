@@ -119,10 +119,12 @@ fn parse_args() -> Option<String> {
         if args[i] == "--native-serial-delayed" {
             let com = args.get(i + 1).cloned().unwrap_or_else(|| "COM6".into());
             let ms: u64 = args.get(i + 2).and_then(|s| s.parse().ok()).unwrap_or(8000);
-            let marker = args
-                .get(i + 3)
-                .cloned()
-                .unwrap_or_else(|| std::env::temp_dir().join("um_go.txt").to_string_lossy().into_owned());
+            let marker = args.get(i + 3).cloned().unwrap_or_else(|| {
+                std::env::temp_dir()
+                    .join("um_go.txt")
+                    .to_string_lossy()
+                    .into_owned()
+            });
             std::process::exit(native_serial_delayed::run(&com, ms, &marker));
         }
         // --find-owners <COMx> — who holds this port right now (auto-attach diagnostic)
@@ -147,7 +149,9 @@ fn load_cjk_fonts() -> egui::FontDefinitions {
         "C:\\Windows\\Fonts\\simsun.ttc",
     ] {
         if let Ok(data) = std::fs::read(p) {
-            fonts.font_data.insert("cjk".into(), egui::FontData::from_owned(data).into());
+            fonts
+                .font_data
+                .insert("cjk".into(), egui::FontData::from_owned(data));
             fonts
                 .families
                 .get_mut(&egui::FontFamily::Proportional)

@@ -31,7 +31,13 @@ extern "system" {
         flags: u32,
         tmpl: *mut c_void,
     ) -> *mut c_void;
-    fn WriteFile(h: *mut c_void, buf: *const u8, len: u32, written: *mut u32, ov: *mut c_void) -> i32;
+    fn WriteFile(
+        h: *mut c_void,
+        buf: *const u8,
+        len: u32,
+        written: *mut u32,
+        ov: *mut c_void,
+    ) -> i32;
     fn ReadFile(h: *mut c_void, buf: *mut u8, len: u32, read: *mut u32, ov: *mut c_void) -> i32;
     fn CloseHandle(h: *mut c_void) -> i32;
     fn Sleep(ms: u32);
@@ -40,10 +46,19 @@ extern "system" {
     fn GetCommTimeouts(h: *mut c_void, t: *mut c_void) -> i32;
 }
 
-type CreateFileWFn =
-    unsafe extern "system" fn(*const u16, u32, u32, *mut c_void, u32, u32, *mut c_void) -> *mut c_void;
-type WriteFileFn = unsafe extern "system" fn(*mut c_void, *const u8, u32, *mut u32, *mut c_void) -> i32;
-type ReadFileFn = unsafe extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32;
+type CreateFileWFn = unsafe extern "system" fn(
+    *const u16,
+    u32,
+    u32,
+    *mut c_void,
+    u32,
+    u32,
+    *mut c_void,
+) -> *mut c_void;
+type WriteFileFn =
+    unsafe extern "system" fn(*mut c_void, *const u8, u32, *mut u32, *mut c_void) -> i32;
+type ReadFileFn =
+    unsafe extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32;
 type CloseHandleFn = unsafe extern "system" fn(*mut c_void) -> i32;
 
 const GENERIC_READ: u32 = 0x8000_0000;
@@ -71,7 +86,10 @@ struct CommTimeouts {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let com = args.get(1).cloned().unwrap_or_else(|| "COM1".into());
-    let logfile = args.get(2).cloned().unwrap_or_else(|| "order_loop.log".into());
+    let logfile = args
+        .get(2)
+        .cloned()
+        .unwrap_or_else(|| "order_loop.log".into());
     let mode = args.get(3).cloned().unwrap_or_else(|| "gpa".into());
 
     let (create, write, read, close): (CreateFileWFn, WriteFileFn, ReadFileFn, CloseHandleFn) =
@@ -106,7 +124,13 @@ fn main() {
             if h as isize != INVALID {
                 let line = format!("{s}\n");
                 let mut w = 0u32;
-                write(h, line.as_ptr(), line.len() as u32, &mut w, std::ptr::null_mut());
+                write(
+                    h,
+                    line.as_ptr(),
+                    line.len() as u32,
+                    &mut w,
+                    std::ptr::null_mut(),
+                );
                 close(h);
             }
         }
@@ -134,7 +158,10 @@ fn main() {
     }
     let pid = unsafe { GetCurrentProcessId() };
     emit(
-        &format!("order: OPENED {com} pid={pid} cached={:#x}", create as usize),
+        &format!(
+            "order: OPENED {com} pid={pid} cached={:#x}",
+            create as usize
+        ),
         &mut log,
     );
 
@@ -156,11 +183,30 @@ fn main() {
     for i in 0..160u32 {
         let msg = format!("L{i};");
         let mut wrote = 0u32;
-        unsafe { write(h, msg.as_ptr(), msg.len() as u32, &mut wrote, std::ptr::null_mut()) };
+        unsafe {
+            write(
+                h,
+                msg.as_ptr(),
+                msg.len() as u32,
+                &mut wrote,
+                std::ptr::null_mut(),
+            )
+        };
         let mut got = 0u32;
-        let ok = unsafe { read(h, buf.as_mut_ptr(), buf.len() as u32, &mut got, std::ptr::null_mut()) };
+        let ok = unsafe {
+            read(
+                h,
+                buf.as_mut_ptr(),
+                buf.len() as u32,
+                &mut got,
+                std::ptr::null_mut(),
+            )
+        };
         emit(
-            &format!("order: io #{i} wrote={wrote} read_ok={} read={got}", if ok != 0 { 1 } else { 0 }),
+            &format!(
+                "order: io #{i} wrote={wrote} read_ok={} read={got}",
+                if ok != 0 { 1 } else { 0 }
+            ),
             &mut log,
         );
         unsafe { Sleep(250) };

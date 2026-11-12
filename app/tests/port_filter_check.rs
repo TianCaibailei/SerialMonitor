@@ -30,7 +30,11 @@ fn pw_invert(sel: &mut HashSet<String>, on: &mut bool, all: &[String]) {
     if all.is_empty() {
         return;
     }
-    let next: HashSet<String> = all.iter().filter(|n| !pw_allowed(sel, *on, n)).cloned().collect();
+    let next: HashSet<String> = all
+        .iter()
+        .filter(|n| !pw_allowed(sel, *on, n))
+        .cloned()
+        .collect();
     if next.len() >= all.len() {
         pw_select_all(sel, on);
     } else {
@@ -55,7 +59,10 @@ fn pw_toggle(sel: &mut HashSet<String>, on: &mut bool, all: &[String], name: &st
 }
 
 fn main() {
-    let all: Vec<String> = ["COM1", "COM2", "COM6", "COM7"].iter().map(|s| s.to_string()).collect();
+    let all: Vec<String> = ["COM1", "COM2", "COM6", "COM7"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     let mut fails = 0;
     macro_rules! check {
         ($cond:expr, $msg:expr) => {

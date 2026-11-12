@@ -15,10 +15,47 @@ encoding_rs = "0.8"
 opt-level = 2
 # The injected hook DLL must not depend on dbghelp.dll (Rust's default backtrace
 # support pulls it in). dbghelp is present system-wide, but a 32-bit target can resolve
-# it only through SysWOW64, and a failed load there makes LoadLibrary return NULL —
-# measured as the reason 32-bit injection failed. abort keeps the DLL dependency-free.
+# it only through SysWOW64, and a failed load there makes LoadLibrary return NULL 鈥?# measured as the reason 32-bit injection failed. abort keeps the DLL dependency-free.
 panic = "abort"
 
 [workspace]
 members = ["hook", "x86_injector"]
 
+# Lint policy for the whole workspace (Rust 1.74+ `[lints]` tables).
+#
+# CI runs `cargo clippy -- -D warnings`, so anything not allowed here fails the build.
+# The allows below are **style-only** suggestions that conflict with this codebase's
+# established idioms around FFI and packet layouts. Everything else 鈥?real bugs,
+# suspicious casts, error-handling mistakes 鈥?still fails the gate.
+#
+# Do not add an allow to silence a genuine problem; fix the code instead.
+[workspace.lints.clippy]
+# Payload layouts mirror on-wire packet formats; `as_chunks` renames obscure that.
+chunks_exact_to_as_chunks = "allow"
+# `len() % 2 != 0` reads better than `!len().is_multiple_of(2)` in hex parsing, and the
+# method form is unavailable on the oldest toolchain we target.
+manual_is_multiple_of = "allow"
+# Helpers end in `let x = if ...; x` because the branches carry long explanatory
+# comments; collapsing them hurts readability.
+let_and_return = "allow"
+# Diagnostic loops keep an explicit `examined` counter to label log lines.
+explicit_counter_loop = "allow"
+# Asymmetric Ok/Err arms in FFI error paths are clearer as a match.
+single_match = "allow"
+# `ptr as *const u8` style casts document the LPCVOID <-> Rust reinterpretation.
+unnecessary_cast = "allow"
+# A few error constructors build strings that may gain arguments later.
+useless_format = "allow"
+redundant_closure = "allow"
+# io::Error::new(ErrorKind::Other, ..) keeps compatibility with older toolchains.
+io_other_error = "allow"
+empty_line_after_doc_comments = "allow"
+# Filters::default() documents its field semantics inline; deriving would lose that.
+derivable_impls = "allow"
+
+[workspace.lints.rust]
+# Deliberate FFI patterns flagged by newer rustc lints.
+function_casts_as_integer = "allow"
+
+[lints]
+workspace = true

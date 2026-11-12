@@ -12,7 +12,7 @@ edition = "2021"
 #
 # It used to live in app/src/bin/, where `cargo build --release` built it for the HOST
 # architecture (x64) and silently overwrote the deployed 32-bit binary. The symptom was
-# "32 位注入器失败 ... LoadLibraryW=0x7ffe..." — a 64-bit address in a 32-bit target.
+# "32 浣嶆敞鍏ュ櫒澶辫触 ... LoadLibraryW=0x7ffe..." 鈥?a 64-bit address in a 32-bit target.
 # Keeping it out of the main package means the main build can never touch it.
 
 [[bin]]
@@ -23,3 +23,6 @@ path = "src/main.rs"
 # packages (it warns about it), so this setting used to be silently dead. The injector is
 # built with the same release profile as the workspace, which is defined once in
 # `app/Cargo.toml` (opt-level 2, panic = "abort").
+
+[lints]
+workspace = true

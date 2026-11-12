@@ -106,7 +106,11 @@ extern "system" {
         size: *mut u32,
     ) -> i32;
     fn QueryDosDeviceW(name: *const u16, target: *mut u16, max: u32) -> u32;
-    fn OpenProcessToken(process: *mut std::ffi::c_void, access: u32, token: *mut *mut std::ffi::c_void) -> i32;
+    fn OpenProcessToken(
+        process: *mut std::ffi::c_void,
+        access: u32,
+        token: *mut *mut std::ffi::c_void,
+    ) -> i32;
     fn LookupPrivilegeValueW(system: *const u16, name: *const u16, luid: *mut u64) -> i32;
     fn AdjustTokenPrivileges(
         token: *mut std::ffi::c_void,
@@ -144,7 +148,12 @@ const SE_PRIVILEGE_ENABLED: u32 = 0x0002;
 pub fn enable_debug_privilege() -> bool {
     unsafe {
         let mut token: *mut std::ffi::c_void = std::ptr::null_mut();
-        if OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &mut token) == 0 {
+        if OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+            &mut token,
+        ) == 0
+        {
             return false;
         }
         let name = crate::inject::wide_str("SeDebugPrivilege");
@@ -155,7 +164,10 @@ pub fn enable_debug_privilege() -> bool {
         }
         let tp = TokenPrivileges {
             count: 1,
-            privileges: [LuidAndAttributes { luid, attributes: SE_PRIVILEGE_ENABLED }],
+            privileges: [LuidAndAttributes {
+                luid,
+                attributes: SE_PRIVILEGE_ENABLED,
+            }],
         };
         let ok = AdjustTokenPrivileges(
             token,
@@ -418,7 +430,10 @@ pub fn find_port_owners(ports: &[String]) -> Vec<PortOwner> {
     }
     let mut out: Vec<PortOwner> = owners
         .into_keys()
-        .map(|pid| PortOwner { pid, exe: process_exe(pid) })
+        .map(|pid| PortOwner {
+            pid,
+            exe: process_exe(pid),
+        })
         .collect();
     out.sort_by_key(|o| o.pid);
     out
@@ -511,7 +526,11 @@ pub fn scan_stats() -> (usize, usize, usize, usize) {
         }
         examined += 1;
         let proc = unsafe {
-            OpenProcess(PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION, 0, *pid)
+            OpenProcess(
+                PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION,
+                0,
+                *pid,
+            )
         };
         if proc.is_null() {
             continue;
@@ -554,27 +573,110 @@ pub fn is_plausible_serial_client(exe: &str) -> bool {
     let n = exe.to_lowercase();
     // Never these, whatever the name says.
     const NEVER: &[&str] = &[
-        "csrss", "smss", "wininit", "winlogon", "lsass", "services", "svchost", "dwm",
-        "fontdrvhost", "sihost", "taskhostw", "explorer", "runtimebroker", "searchhost",
-        "searchindexer", "searchprotocolhost", "searchfilterhost", "dllhost", "conhost",
-        "openconsole", "msedge", "chrome", "firefox", "webview", "code", "codex", "deeps",
-        "workbuddy", "craft-anything", "node", "python", "java", "wsl", "vmware",
-        "vbox", "weixin", "wxwork", "wechat", "qq", "dingtalk", "msmpeng", "mpdefender",
-        "securityhealth", "senseshield", "hasplms", "nasvc", "spoolsv", "audiodg",
-        "nahimic", "rtkaud", "nvdisplay", "intel", "lenovo", "clash", "zerotier",
-        "sandbox", "hooksloader",
+        "csrss",
+        "smss",
+        "wininit",
+        "winlogon",
+        "lsass",
+        "services",
+        "svchost",
+        "dwm",
+        "fontdrvhost",
+        "sihost",
+        "taskhostw",
+        "explorer",
+        "runtimebroker",
+        "searchhost",
+        "searchindexer",
+        "searchprotocolhost",
+        "searchfilterhost",
+        "dllhost",
+        "conhost",
+        "openconsole",
+        "msedge",
+        "chrome",
+        "firefox",
+        "webview",
+        "code",
+        "codex",
+        "deeps",
+        "workbuddy",
+        "craft-anything",
+        "node",
+        "python",
+        "java",
+        "wsl",
+        "vmware",
+        "vbox",
+        "weixin",
+        "wxwork",
+        "wechat",
+        "qq",
+        "dingtalk",
+        "msmpeng",
+        "mpdefender",
+        "securityhealth",
+        "senseshield",
+        "hasplms",
+        "nasvc",
+        "spoolsv",
+        "audiodg",
+        "nahimic",
+        "rtkaud",
+        "nvdisplay",
+        "intel",
+        "lenovo",
+        "clash",
+        "zerotier",
+        "sandbox",
+        "hooksloader",
     ];
     if NEVER.iter().any(|k| n.contains(k)) {
         return false;
     }
     // Only names that plausibly talk to a serial port.
     const YES: &[&str] = &[
-        "putty", "teraterm", "sscom", "comassistant", "comdebug", "串口", "comtool",
-        "serial", "modscan", "modbus", "hercules", "minicom", "xshell", "securecrt",
-        "term", "console", "monitor", "tool", "comm", "uart", "plc", "hmi",
-        "labview", "matlab", "keil", "iar", "stm32", "arduino", "esptool",
-        "flasher", "downloader", "upgrade", "firmware", "eeprom", "sensor",
-        "instrument", "meter", "scale", "printer", "scanner", "gps",
+        "putty",
+        "teraterm",
+        "sscom",
+        "comassistant",
+        "comdebug",
+        "串口",
+        "comtool",
+        "serial",
+        "modscan",
+        "modbus",
+        "hercules",
+        "minicom",
+        "xshell",
+        "securecrt",
+        "term",
+        "console",
+        "monitor",
+        "tool",
+        "comm",
+        "uart",
+        "plc",
+        "hmi",
+        "labview",
+        "matlab",
+        "keil",
+        "iar",
+        "stm32",
+        "arduino",
+        "esptool",
+        "flasher",
+        "downloader",
+        "upgrade",
+        "firmware",
+        "eeprom",
+        "sensor",
+        "instrument",
+        "meter",
+        "scale",
+        "printer",
+        "scanner",
+        "gps",
     ];
     YES.iter().any(|k| n.contains(k))
 }
@@ -651,9 +753,15 @@ pub fn find_serial_owners(limit_processes: usize) -> Vec<PortOwner> {
             break;
         }
         pids_seen.push(pid);
-        let Some(handles) = by_pid.get(&pid) else { continue };
+        let Some(handles) = by_pid.get(&pid) else {
+            continue;
+        };
         let proc = unsafe {
-            OpenProcess(PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION, 0, pid)
+            OpenProcess(
+                PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION,
+                0,
+                pid,
+            )
         };
         if proc.is_null() {
             continue;
@@ -685,12 +793,14 @@ pub fn find_serial_owners(limit_processes: usize) -> Vec<PortOwner> {
     }
     let mut out: Vec<PortOwner> = owners
         .into_keys()
-        .map(|pid| PortOwner { pid, exe: process_exe(pid) })
+        .map(|pid| PortOwner {
+            pid,
+            exe: process_exe(pid),
+        })
         .collect();
     out.sort_by_key(|o| o.pid);
     out
 }
-
 
 /// The object type index of a serial device object, learned by opening \\.\COMn and
 /// finding the same handle in our own process's handle table.
@@ -776,9 +886,9 @@ impl AutoAttach {
                 if ticks % 10 == 1 {
                     push_log(&l, format!("扫描中 (监听 {})", watched.join(",")));
                 }
-                    // Discovery by process enumeration (see list_injectable_processes):
-                    // safe without admin rights, and the hook itself decides whether a
-                    // process touches a serial port.
+                // Discovery by process enumeration (see list_injectable_processes):
+                // safe without admin rights, and the hook itself decides whether a
+                // process touches a serial port.
                 let candidates = list_injectable_processes();
                 if ticks % 10 == 1 {
                     push_log(&l, format!("进程候选数 = {}", candidates.len()));
@@ -790,10 +900,8 @@ impl AutoAttach {
                 //     a candidate, and the port owner list promotes it to high priority.
                 //   * A bounded number per pass keeps the UI thread and the target
                 //     processes responsive.
-                let serial_owners: Vec<u32> = find_serial_owners(120)
-                    .into_iter()
-                    .map(|o| o.pid)
-                    .collect();
+                let serial_owners: Vec<u32> =
+                    find_serial_owners(120).into_iter().map(|o| o.pid).collect();
                 // Injection policy: serial owners first, then newly started processes.
                 //
                 // A "no activity, so wait" gate was tried and removed: opening
@@ -808,7 +916,11 @@ impl AutoAttach {
                         &l,
                         format!(
                             "串口占用={} 持有者={:?}",
-                            watched.iter().map(|p| format!("{p}:{}", port_in_use(p))).collect::<Vec<_>>().join(" "),
+                            watched
+                                .iter()
+                                .map(|p| format!("{p}:{}", port_in_use(p)))
+                                .collect::<Vec<_>>()
+                                .join(" "),
                             serial_owners
                         ),
                     );
@@ -882,10 +994,26 @@ impl AutoAttach {
                     let looks_like_serial_tool = {
                         let n = name.to_lowercase();
                         [
-                            "putty", "comassistant", "sscom", "minicom", "串口", "serial",
-                            "terminate", "term", "comdebug", "commonitor", "modscan",
-                            "modbus", "hercules", "monitor", "tool", "console", "cmd.exe",
-                            "powershell", "python", "node",
+                            "putty",
+                            "comassistant",
+                            "sscom",
+                            "minicom",
+                            "串口",
+                            "serial",
+                            "terminate",
+                            "term",
+                            "comdebug",
+                            "commonitor",
+                            "modscan",
+                            "modbus",
+                            "hercules",
+                            "monitor",
+                            "tool",
+                            "console",
+                            "cmd.exe",
+                            "powershell",
+                            "python",
+                            "node",
                         ]
                         .iter()
                         .any(|k| n.contains(k))
@@ -913,7 +1041,8 @@ impl AutoAttach {
                             Err(poisoned) => poisoned.into_inner(),
                         };
                         let created_now = {
-                            let h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+                            let h =
+                                unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
                             let c = if h.is_null() {
                                 0
                             } else {
@@ -923,7 +1052,12 @@ impl AutoAttach {
                             };
                             c
                         };
-                        g.insert(pid, Attached { created: created_now });
+                        g.insert(
+                            pid,
+                            Attached {
+                                created: created_now,
+                            },
+                        );
                         continue;
                     }
                     if first_pass && !looks_like_serial_tool {
@@ -934,9 +1068,8 @@ impl AutoAttach {
                             Err(poisoned) => poisoned.into_inner(),
                         };
                         let created_now = {
-                            let h = unsafe {
-                                OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid)
-                            };
+                            let h =
+                                unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
                             let c = if h.is_null() {
                                 0
                             } else {
@@ -946,7 +1079,12 @@ impl AutoAttach {
                             };
                             c
                         };
-                        g.insert(pid, Attached { created: created_now });
+                        g.insert(
+                            pid,
+                            Attached {
+                                created: created_now,
+                            },
+                        );
                         continue;
                     }
                     let created_now = {
@@ -968,7 +1106,12 @@ impl AutoAttach {
                         match g.get(&pid) {
                             Some(prev) if prev.created == created_now && created_now != 0 => false,
                             _ => {
-                                g.insert(pid, Attached { created: created_now });
+                                g.insert(
+                                    pid,
+                                    Attached {
+                                        created: created_now,
+                                    },
+                                );
                                 true
                             }
                         }
@@ -980,7 +1123,11 @@ impl AutoAttach {
                         match crate::inject::inject(pid, &dll.to_string_lossy()) {
                             Ok(()) => {
                                 injected_this_pass += 1;
-                                let tag = if serial_owners.contains(&pid) { "串口进程" } else { "进程" };
+                                let tag = if serial_owners.contains(&pid) {
+                                    "串口进程"
+                                } else {
+                                    "进程"
+                                };
                                 push_log(&l, format!("已附加{tag} {name} (PID {pid})"));
                             }
                             Err(_) => {}
@@ -991,7 +1138,13 @@ impl AutoAttach {
             }
         });
 
-        AutoAttach { stop, attached, skip, ports: ports_s, log }
+        AutoAttach {
+            stop,
+            attached,
+            skip,
+            ports: ports_s,
+            log,
+        }
     }
 
     /// Replace the watched port list (called when sessions change).
@@ -1059,7 +1212,9 @@ fn parse_object_name(buf: &[u8]) -> Option<String> {
     if NAME_OFF + length > buf.len() {
         // Some builds report the name only through Buffer; try that address only if
         // it happens to fall inside our buffer (otherwise it is kernel memory).
-        let buf_ptr = u64::from_le_bytes([buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15]]);
+        let buf_ptr = u64::from_le_bytes([
+            buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
+        ]);
         let base = buf.as_ptr() as u64;
         if buf_ptr >= base && buf_ptr + length as u64 <= base + buf.len() as u64 {
             let off = (buf_ptr - base) as usize;
@@ -1220,9 +1375,7 @@ pub fn scan_owners_limited(ports: &[String], max: usize) -> Vec<PortOwner> {
             continue;
         };
         let lower = name.to_lowercase();
-        let by_com = wanted_com
-            .iter()
-            .any(|com| lower.contains(com.as_str()));
+        let by_com = wanted_com.iter().any(|com| lower.contains(com.as_str()));
         let by_device = crate::inject::is_serial_device_path(&lower);
         if by_com || by_device {
             owners.insert(pid, name);
@@ -1230,7 +1383,10 @@ pub fn scan_owners_limited(ports: &[String], max: usize) -> Vec<PortOwner> {
     }
     let mut out: Vec<PortOwner> = owners
         .into_keys()
-        .map(|pid| PortOwner { pid, exe: process_exe(pid) })
+        .map(|pid| PortOwner {
+            pid,
+            exe: process_exe(pid),
+        })
         .collect();
     out.sort_by_key(|o| o.pid);
     out

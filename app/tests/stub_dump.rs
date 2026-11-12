@@ -48,7 +48,13 @@ fn main() {
             }
             let bytes = unsafe { std::slice::from_raw_parts(p as *const u8, 16) };
             let hex: Vec<String> = bytes.iter().map(|b| format!("{:02X}", b)).collect();
-            println!("{:<10} {:<22} {:>#14x}  {}", label, name, p as usize, hex.join(" "));
+            println!(
+                "{:<10} {:<22} {:>#14x}  {}",
+                label,
+                name,
+                p as usize,
+                hex.join(" ")
+            );
         }
     }
 }

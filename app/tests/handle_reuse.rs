@@ -33,7 +33,13 @@ extern "system" {
         flags: u32,
         tmpl: *mut c_void,
     ) -> *mut c_void;
-    fn WriteFile(h: *mut c_void, buf: *const u8, len: u32, written: *mut u32, ov: *mut c_void) -> i32;
+    fn WriteFile(
+        h: *mut c_void,
+        buf: *const u8,
+        len: u32,
+        written: *mut u32,
+        ov: *mut c_void,
+    ) -> i32;
     fn CloseHandle(h: *mut c_void) -> i32;
     fn GetFileType(h: *mut c_void) -> u32;
 }
@@ -54,7 +60,10 @@ fn wide(s: &str) -> Vec<u16> {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let com = args.get(1).cloned().unwrap_or_else(|| "COM6".into());
-    let logfile = args.get(2).cloned().unwrap_or_else(|| "handle_reuse.log".to_string());
+    let logfile = args
+        .get(2)
+        .cloned()
+        .unwrap_or_else(|| "handle_reuse.log".to_string());
     let marker = args.get(3).cloned();
     let mut out = String::new();
     macro_rules! say {
@@ -109,7 +118,10 @@ fn main() {
     let mut collided = false;
     let mut file_h = 0usize;
     for i in 0..200 {
-        let p = wide(&format!(r"{}\hreuse_{i}.txt", std::env::temp_dir().display()));
+        let p = wide(&format!(
+            r"{}\hreuse_{i}.txt",
+            std::env::temp_dir().display()
+        ));
         let h = unsafe {
             CreateFileW(
                 p.as_ptr(),

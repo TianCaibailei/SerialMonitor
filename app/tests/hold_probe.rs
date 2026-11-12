@@ -160,7 +160,9 @@ fn main() {
         )
     };
     if h as isize == INVALID {
-        println!("hold: 无法打开控制设备, err={}", unsafe { GetLastError() });
+        println!("hold: 无法打开控制设备, err={}", unsafe {
+            GetLastError()
+        });
         std::process::exit(2);
     }
     let Some(key) = session_key() else {
@@ -270,7 +272,13 @@ fn main() {
             let preview: String = out[RECORD_HEADER..RECORD_HEADER + take]
                 .iter()
                 .take(24)
-                .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' })
+                .map(|&b| {
+                    if (0x20..0x7f).contains(&b) {
+                        b as char
+                    } else {
+                        '.'
+                    }
+                })
                 .collect();
             println!(
                 "hold: 记录 #{total_records} dir={dir} pid={pid} port={port} {take} 字节: {preview}"

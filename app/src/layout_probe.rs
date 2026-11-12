@@ -40,7 +40,13 @@ pub fn probe_layout() -> i32 {
         let hex: Vec<String> = bytes.iter().map(|b| format!("{b:02X}")).collect();
         let ascii: String = bytes
             .iter()
-            .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' })
+            .map(|&b| {
+                if (0x20..0x7f).contains(&b) {
+                    b as char
+                } else {
+                    '.'
+                }
+            })
             .collect();
         println!("probe: +{start:03}  {}  |{ascii}|", hex.join(" "));
     }
@@ -62,7 +68,9 @@ pub fn probe_layout() -> i32 {
     };
     println!("probe: offset 36 名称 = {name36:?}");
     let pid = u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]);
-    println!("probe: pid@8 = {pid} (自身 {})", unsafe { GetCurrentProcessId() });
+    println!("probe: pid@8 = {pid} (自身 {})", unsafe {
+        GetCurrentProcessId()
+    });
     unsafe { CloseHandle(snap) };
     0
 }

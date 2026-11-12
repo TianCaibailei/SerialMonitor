@@ -27,16 +27,31 @@ extern "system" {
         flags: u32,
         tmpl: *mut c_void,
     ) -> *mut c_void;
-    fn WriteFile(h: *mut c_void, buf: *const u8, len: u32, written: *mut u32, ov: *mut c_void) -> i32;
+    fn WriteFile(
+        h: *mut c_void,
+        buf: *const u8,
+        len: u32,
+        written: *mut u32,
+        ov: *mut c_void,
+    ) -> i32;
     fn ReadFile(h: *mut c_void, buf: *mut u8, len: u32, read: *mut u32, ov: *mut c_void) -> i32;
     fn Sleep(ms: u32);
     fn GetCurrentProcessId() -> u32;
 }
 
-type CreateFileWFn =
-    unsafe extern "system" fn(*const u16, u32, u32, *mut c_void, u32, u32, *mut c_void) -> *mut c_void;
-type WriteFileFn = unsafe extern "system" fn(*mut c_void, *const u8, u32, *mut u32, *mut c_void) -> i32;
-type ReadFileFn = unsafe extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32;
+type CreateFileWFn = unsafe extern "system" fn(
+    *const u16,
+    u32,
+    u32,
+    *mut c_void,
+    u32,
+    u32,
+    *mut c_void,
+) -> *mut c_void;
+type WriteFileFn =
+    unsafe extern "system" fn(*mut c_void, *const u8, u32, *mut u32, *mut c_void) -> i32;
+type ReadFileFn =
+    unsafe extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32;
 
 const GENERIC_READ: u32 = 0x8000_0000;
 const GENERIC_WRITE: u32 = 0x4000_0000;
@@ -59,7 +74,9 @@ struct Log {
 impl Log {
     fn new(path: &str) -> Self {
         let _ = std::fs::remove_file(path);
-        Log { path: path.to_string() }
+        Log {
+            path: path.to_string(),
+        }
     }
     fn line(&self, text: &str) {
         use std::io::Write;
@@ -127,10 +144,24 @@ fn main() {
         let msg = format!("ORD{i};");
         let mut wrote = 0u32;
         unsafe {
-            write(h, msg.as_ptr(), msg.len() as u32, &mut wrote, std::ptr::null_mut());
+            write(
+                h,
+                msg.as_ptr(),
+                msg.len() as u32,
+                &mut wrote,
+                std::ptr::null_mut(),
+            );
         }
         let mut got = 0u32;
-        let r = unsafe { read(h, buf.as_mut_ptr(), buf.len() as u32, &mut got, std::ptr::null_mut()) };
+        let r = unsafe {
+            read(
+                h,
+                buf.as_mut_ptr(),
+                buf.len() as u32,
+                &mut got,
+                std::ptr::null_mut(),
+            )
+        };
         log.line(&format!(
             "setup32: io #{i} wrote={wrote} read_ok={} read={got}",
             if r != 0 { 1 } else { 0 }

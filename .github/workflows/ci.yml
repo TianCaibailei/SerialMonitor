@@ -1,0 +1,195 @@
+name: CI
+
+# Everything that can be verified without hardware runs here.
+#
+# What is deliberately NOT in CI:
+#   * Injected-hook and kernel-driver behaviour (needs admin, test-signing, a real or
+#     virtual COM pair). Those stay as the PowerShell acceptance scripts in app/ and
+#     driver/ — see docs/技术手册.md §7. CI proves the code is correct; the scripts prove
+#     the capture paths work on a machine.
+#   * Any cross-compilation of the 32-bit injector beyond a type check, because the
+#     architecture check needs PE headers (see the arch job below, which does build it).
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fail fast on flaky network instead of hanging the job.
+  CARGO_NET_RETRY: 3
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fmt:
+    name: 格式检查
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: cargo fmt --check
+        working-directory: app
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app
+      - name: cargo clippy (deny warnings)
+        working-directory: app
+        # Only production code and unit tests are linted to `-D warnings`.
+        #
+        # `--all-targets` would also lint app/tests/*.rs, which are one-off diagnostic
+        # probes (raw PE/registry/handle experiments) rather than shipping code; holding
+        # them to production lint standards produces noise with no safety benefit. They
+        # are still compiled and run by the `test` job below.
+        run: cargo clippy --workspace --lib --bins -- -D warnings
+
+  test:
+    name: 单元测试
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app
+      - name: cargo test (workspace)
+        working-directory: app
+        run: cargo test --workspace --all-targets
+      - name: 断言测试数量未回退
+        working-directory: app
+        shell: pwsh
+        run: |
+          # A green `cargo test` that silently runs zero tests is the exact failure mode
+          # this repository had for months (14 test binaries, 0 #[test] functions).
+          # Fail the job if the suite is smaller than the floor.
+          $out = cargo test --bin universal_monitor 2>&1 | Out-String
+          $m = [regex]::Match($out, 'test result: ok\. (\d+) passed')
+          if (-not $m.Success) { Write-Error "无法解析测试结果"; exit 1 }
+          $n = [int]$m.Groups[1].Value
+          Write-Host "实际运行测试数: $n"
+          $floor = 30
+          if ($n -lt $floor) {
+            Write-Error "测试数量 $n 低于下限 $floor —— 检查是否有测试被静默跳过"
+            exit 1
+          }
+
+  build:
+    name: 构建（x64 + x86 注入器）
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc, i686-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app
+      - name: 构建主程序与 64 位 hook
+        working-directory: app
+        run: cargo build --release
+      - name: 构建 32 位 hook 与注入器
+        working-directory: app
+        run: |
+          cargo build --release --target i686-pc-windows-msvc -p monitor_hook
+          cargo build --release --target i686-pc-windows-msvc -p universal_injector_x86
+      - name: 校验 PE 架构（防止 64 位产物覆盖 32 位）
+        shell: pwsh
+        run: |
+          # This check is the whole reason the x86 injector is a separate crate: a plain
+          # `cargo build` used to overwrite it with the host-architecture binary, and the
+          # failure surfaced only at runtime as "LoadLibraryW=0x7ffe...".
+          #
+          # Paths: an unqualified `cargo build` writes to target/release (host = x64 here),
+          # while an explicit --target writes to target/<triple>/release.
+          function Get-PeMachine([string]$path) {
+            $fs = [System.IO.File]::OpenRead($path)
+            try {
+              $br = New-Object System.IO.BinaryReader($fs)
+              $fs.Position = 0x3C
+              $peOff = $br.ReadInt32()
+              $fs.Position = $peOff
+              if ($br.ReadUInt32() -ne 0x00004550) { throw "不是 PE 文件: $path" }
+              return $br.ReadUInt16()
+            } finally { $fs.Dispose() }
+          }
+          $expect = [ordered]@{
+            'app\target\release\monitor_hook.dll'                                = 0x8664
+            'app\target\release\universal_monitor.exe'                           = 0x8664
+            'app\target\i686-pc-windows-msvc\release\monitor_hook.dll'           = 0x014C
+            'app\target\i686-pc-windows-msvc\release\universal_injector_x86.exe' = 0x014C
+          }
+          $fail = $false
+          foreach ($k in $expect.Keys) {
+            if (-not (Test-Path $k)) { Write-Error "缺少产物: $k"; $fail = $true; continue }
+            $m = Get-PeMachine $k
+            $ok = ($m -eq $expect[$k])
+            Write-Host ("{0,-68} machine=0x{1:X4} 期望=0x{2:X4} {3}" -f $k, $m, $expect[$k], $(if ($ok) {'OK'} else {'不符'}))
+            if (-not $ok) { $fail = $true }
+          }
+          if ($fail) { exit 1 }
+          Write-Host "PASS: 全部产物架构正确"
+
+  docs:
+    name: 文档一致性
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 关键文档存在且非空
+        shell: pwsh
+        run: |
+          # Paths are relative to the repository root, which IS MonitorAnything/.
+          $files = @(
+            'docs\README.md',
+            'docs\技术手册.md',
+            'CHANGELOG.md',
+            'LICENSE',
+            'SECURITY.md'
+          )
+          $fail = $false
+          foreach ($f in $files) {
+            if (-not (Test-Path $f)) { Write-Error "缺失: $f"; $fail = $true; continue }
+            if ((Get-Item $f).Length -eq 0) { Write-Error "空文件: $f"; $fail = $true }
+          }
+          if ($fail) { exit 1 }
+          Write-Host "PASS: 关键文档齐备"
+      - name: 禁止私钥/证书再次入库
+        shell: pwsh
+        run: |
+          # A test signing key was committed once; this guard makes a repeat impossible to
+          # merge without noticing.
+          $bad = git ls-files | Select-String -Pattern '\.(pfx|pvk|key|snk|pem)$'
+          if ($bad) {
+            Write-Error "发现被版本库跟踪的私钥/证书文件："
+            $bad | ForEach-Object { Write-Error "  $_" }
+            exit 1
+          }
+          Write-Host "PASS: 版本库中没有私钥/证书"
+
+  security:
+    name: 依赖审计
+    runs-on: windows-latest
+    continue-on-error: true   # advisory only: a new advisory should not block unrelated work
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: cargo-audit
+        working-directory: app
+        run: |
+          cargo install cargo-audit --locked --quiet
+          cargo audit

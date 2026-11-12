@@ -121,10 +121,14 @@ impl Stats {
         let r = &self.raw;
         let received = r[2] as u64 | ((r[3] as u64) << 32);
         let sent = r[4] as u64 | ((r[5] as u64) << 32);
-        println!("[{tag}] 队列={} 丢弃={} 收={} 发={} 启用={} 目标PID={} 已附加={}",
-                 r[0], r[1], received, sent, r[6], r[7], r[8]);
-        println!("[{tag}] 发现闸门: 类型不符={} 名称不符={} 通过={}",
-                 r[9], r[10], r[11]);
+        println!(
+            "[{tag}] 队列={} 丢弃={} 收={} 发={} 启用={} 目标PID={} 已附加={}",
+            r[0], r[1], received, sent, r[6], r[7], r[8]
+        );
+        println!(
+            "[{tag}] 发现闸门: 类型不符={} 名称不符={} 通过={}",
+            r[9], r[10], r[11]
+        );
         println!("[{tag}] raw = {:?}", r);
     }
 }
@@ -145,7 +149,9 @@ fn get_stats(h: *mut c_void) -> Option<Stats> {
         )
     };
     if ok == 0 {
-        println!("   GET_STATS 失败, GetLastError={}", unsafe { GetLastError() });
+        println!("   GET_STATS 失败, GetLastError={}", unsafe {
+            GetLastError()
+        });
         return None;
     }
     if ret < 48 {
@@ -177,7 +183,10 @@ fn main() {
         )
     };
     if h as isize == INVALID {
-        println!("probe: 无法打开 \\\\.\\UmSerialFilter, GetLastError={}", unsafe { GetLastError() });
+        println!(
+            "probe: 无法打开 \\\\.\\UmSerialFilter, GetLastError={}",
+            unsafe { GetLastError() }
+        );
         std::process::exit(2);
     }
     println!("probe: 已打开控制设备");
@@ -198,9 +207,11 @@ fn main() {
                     std::ptr::null_mut(),
                 )
             };
-            println!("probe: 认证 {} (key {} 字节)",
-                     if ok != 0 { "成功" } else { "失败" },
-                     key.len());
+            println!(
+                "probe: 认证 {} (key {} 字节)",
+                if ok != 0 { "成功" } else { "失败" },
+                key.len()
+            );
             if ok == 0 {
                 println!("probe: 认证 GetLastError={}（错误 5 = 会话密钥不匹配，驱动可能是上一代加载的）",
                          unsafe { GetLastError() });
@@ -232,8 +243,12 @@ fn main() {
                 std::ptr::null_mut(),
             )
         };
-        println!("probe: ATTACH_PORTS ok={} ret={} 本次新增附加={n} err={}",
-                 ok, ret, unsafe { GetLastError() });
+        println!(
+            "probe: ATTACH_PORTS ok={} ret={} 本次新增附加={n} err={}",
+            ok,
+            ret,
+            unsafe { GetLastError() }
+        );
 
         if let Some(s) = get_stats(h) {
             s.dump("附加后");
@@ -258,8 +273,7 @@ fn main() {
                 )
             };
             if ok != 0 && ret >= 8 {
-                let chars =
-                    u32::from_le_bytes([out[4], out[5], out[6], out[7]]) as usize;
+                let chars = u32::from_le_bytes([out[4], out[5], out[6], out[7]]) as usize;
                 let units: Vec<u16> = (0..chars)
                     .map(|k| {
                         let o = 8 + k * 2;
@@ -268,7 +282,9 @@ fn main() {
                     .collect();
                 println!("probe:   [{i}] {}", String::from_utf16_lossy(&units));
             } else {
-                println!("probe:   [{i}] <无名称> ret={ret} err={}", unsafe { GetLastError() });
+                println!("probe:   [{i}] <无名称> ret={ret} err={}", unsafe {
+                    GetLastError()
+                });
             }
         }
     }

@@ -4,8 +4,8 @@ use crate::inject::{self, CapMsg};
 use crate::protocol;
 use crate::session::{
     bytes_hex, escape_text, fmt_time, now_wall, pw_allowed, pw_invert, pw_select_all,
-    pw_select_none, pw_toggle, seed_demo, Autosave, ChanKind, ChannelCfg, Filters, RowOrigin,
-    ProtoType, Session, ViewToggles,
+    pw_select_none, pw_toggle, seed_demo, Autosave, ChanKind, ChannelCfg, Filters, ProtoType,
+    RowOrigin, Session, ViewToggles,
 };
 use crate::text_codec::{self, DisplayEncoding};
 use egui::{
@@ -49,7 +49,6 @@ fn short_dev(path: &str) -> String {
     path.rsplit('\\').next().unwrap_or(path).to_string()
 }
 
-
 /// Channel display name. Unresolved ids render as `UNKNOWN(<id>)`, matching the
 /// original's port-name fallback (CommMonitor sub_841a50; fmt "UNKNOWN(%d)" @0x841b74).
 fn chan_label(s: &Session, idx: usize) -> String {
@@ -59,11 +58,25 @@ fn chan_label(s: &Session, idx: usize) -> String {
     }
 }
 
-const BAUDS: [u32; 12] = [1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200, 230400, 460800, 576000, 921600];
-const FCS: [u8; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 0x0B, 0x0C, 0x0F, 0x10, 0x11, 0x14, 0x16, 0x2B];
-const VIEW_NAMES: [&str; 5] = ["Table视图", "终端视图", "Dump视图", "Line曲线图", "Modbus视图"];
+const BAUDS: [u32; 12] = [
+    1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200, 230400, 460800, 576000, 921600,
+];
+const FCS: [u8; 16] = [
+    1, 2, 3, 4, 5, 6, 7, 8, 0x0B, 0x0C, 0x0F, 0x10, 0x11, 0x14, 0x16, 0x2B,
+];
+const VIEW_NAMES: [&str; 5] = [
+    "Table视图",
+    "终端视图",
+    "Dump视图",
+    "Line曲线图",
+    "Modbus视图",
+];
 const ENCS: [&str; 3] = ["UTF-8", "ANSI(GBK)", "Unicode(UTF-16LE)"];
-const SPLITS: [&str; 3] = ["单个文件不分割", "按时间范围分割", "强制文件大小，超过将覆盖"];
+const SPLITS: [&str; 3] = [
+    "单个文件不分割",
+    "按时间范围分割",
+    "强制文件大小，超过将覆盖",
+];
 // Order matters: index 0 is the DEFAULT when the New Monitor dialog opens.
 //
 // A serial monitor exists to watch OTHER software's traffic, so the passive
@@ -237,7 +250,11 @@ pub struct MonitorApp {
 }
 
 fn b(v: bool) -> &'static str {
-    if v { "1" } else { "0" }
+    if v {
+        "1"
+    } else {
+        "0"
+    }
 }
 
 /// Quote a string for JSON output (handles the escapes that actually occur in session
@@ -305,7 +322,11 @@ mod export_tests {
 fn fmt_port_list(sel: &HashSet<String>) -> String {
     let mut names: Vec<&String> = sel.iter().collect();
     names.sort(); // 稳定输出，避免每次保存都改文件内容
-    names.iter().map(|s| s.as_str()).collect::<Vec<&str>>().join(",")
+    names
+        .iter()
+        .map(|s| s.as_str())
+        .collect::<Vec<&str>>()
+        .join(",")
 }
 
 fn parse_port_list(v: &str) -> HashSet<String> {
@@ -322,14 +343,48 @@ fn parse_port_list(v: &str) -> HashSet<String> {
 fn looks_like_app(name: &str) -> bool {
     let n = name.to_lowercase();
     const NOISE: &[&str] = &[
-        "svchost", "dllhost", "conhost", "runtimebroker", "searchhost", "searchindexer",
-        "searchprotocolhost", "searchfilterhost", "taskhostw", "sihost", "fontdrvhost",
-        "dwm", "csrss", "smss", "wininit", "winlogon", "lsass", "services", "spoolsv",
-        "audiodg", "msmpeng", "mpdefender", "securityhealth", "smartscreen", "wudfhost",
-        "wmiprvse", "dashost", "unsecapp", "lockapp", "textinputhost",
-        "startmenuexperiencehost", "shellexperiencehost", "applicationframehost",
-        "aggregatorhost", "backgroundtaskhost", "msedgewebview2", "crashpad_handler",
-        "widgetboard", "widgetservice", "useroobebroker", "openconsole", "systemsettings",
+        "svchost",
+        "dllhost",
+        "conhost",
+        "runtimebroker",
+        "searchhost",
+        "searchindexer",
+        "searchprotocolhost",
+        "searchfilterhost",
+        "taskhostw",
+        "sihost",
+        "fontdrvhost",
+        "dwm",
+        "csrss",
+        "smss",
+        "wininit",
+        "winlogon",
+        "lsass",
+        "services",
+        "spoolsv",
+        "audiodg",
+        "msmpeng",
+        "mpdefender",
+        "securityhealth",
+        "smartscreen",
+        "wudfhost",
+        "wmiprvse",
+        "dashost",
+        "unsecapp",
+        "lockapp",
+        "textinputhost",
+        "startmenuexperiencehost",
+        "shellexperiencehost",
+        "applicationframehost",
+        "aggregatorhost",
+        "backgroundtaskhost",
+        "msedgewebview2",
+        "crashpad_handler",
+        "widgetboard",
+        "widgetservice",
+        "useroobebroker",
+        "openconsole",
+        "systemsettings",
     ];
     !NOISE.iter().any(|k| n.contains(k))
 }
@@ -430,7 +485,13 @@ impl MonitorApp {
         };
         app.load_cfg();
         if screenshot.is_some() {
-            let views = ViewToggles { table: true, terminal: true, dump: true, line: true, modbus: true };
+            let views = ViewToggles {
+                table: true,
+                terminal: true,
+                dump: true,
+                line: true,
+                modbus: true,
+            };
             let mut s = Session::new("COM3 演示会话".into(), Vec::new(), ProtoType::Rtu, views);
             s.channels.push(ChannelCfg {
                 kind: ChanKind::Serial,
@@ -483,12 +544,18 @@ impl MonitorApp {
             s.display_encoding = enc;
         }
         self.save_cfg();
-        self.toast(format!("显示编码已切换为 {}（全部视图即时生效）", enc.label()));
+        self.toast(format!(
+            "显示编码已切换为 {}（全部视图即时生效）",
+            enc.label()
+        ));
     }
 
     fn load_cfg(&mut self) {
         if let Ok(txt) = std::fs::read_to_string("config.ini") {
-            for line in txt.lines().skip_while(|l| !l.trim().eq_ignore_ascii_case("[NewMon]")) {
+            for line in txt
+                .lines()
+                .skip_while(|l| !l.trim().eq_ignore_ascii_case("[NewMon]"))
+            {
                 if line.trim().eq_ignore_ascii_case("[NewMon]") {
                     continue;
                 }
@@ -507,7 +574,10 @@ impl MonitorApp {
                             // 缺省（历史配置里没有这两项）= 不限制。
                             "portFilter" => self.fport_on = on,
                             "portWatch" => self.fport_sel = parse_port_list(v),
-                            "displayEnc" => self.display_enc = DisplayEncoding::from_index(v.parse().unwrap_or(0)),
+                            "displayEnc" => {
+                                self.display_enc =
+                                    DisplayEncoding::from_index(v.parse().unwrap_or(0))
+                            }
                             "exportEnc" => self.save_enc = v.parse().unwrap_or(0).min(2),
                             "recentArchive" => {
                                 // Paths are tokenised by whitespace in this ini format, so
@@ -827,8 +897,8 @@ impl MonitorApp {
             self.drv_err = 0;
             self.drv_checked = true;
             self.drv_names = ports.iter().cloned().collect();
-        // Device path -> COM number, so the port list can show both.
-        self.drv_com = crate::driver::com_names();
+            // Device path -> COM number, so the port list can show both.
+            self.drv_com = crate::driver::com_names();
             self.set_driver_note_for_ports(n, &ports);
             self.toast(self.drv_note.clone());
         } else {
@@ -863,7 +933,11 @@ impl MonitorApp {
             return;
         }
         self.drv_avail = crate::driver::DriverHandle::is_available();
-        self.drv_err = if self.drv_avail { 0 } else { crate::driver::last_error() };
+        self.drv_err = if self.drv_avail {
+            0
+        } else {
+            crate::driver::last_error()
+        };
         self.drv_checked = true;
     }
 
@@ -923,7 +997,13 @@ impl MonitorApp {
                 "驱动捕获".into(),
                 Vec::new(),
                 ProtoType::None,
-                ViewToggles { table: true, terminal: true, dump: true, line: true, modbus: false },
+                ViewToggles {
+                    table: true,
+                    terminal: true,
+                    dump: true,
+                    line: true,
+                    modbus: false,
+                },
             );
             self.sessions.push(s);
             self.active = 0;
@@ -999,14 +1079,7 @@ impl MonitorApp {
             // Read the direction before moving `data` out of `rec`.
             let dir_tx = rec.kind == crate::driver::RecordKind::Tx;
             let control = rec.control;
-            self.sessions[sess_idx].ingest_driver(
-                chan,
-                rec.data,
-                secs,
-                millis,
-                dir_tx,
-                control,
-            );
+            self.sessions[sess_idx].ingest_driver(chan, rec.data, secs, millis, dir_tx, control);
         }
     }
 
@@ -1032,7 +1105,7 @@ impl MonitorApp {
 
     fn close_active(&mut self) {
         let closed_name = self.sessions.get(self.active).map(|s| s.name.clone());
-        let had_hook = self.sessions.get(self.active).map_or(false, |s| {
+        let had_hook = self.sessions.get(self.active).is_some_and(|s| {
             s.cap_pid.is_some() || s.channels.iter().any(|c| c.kind == ChanKind::HookSerial)
         });
         if let Some(s) = self.sessions.get(self.active) {
@@ -1063,13 +1136,21 @@ impl MonitorApp {
     /// encoding, so exported Chinese is readable. Auto-named to avoid silently
     /// overwriting an earlier export (the old fixed `session_N.log` did).
     fn save_active(&mut self) {
-        let Some(s) = self.sessions.get(self.active) else { return };
+        let Some(s) = self.sessions.get(self.active) else {
+            return;
+        };
         let enc = DisplayEncoding::from_index(self.save_enc);
         let (secs, _) = now_wall();
         let safe_name = s
             .name
             .chars()
-            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect::<String>();
         let path = format!("session_{}_{secs}.log", safe_name);
         match s.save_log(&path, enc) {
@@ -1097,7 +1178,13 @@ impl MonitorApp {
             self.p_esc = s.ascii_escape;
             self.p_scroll = s.auto_scroll;
         }
-        self.prefs_backup = Some((self.p_merge, self.p_strlen, self.p_dec, self.p_esc, self.p_scroll));
+        self.prefs_backup = Some((
+            self.p_merge,
+            self.p_strlen,
+            self.p_dec,
+            self.p_esc,
+            self.p_scroll,
+        ));
     }
 
     fn sync_redir_from_session(&mut self) {
@@ -1144,12 +1231,20 @@ impl MonitorApp {
 
     /// Save the active session as a reopenable archive.
     fn save_archive_active(&mut self) {
-        let Some(s) = self.sessions.get(self.active) else { return };
+        let Some(s) = self.sessions.get(self.active) else {
+            return;
+        };
         let (secs, _) = now_wall();
         let safe: String = s
             .name
             .chars()
-            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect();
         let path = format!("session_{safe}_{secs}.umses");
         match s.save_archive(&path) {
@@ -1205,7 +1300,9 @@ impl MonitorApp {
             self.find_note = "请输入查找内容".into();
             return;
         }
-        let Some(s) = self.sessions.get_mut(self.active) else { return };
+        let Some(s) = self.sessions.get_mut(self.active) else {
+            return;
+        };
         let enc = s.display_encoding;
         let n = s.rows.len();
         let mut hit = None;
@@ -1229,7 +1326,9 @@ impl MonitorApp {
             .iter()
             .filter(|r| {
                 bytes_hex(&r.data).to_lowercase().contains(&t)
-                    || text_codec::decoded_text(&r.data, enc).to_lowercase().contains(&t)
+                    || text_codec::decoded_text(&r.data, enc)
+                        .to_lowercase()
+                        .contains(&t)
             })
             .count();
         match hit {
@@ -1240,7 +1339,9 @@ impl MonitorApp {
                     .iter()
                     .filter(|r| {
                         bytes_hex(&r.data).to_lowercase().contains(&t)
-                            || text_codec::decoded_text(&r.data, enc).to_lowercase().contains(&t)
+                            || text_codec::decoded_text(&r.data, enc)
+                                .to_lowercase()
+                                .contains(&t)
                     })
                     .count();
                 self.scroll_to_row = Some(i);
@@ -1253,14 +1354,16 @@ impl MonitorApp {
     }
 
     fn copy_selected(&mut self, ctx: &Context) {
-        let Some(s) = self.sessions.get(self.active) else { return };
+        let Some(s) = self.sessions.get(self.active) else {
+            return;
+        };
         let Some(si) = s.selected else { return };
         let Some(r) = s.rows.get(si) else { return };
         let mut line = format!(
             "#{}\t{}\t{}\t{}",
             r.seq,
             fmt_time(r.secs, r.millis),
-            &chan_label(s, r.idx),
+            chan_label(s, r.idx),
             if r.dir_tx { "写" } else { "读" }
         );
         if let Some(p) = &r.parsed {
@@ -1268,8 +1371,12 @@ impl MonitorApp {
                 "\tID={} FC=0x{:02X} ADDR={} QTY={}",
                 p.id,
                 p.function,
-                p.address.map(|a| a.to_string()).unwrap_or_else(|| "-".into()),
-                p.quantity.map(|a| a.to_string()).unwrap_or_else(|| "-".into())
+                p.address
+                    .map(|a| a.to_string())
+                    .unwrap_or_else(|| "-".into()),
+                p.quantity
+                    .map(|a| a.to_string())
+                    .unwrap_or_else(|| "-".into())
             );
         }
         line += &format!("\t{}", bytes_hex(&r.data));
@@ -1293,7 +1400,10 @@ impl MonitorApp {
                         ui.close_menu();
                     }
                     ui.separator();
-                    if ui.add_enabled(has, egui::Button::new("保存会话（.umses，可重新打开）")).clicked() {
+                    if ui
+                        .add_enabled(has, egui::Button::new("保存会话（.umses，可重新打开）"))
+                        .clicked()
+                    {
                         self.save_archive_active();
                         ui.close_menu();
                     }
@@ -1302,7 +1412,10 @@ impl MonitorApp {
                         ui.close_menu();
                     }
                     ui.separator();
-                    if ui.add_enabled(has, egui::Button::new("导出日志（文本/HEX）")).clicked() {
+                    if ui
+                        .add_enabled(has, egui::Button::new("导出日志（文本/HEX）"))
+                        .clicked()
+                    {
                         self.save_active();
                         ui.close_menu();
                     }
@@ -1354,7 +1467,7 @@ impl MonitorApp {
                             self.stop_driver_capture();
                             self.drv_note = "驱动捕获已停止".into();
                             self.toast("已停止驱动捕获");
-                        ui.close_menu();
+                            ui.close_menu();
                         }
                         ui.label("  驱动捕获运行中");
                     } else if ui.button("启用驱动捕获(推荐)").clicked() {
@@ -1364,7 +1477,7 @@ impl MonitorApp {
                             // 失败时把完整指引塞进对话框，状态栏只放一句摘要。
                             self.dlg_drv = true;
                             self.toast("驱动不可用，已打开设置对话框查看原因");
-                        ui.close_menu();
+                            ui.close_menu();
                         }
                     }
                     if ui.button("驱动捕获设置…").clicked() {
@@ -1382,7 +1495,10 @@ impl MonitorApp {
                         self.dlg_find = true;
                         ui.close_menu();
                     }
-                    if ui.add_enabled(has, egui::Button::new("查找下一个")).clicked() {
+                    if ui
+                        .add_enabled(has, egui::Button::new("查找下一个"))
+                        .clicked()
+                    {
                         self.find_next();
                         ui.close_menu();
                     }
@@ -1407,7 +1523,11 @@ impl MonitorApp {
                     }
                     ui.separator();
                     ui.menu_button("显示编码（决定监控内容如何解码）", |ui| {
-                        ui.label(RichText::new("作用于全部视图 / 查找 / 过滤 / 复制 / 导出文本").weak().small());
+                        ui.label(
+                            RichText::new("作用于全部视图 / 查找 / 过滤 / 复制 / 导出文本")
+                                .weak()
+                                .small(),
+                        );
                         for e in DisplayEncoding::ALL {
                             let r = ui.radio(self.display_enc == e, e.label());
                             if r.clicked() {
@@ -1417,15 +1537,18 @@ impl MonitorApp {
                             r.on_hover_text(e.hint());
                         }
                         ui.separator();
-                        ui.menu_button("导出文件编码（仅决定日志文件的字节格式）", |ui| {
-                            for (i, name) in ENCS.iter().enumerate() {
-                                if ui.radio(self.save_enc == i, *name).clicked() {
-                                    self.save_enc = i;
-                                    self.save_cfg();
-                                    ui.close_menu();
+                        ui.menu_button(
+                            "导出文件编码（仅决定日志文件的字节格式）",
+                            |ui| {
+                                for (i, name) in ENCS.iter().enumerate() {
+                                    if ui.radio(self.save_enc == i, *name).clicked() {
+                                        self.save_enc = i;
+                                        self.save_cfg();
+                                        ui.close_menu();
+                                    }
                                 }
-                            }
-                        });
+                            },
+                        );
                     });
                 });
                 ui.menu_button("视图", |ui| {
@@ -1434,7 +1557,11 @@ impl MonitorApp {
                     } else {
                         // View visibility used to be settable only at creation time, so a
                         // session created without the Modbus view could never show it.
-                        ui.label(RichText::new("显示/隐藏视图（对当前会话即时生效）").weak().small());
+                        ui.label(
+                            RichText::new("显示/隐藏视图（对当前会话即时生效）")
+                                .weak()
+                                .small(),
+                        );
                         let s = &mut self.sessions[self.active];
                         let mut changed = false;
                         changed |= ui.checkbox(&mut s.views.table, "Table 视图").changed();
@@ -1479,7 +1606,10 @@ impl MonitorApp {
                     } else {
                         RichText::new(s.name.clone())
                     };
-                    if ui.add(SelectableLabel::new(i == self.active, label)).clicked() {
+                    if ui
+                        .add(SelectableLabel::new(i == self.active, label))
+                        .clicked()
+                    {
                         click_tab = Some(i);
                     }
                     if ui.small_button("×").clicked() {
@@ -1489,7 +1619,7 @@ impl MonitorApp {
                 }
                 if ui.button("＋ 新建").clicked() {
                     self.dlg_new = true;
-                        ui.close_menu();
+                    ui.close_menu();
                 }
                 if let Some(i) = click_tab {
                     self.active = i;
@@ -1588,7 +1718,9 @@ impl MonitorApp {
     }
 
     fn enabled_views(&self) -> Vec<usize> {
-        let Some(s) = self.sessions.get(self.active) else { return vec![0] };
+        let Some(s) = self.sessions.get(self.active) else {
+            return vec![0];
+        };
         let v = &s.views;
         (0..5)
             .filter(|i| match i {
@@ -1608,9 +1740,12 @@ impl MonitorApp {
                 ui.heading("万能串口监控");
                 ui.label("串口 / TCP / UDP / Modbus 通信监控 · 协议解析 · 预设库");
                 ui.add_space(12.0);
-                if ui.button(RichText::new("新建监控会话…").size(18.0)).clicked() {
+                if ui
+                    .button(RichText::new("新建监控会话…").size(18.0))
+                    .clicked()
+                {
                     self.dlg_new = true;
-                        ui.close_menu();
+                    ui.close_menu();
                 }
             });
             return;
@@ -1627,7 +1762,10 @@ impl MonitorApp {
                 } else {
                     RichText::new(VIEW_NAMES[*i])
                 };
-                if ui.add(SelectableLabel::new(self.view_sel == *i, label)).clicked() {
+                if ui
+                    .add(SelectableLabel::new(self.view_sel == *i, label))
+                    .clicked()
+                {
                     self.view_sel = *i;
                 }
                 ui.separator();
@@ -1650,7 +1788,9 @@ impl MonitorApp {
     }
 
     fn view_table(&mut self, ui: &mut Ui) {
-        let Some(s) = self.sessions.get_mut(self.active) else { return };
+        let Some(s) = self.sessions.get_mut(self.active) else {
+            return;
+        };
         let enc = s.display_encoding;
         let vis: Vec<usize> = s
             .rows
@@ -1687,7 +1827,16 @@ impl MonitorApp {
             .column(Column::initial(380.0).at_least(120.0))
             .column(Column::remainder().at_least(80.0))
             .header(20.0, |mut h| {
-                for t in ["序号", "时间", "通道", "方向", "功能", "长度", "Hex数据", "数据"] {
+                for t in [
+                    "序号",
+                    "时间",
+                    "通道",
+                    "方向",
+                    "功能",
+                    "长度",
+                    "Hex数据",
+                    "数据",
+                ] {
                     h.col(|ui| {
                         ui.strong(t);
                     });
@@ -1713,7 +1862,11 @@ impl MonitorApp {
                             ui.label(chan_label(s, r.idx));
                         });
                         row.col(|ui| {
-                            let (t, c) = if r.dir_tx { ("写", C_TX) } else { ("读", C_RX) };
+                            let (t, c) = if r.dir_tx {
+                                ("写", C_TX)
+                            } else {
+                                ("读", C_RX)
+                            };
                             ui.colored_label(c, t);
                         });
                         row.col(|ui| {
@@ -1791,7 +1944,9 @@ impl MonitorApp {
     }
 
     fn view_terminal(&mut self, ui: &mut Ui) {
-        let Some(s) = self.sessions.get_mut(self.active) else { return };
+        let Some(s) = self.sessions.get_mut(self.active) else {
+            return;
+        };
         let enc = s.display_encoding;
         let vis: Vec<usize> = s
             .rows
@@ -1808,7 +1963,11 @@ impl MonitorApp {
             for &ri in &vis[start..] {
                 let r = &s.rows[ri];
                 let chan = chan_label(s, r.idx);
-                let (tag, c) = if r.dir_tx { ("[TX]", C_TX) } else { ("[RX]", C_RX) };
+                let (tag, c) = if r.dir_tx {
+                    ("[TX]", C_TX)
+                } else {
+                    ("[RX]", C_RX)
+                };
                 let line = escape_text(&r.data, esc, enc);
                 let resp = ui.horizontal(|ui| {
                     ui.monospace(RichText::new(fmt_time(r.secs, r.millis)).weak().small());
@@ -1827,7 +1986,9 @@ impl MonitorApp {
     }
 
     fn view_dump(&mut self, ui: &mut Ui) {
-        let Some(s) = self.sessions.get_mut(self.active) else { return };
+        let Some(s) = self.sessions.get_mut(self.active) else {
+            return;
+        };
         let enc = s.display_encoding;
         let vis: Vec<usize> = s
             .rows
@@ -1838,75 +1999,83 @@ impl MonitorApp {
             .collect();
         let start = vis.len().saturating_sub(1200);
         let mut clicked: Option<usize> = None;
-        ScrollArea::vertical().stick_to_bottom(s.auto_scroll).show(ui, |ui| {
-            for &ri in &vis[start..] {
-                let r = &s.rows[ri];
-                let chan = chan_label(s, r.idx);
-                let (tag, c) = if r.dir_tx { ("TX", C_TX) } else { ("RX", C_RX) };
-                let head = format!(
-                    "#{} {} {} {} {}B",
-                    r.seq,
-                    fmt_time(r.secs, r.millis),
-                    chan,
-                    tag,
-                    r.data.len()
-                );
-                let hr = ui.horizontal(|ui| {
-                    ui.colored_label(c, RichText::new(head).strong().small());
-                });
-                if hr.response.clicked() {
-                    clicked = Some(ri);
-                }
-                for (off, chunk) in r.data.chunks(16).enumerate() {
-                    let mut hex = String::new();
-                    let mut asc = String::new();
-                    for (j, &b) in chunk.iter().enumerate() {
-                        hex += &format!("{:02X} ", b);
-                        if j == 7 {
-                            hex.push(' ');
+        ScrollArea::vertical()
+            .stick_to_bottom(s.auto_scroll)
+            .show(ui, |ui| {
+                for &ri in &vis[start..] {
+                    let r = &s.rows[ri];
+                    let chan = chan_label(s, r.idx);
+                    let (tag, c) = if r.dir_tx { ("TX", C_TX) } else { ("RX", C_RX) };
+                    let head = format!(
+                        "#{} {} {} {} {}B",
+                        r.seq,
+                        fmt_time(r.secs, r.millis),
+                        chan,
+                        tag,
+                        r.data.len()
+                    );
+                    let hr = ui.horizontal(|ui| {
+                        ui.colored_label(c, RichText::new(head).strong().small());
+                    });
+                    if hr.response.clicked() {
+                        clicked = Some(ri);
+                    }
+                    for (off, chunk) in r.data.chunks(16).enumerate() {
+                        let mut hex = String::new();
+                        let mut asc = String::new();
+                        for (j, &b) in chunk.iter().enumerate() {
+                            hex += &format!("{:02X} ", b);
+                            if j == 7 {
+                                hex.push(' ');
+                            }
+                            asc.push(if (0x20..0x7F).contains(&b) {
+                                b as char
+                            } else {
+                                '.'
+                            });
                         }
-                        asc.push(if (0x20..0x7F).contains(&b) { b as char } else { '.' });
+                        let hr = ui.horizontal(|ui| {
+                            ui.monospace(RichText::new(format!("{:04X}  ", off * 16)).weak());
+                            ui.monospace(RichText::new(format!("{:<50}", hex.trim_end())).color(c));
+                            ui.monospace(asc);
+                        });
+                        if hr.response.clicked() {
+                            clicked = Some(ri);
+                        }
                     }
-                    let hr = ui.horizontal(|ui| {
-                        ui.monospace(RichText::new(format!("{:04X}  ", off * 16)).weak());
-                        ui.monospace(RichText::new(format!("{:<50}", hex.trim_end())).color(c));
-                        ui.monospace(asc);
-                    });
-                    if hr.response.clicked() {
-                        clicked = Some(ri);
+                    // Hex dump stays byte-for-byte (that is what a dump *is*), but a decoded
+                    // preview is what makes GBK/UTF-16 payloads readable — the dump view used
+                    // to be the one place where even the ASCII column was byte-wise.
+                    let preview =
+                        text_codec::decoded_text(&r.data, enc).replace(['\r', '\n', '\t'], " ");
+                    if !preview.is_empty() {
+                        let shown: String = if preview.chars().count() > 160 {
+                            let mut t: String = preview.chars().take(160).collect();
+                            t.push('…');
+                            t
+                        } else {
+                            preview
+                        };
+                        let hr = ui.horizontal(|ui| {
+                            ui.monospace(RichText::new("文本  ").weak());
+                            ui.monospace(RichText::new(shown).color(c));
+                        });
+                        if hr.response.clicked() {
+                            clicked = Some(ri);
+                        }
                     }
+                    ui.separator();
                 }
-                // Hex dump stays byte-for-byte (that is what a dump *is*), but a decoded
-                // preview is what makes GBK/UTF-16 payloads readable — the dump view used
-                // to be the one place where even the ASCII column was byte-wise.
-                let preview = text_codec::decoded_text(&r.data, enc)
-                    .replace(['\r', '\n', '\t'], " ");
-                if !preview.is_empty() {
-                    let shown: String = if preview.chars().count() > 160 {
-                        let mut t: String = preview.chars().take(160).collect();
-                        t.push('…');
-                        t
-                    } else {
-                        preview
-                    };
-                    let hr = ui.horizontal(|ui| {
-                        ui.monospace(RichText::new("文本  ").weak());
-                        ui.monospace(RichText::new(shown).color(c));
-                    });
-                    if hr.response.clicked() {
-                        clicked = Some(ri);
-                    }
-                }
-                ui.separator();
-            }
-        });
+            });
         if let Some(i) = clicked {
             s.selected = Some(i);
         }
     }
 
     fn view_line(&mut self, ui: &mut Ui) {
-        let Some(s) = self.sessions.get(self.active) else { return };
+        let Some(s) = self.sessions.get(self.active) else {
+            return;
+        };
         // Build a continuous per-second series ending at "now": gaps (seconds with no
         // traffic) must show as zero rather than being compressed away, which is what
         // made the old enumerate()-based x axis misleading.
@@ -1927,10 +2096,18 @@ impl MonitorApp {
         let (_, cur_tx) = s.current_rate();
         let (_, pk_tx) = s.peak_rate();
         ui.horizontal(|ui| {
-            ui.label(RichText::new(format!("当前 ↑{cur_tx} B/s")).color(C_TX).strong());
+            ui.label(
+                RichText::new(format!("当前 ↑{cur_tx} B/s"))
+                    .color(C_TX)
+                    .strong(),
+            );
             ui.label(RichText::new(format!("峰值 ↑{pk_tx} B/s")).weak());
             ui.separator();
-            ui.label(RichText::new("每点 = 1 秒内实际字节数，空闲秒补 0").weak().small());
+            ui.label(
+                RichText::new("每点 = 1 秒内实际字节数，空闲秒补 0")
+                    .weak()
+                    .small(),
+            );
         });
         Plot::new("line_plot")
             .legend(Legend::default())
@@ -1945,7 +2122,9 @@ impl MonitorApp {
     }
 
     fn view_modbus(&mut self, ui: &mut Ui) {
-        let Some(s) = self.sessions.get_mut(self.active) else { return };
+        let Some(s) = self.sessions.get_mut(self.active) else {
+            return;
+        };
         let enc = s.display_encoding;
         let vis: Vec<usize> = s
             .rows
@@ -1990,7 +2169,10 @@ impl MonitorApp {
             .column(Column::initial(150.0).at_least(110.0))
             .column(Column::initial(170.0).at_least(90.0))
             .header(20.0, |mut h| {
-                for t in ["序号", "ID", "Function", "Address", "Quantity", "Values", "CheckSum", "COM", "Time", "Remark"] {
+                for t in [
+                    "序号", "ID", "Function", "Address", "Quantity", "Values", "CheckSum", "COM",
+                    "Time", "Remark",
+                ] {
                     h.col(|ui| {
                         ui.strong(t);
                     });
@@ -2004,7 +2186,10 @@ impl MonitorApp {
                     body.row(20.0, |mut row| {
                         row.col(|ui| {
                             let label = RichText::new(format!("{}", r.seq)).color(col);
-                            if ui.add(SelectableLabel::new(s.selected == Some(ri), label)).clicked() {
+                            if ui
+                                .add(SelectableLabel::new(s.selected == Some(ri), label))
+                                .clicked()
+                            {
                                 clicked = Some(ri);
                             }
                         });
@@ -2016,12 +2201,16 @@ impl MonitorApp {
                         });
                         row.col(|ui| {
                             ui.monospace(
-                                p.address.map(|a| a.to_string()).unwrap_or_else(|| "-".into()),
+                                p.address
+                                    .map(|a| a.to_string())
+                                    .unwrap_or_else(|| "-".into()),
                             );
                         });
                         row.col(|ui| {
                             ui.monospace(
-                                p.quantity.map(|a| a.to_string()).unwrap_or_else(|| "-".into()),
+                                p.quantity
+                                    .map(|a| a.to_string())
+                                    .unwrap_or_else(|| "-".into()),
                             );
                         });
                         row.col(|ui| {
@@ -2030,22 +2219,36 @@ impl MonitorApp {
                                 Some(vs) if vs.is_empty() => "-".to_string(),
                                 Some(vs) => {
                                     if dec {
-                                        vs.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(" ")
+                                        vs.iter()
+                                            .map(|b| b.to_string())
+                                            .collect::<Vec<_>>()
+                                            .join(" ")
                                     } else {
-                                        vs.iter().map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(" ")
+                                        vs.iter()
+                                            .map(|b| format!("{:02X}", b))
+                                            .collect::<Vec<_>>()
+                                            .join(" ")
                                     }
                                 }
                             };
                             let mut shown = v;
                             if shown.chars().count() > s.string_len.max(8) * 3 {
-                                shown = shown.chars().take(s.string_len.max(8) * 3).collect::<String>() + "…";
+                                shown = shown
+                                    .chars()
+                                    .take(s.string_len.max(8) * 3)
+                                    .collect::<String>()
+                                    + "…";
                             }
                             ui.monospace(shown);
                         });
                         row.col(|ui| {
                             let mark = match p.checksum_ok {
-                                Some(true) => RichText::new(format!("{} ✓", p.checksum)).color(C_RESP),
-                                Some(false) => RichText::new(format!("{} ✗", p.checksum)).color(C_FAIL),
+                                Some(true) => {
+                                    RichText::new(format!("{} ✓", p.checksum)).color(C_RESP)
+                                }
+                                Some(false) => {
+                                    RichText::new(format!("{} ✗", p.checksum)).color(C_FAIL)
+                                }
                                 None => RichText::new(p.checksum.clone()).weak(),
                             };
                             ui.monospace(mark);
@@ -2077,6 +2280,16 @@ impl MonitorApp {
     fn detail_pane(&mut self, ui: &mut Ui) {
         // Snapshot everything first: rendering must not hold a borrow of `self.sessions`
         // while also needing `&mut self` for the action buttons below.
+        /// The Modbus fields worth showing for one frame:
+        /// (kind, function code, address, quantity, checksum text, checksum verdict).
+        type ParsedSummary = (
+            crate::protocol::FrameKind,
+            u8,
+            Option<u16>,
+            Option<u16>,
+            String,
+            Option<bool>,
+        );
         struct Snapshot {
             seq: u64,
             when: String,
@@ -2085,7 +2298,7 @@ impl MonitorApp {
             len: usize,
             hex: String,
             text: String,
-            parsed: Option<(crate::protocol::FrameKind, u8, Option<u16>, Option<u16>, String, Option<bool>)>,
+            parsed: Option<ParsedSummary>,
             control: Option<String>,
         }
         let snap: Option<Snapshot> = {
@@ -2107,7 +2320,14 @@ impl MonitorApp {
                 hex: bytes_hex(&r.data),
                 text: escape_text(&r.data, s.ascii_escape, enc),
                 parsed: r.parsed.as_ref().map(|p| {
-                    (p.kind, p.function, p.address, p.quantity, p.checksum.clone(), p.checksum_ok)
+                    (
+                        p.kind,
+                        p.function,
+                        p.address,
+                        p.quantity,
+                        p.checksum.clone(),
+                        p.checksum_ok,
+                    )
                 }),
                 control: r.control.as_ref().map(|c| c.summary()),
             })
@@ -2125,7 +2345,11 @@ impl MonitorApp {
                     ui.monospace(RichText::new(format!("#{}", v.seq)).strong());
                     ui.monospace(&v.when);
                     ui.label(&v.chan);
-                    let (t, c) = if v.dir_tx { ("写 TX", C_TX) } else { ("读 RX", C_RX) };
+                    let (t, c) = if v.dir_tx {
+                        ("写 TX", C_TX)
+                    } else {
+                        ("读 RX", C_RX)
+                    };
                     ui.colored_label(c, t);
                     ui.label(RichText::new(format!("{} 字节", v.len)).weak());
                     if let Some((kind, fc, addr, qty, crc, ok)) = &v.parsed {
@@ -2219,16 +2443,28 @@ impl MonitorApp {
             .map(|s| s.auto_scroll)
             .unwrap_or(true);
         ui.horizontal(|ui| {
-            if ui.add_enabled(has, egui::Button::new("导出会话（.umses）")).clicked() {
+            if ui
+                .add_enabled(has, egui::Button::new("导出会话（.umses）"))
+                .clicked()
+            {
                 do_archive = true;
             }
-            if ui.add_enabled(has, egui::Button::new("导出日志（文本+HEX）")).clicked() {
+            if ui
+                .add_enabled(has, egui::Button::new("导出日志（文本+HEX）"))
+                .clicked()
+            {
                 do_log = true;
             }
-            if ui.add_enabled(has, egui::Button::new("导出项目信息（JSON）")).clicked() {
+            if ui
+                .add_enabled(has, egui::Button::new("导出项目信息（JSON）"))
+                .clicked()
+            {
                 do_info = true;
             }
-            if ui.add_enabled(has, egui::Button::new("复制全部为 CSV")).clicked() {
+            if ui
+                .add_enabled(has, egui::Button::new("复制全部为 CSV"))
+                .clicked()
+            {
                 do_csv = true;
             }
             ui.separator();
@@ -2273,7 +2509,13 @@ impl MonitorApp {
         let safe: String = s
             .name
             .chars()
-            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect();
         let path = format!("project_info_{safe}_{secs}.json");
 
@@ -2396,7 +2638,9 @@ impl MonitorApp {
     /// Copy every visible row as CSV (header included), honouring the current filters
     /// and display encoding — the fastest way to get a capture into a spreadsheet.
     fn copy_all_csv(&mut self) {
-        let Some(s) = self.sessions.get(self.active) else { return };
+        let Some(s) = self.sessions.get(self.active) else {
+            return;
+        };
         let enc = s.display_encoding;
         let mut out = String::from("序号,时间,通道,方向,功能,长度,HEX,文本\n");
         let mut n = 0usize;
@@ -2414,7 +2658,11 @@ impl MonitorApp {
             } else if let Some(c) = &r.control {
                 c.summary()
             } else if r.origin == RowOrigin::Driver {
-                if r.dir_tx { "串口写".to_string() } else { "串口读".to_string() }
+                if r.dir_tx {
+                    "串口写".to_string()
+                } else {
+                    "串口读".to_string()
+                }
             } else {
                 r.kind.name().to_string()
             };
@@ -2511,7 +2759,9 @@ impl MonitorApp {
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
-                    ui.label("当前还有监控会话。退出前建议先「保存会话」，否则本次采集的数据会丢失。");
+                    ui.label(
+                        "当前还有监控会话。退出前建议先「保存会话」，否则本次采集的数据会丢失。",
+                    );
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         if ui.button("保存会话并退出").clicked() {
@@ -2528,14 +2778,17 @@ impl MonitorApp {
                 });
         }
         if self.dlg_about {
-            Window::new("关于").collapsible(false).resizable(false).show(ctx, |ui| {
-                ui.heading("万能串口监控 v1.0");
-                ui.separator();
-                ui.label("串口 / TCP / UDP / Modbus 通信监控");
-                ui.label("五视图: Table / 终端 / Dump / Line曲线 / Modbus");
-                ui.label("内置 23 请求 + 43 响应 Modbus 预设");
-                ui.label("原创实现，不含任何第三方程序的品牌资源");
-            });
+            Window::new("关于")
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.heading("万能串口监控 v1.0");
+                    ui.separator();
+                    ui.label("串口 / TCP / UDP / Modbus 通信监控");
+                    ui.label("五视图: Table / 终端 / Dump / Line曲线 / Modbus");
+                    ui.label("内置 23 请求 + 43 响应 Modbus 预设");
+                    ui.label("原创实现，不含任何第三方程序的品牌资源");
+                });
         }
         if self.dlg_attach {
             Window::new("附加到进程(串口拦截)")
@@ -2583,7 +2836,7 @@ impl MonitorApp {
             }
             if ui.button("重新检测").clicked() {
                 self.probe_driver_availability(true);
-                        ui.close_menu();
+                ui.close_menu();
             }
         });
         ui.label(
@@ -2643,7 +2896,11 @@ impl MonitorApp {
                 .values()
                 .map(|path| {
                     let short = short_dev(path);
-                    let com = self.drv_com.get(path).cloned().unwrap_or_else(|| short.clone());
+                    let com = self
+                        .drv_com
+                        .get(path)
+                        .cloned()
+                        .unwrap_or_else(|| short.clone());
                     (com, short)
                 })
                 .collect();
@@ -2692,14 +2949,17 @@ impl MonitorApp {
             let hint = crate::driver::open_failure_hint(err);
             ui.separator();
             ui.label(RichText::new("如何让它可用：").strong());
-            ScrollArea::vertical().id_source("drv_hint").max_height(170.0).show(ui, |ui| {
-                // 文案里带命令，用等宽字体才对得上复制粘贴时的空格。
-                ui.monospace(hint);
-            });
+            ScrollArea::vertical()
+                .id_source("drv_hint")
+                .max_height(170.0)
+                .show(ui, |ui| {
+                    // 文案里带命令，用等宽字体才对得上复制粘贴时的空格。
+                    ui.monospace(hint);
+                });
             if ui.button("复制安装命令").clicked() {
                 let cmd = "sc create UmSerialFilter type= kernel binPath= <umserialfilter.sys 完整路径>\r\nsc start UmSerialFilter\r\nsc query UmSerialFilter";
                 ui.output_mut(|o| o.copied_text = cmd.to_string());
-                        ui.close_menu();
+                ui.close_menu();
             }
             ui.add_space(4.0);
             ui.label(
@@ -2723,7 +2983,7 @@ impl MonitorApp {
             );
             if ui.button("重新扫描端口").clicked() {
                 self.rescan_driver_ports();
-                        ui.close_menu();
+                ui.close_menu();
             }
         });
         if self.drv_names.is_empty() {
@@ -2741,27 +3001,32 @@ impl MonitorApp {
                 .map(|(i, d)| (*i, d.clone()))
                 .collect();
             rows.sort_by_key(|(i, _)| *i);
-            ScrollArea::vertical().id_source("drv_ports").max_height(130.0).show(ui, |ui| {
-                egui::Grid::new("drv_port_grid").striped(true).show(ui, |ui| {
-                    ui.strong("序号");
-                    ui.strong("设备路径");
-                    ui.strong("短名");
-                    ui.strong("会话通道");
-                    ui.end_row();
-                    for (idx, dev) in rows {
-                        ui.monospace(idx.to_string());
-                        ui.monospace(&dev);
-                        ui.label(short_dev(&dev));
-                        let linked = self.drv_ports.iter().any(|((_, pi), _)| *pi == idx);
-                        if linked {
-                            ui.label(RichText::new("已接入").color(C_RX));
-                        } else {
-                            ui.label(RichText::new("等待数据").weak());
-                        }
-                        ui.end_row();
-                    }
+            ScrollArea::vertical()
+                .id_source("drv_ports")
+                .max_height(130.0)
+                .show(ui, |ui| {
+                    egui::Grid::new("drv_port_grid")
+                        .striped(true)
+                        .show(ui, |ui| {
+                            ui.strong("序号");
+                            ui.strong("设备路径");
+                            ui.strong("短名");
+                            ui.strong("会话通道");
+                            ui.end_row();
+                            for (idx, dev) in rows {
+                                ui.monospace(idx.to_string());
+                                ui.monospace(&dev);
+                                ui.label(short_dev(&dev));
+                                let linked = self.drv_ports.iter().any(|((_, pi), _)| *pi == idx);
+                                if linked {
+                                    ui.label(RichText::new("已接入").color(C_RX));
+                                } else {
+                                    ui.label(RichText::new("等待数据").weak());
+                                }
+                                ui.end_row();
+                            }
+                        });
                 });
-            });
         }
 
         // --- PID 过滤 ---
@@ -2776,12 +3041,12 @@ impl MonitorApp {
             if ui.button("应用").clicked() {
                 let pid: u32 = self.drv_pid_text.trim().parse().unwrap_or(0);
                 self.apply_driver_pid(pid);
-                        ui.close_menu();
+                ui.close_menu();
             }
             if ui.button("所有进程").clicked() {
                 self.drv_pid_text = "0".into();
                 self.apply_driver_pid(0);
-                        ui.close_menu();
+                ui.close_menu();
             }
             let cur = self.drv_pid.unwrap_or(0);
             ui.label(
@@ -2808,7 +3073,7 @@ impl MonitorApp {
                     self.stop_driver_capture();
                     self.drv_note = "驱动捕获已停止".into();
                     self.toast("已停止驱动捕获");
-                        ui.close_menu();
+                    ui.close_menu();
                 }
             } else if ui
                 .add_enabled(self.drv_avail, egui::Button::new("开始捕获"))
@@ -2824,21 +3089,24 @@ impl MonitorApp {
             }
             if ui.button("关闭").clicked() {
                 self.dlg_drv = false;
-                        ui.close_menu();
+                ui.close_menu();
             }
         });
         // 驱动不可用时上面已经完整显示过 open_failure_hint，底部不再重复一遍；
         // 这里只负责「已可用」或「捕获中」的操作结果回显。
         if !self.drv_note.is_empty() && (capturing || self.drv_avail) {
             ui.add_space(4.0);
-            ScrollArea::vertical().id_source("drv_note").max_height(90.0).show(ui, |ui| {
-                ui.label(RichText::new(&self.drv_note).small());
-            });
+            ScrollArea::vertical()
+                .id_source("drv_note")
+                .max_height(90.0)
+                .show(ui, |ui| {
+                    ui.label(RichText::new(&self.drv_note).small());
+                });
         }
         ui.separator();
         if ui.button("关闭").clicked() {
             self.dlg_drv = false;
-                        ui.close_menu();
+            ui.close_menu();
         }
     }
 
@@ -2905,9 +3173,7 @@ impl MonitorApp {
             }
         }
 
-        ui.label(
-            egui::RichText::new("附加到进程（被动拦截，不占用串口）").strong(),
-        );
+        ui.label(egui::RichText::new("附加到进程（被动拦截，不占用串口）").strong());
         ui.add_space(4.0);
 
         // --- filter row ---
@@ -2923,14 +3189,14 @@ impl MonitorApp {
             }
             if ui.button("清空").clicked() {
                 self.attach_filter.clear();
-                        ui.close_menu();
+                ui.close_menu();
             }
             ui.checkbox(&mut self.attach_only_apps, "只看应用进程");
             if ui.button("刷新").clicked() {
                 self.procs = inject::list_processes();
                 self.holders_at = 0;
                 self.attach_sel = None;
-                        ui.close_menu();
+                ui.close_menu();
             }
         });
 
@@ -2939,11 +3205,7 @@ impl MonitorApp {
         //   * a name-based candidate scan (helps before anything is injected), and
         //   * the hook's own OPEN reports — a PID that reported opening a watched
         //     port definitely holds it, and is marked accordingly.
-        let confirmed: Vec<u32> = self
-            .hook_ports
-            .keys()
-            .map(|(pid, _)| *pid)
-            .collect();
+        let confirmed: Vec<u32> = self.hook_ports.keys().map(|(pid, _)| *pid).collect();
         let holder_txt = format!("{} 个进程；{}", self.procs.len(), self.holder_note);
         if confirmed.is_empty() && self.port_holders.is_empty() {
             ui.label(egui::RichText::new(holder_txt).weak());
@@ -3012,10 +3274,7 @@ impl MonitorApp {
                 self.attach_selected();
             }
             if ui
-                .add_enabled(
-                    self.attach_sel.is_some(),
-                    egui::Button::new("复制 PID"),
-                )
+                .add_enabled(self.attach_sel.is_some(), egui::Button::new("复制 PID"))
                 .clicked()
             {
                 if let Some(i) = self.attach_sel {
@@ -3025,7 +3284,7 @@ impl MonitorApp {
             }
             if ui.button("关闭").clicked() {
                 self.dlg_attach = false;
-                        ui.close_menu();
+                ui.close_menu();
             }
         });
         ui.add_space(2.0);
@@ -3041,7 +3300,7 @@ impl MonitorApp {
         ui.separator();
         if ui.button("关闭").clicked() {
             self.dlg_attach = false;
-                        ui.close_menu();
+            ui.close_menu();
         }
     }
 
@@ -3058,8 +3317,7 @@ impl MonitorApp {
             Ok(()) => {
                 self.toast(format!("已注入 {name} (PID {pid})，其串口读写将被拦截"));
                 if let Some(s) = self.sessions.get_mut(self.active) {
-                    s.notices
-                        .push(format!("已附加 {name} (PID {pid})"));
+                    s.notices.push(format!("已附加 {name} (PID {pid})"));
                 }
                 self.dlg_attach = false;
             }
@@ -3089,11 +3347,7 @@ impl MonitorApp {
                 if self.sessions.iter().any(|s| s.cap_pid == Some(pid)) {
                     return; // hook reconnected — session already exists
                 }
-                let short = exe
-                    .rsplit(['\\', '/'])
-                    .next()
-                    .unwrap_or("")
-                    .to_string();
+                let short = exe.rsplit(['\\', '/']).next().unwrap_or("").to_string();
                 // With a passive (串口监听) session open, data must flow into THAT
                 // session — auto-attach must not spawn a new window per process.
                 let has_passive = self
@@ -3244,34 +3498,34 @@ impl MonitorApp {
                 // Passive listening: baud/line settings belong to the program that
                 // owns the port, not to us — nothing to configure here.
             } else {
-            ComboBox::from_label("波特率")
-                .selected_text(format!("{}", BAUDS[self.baud_i]))
-                .show_ui(ui, |ui| {
-                    for (i, b) in BAUDS.iter().enumerate() {
-                        ui.selectable_value(&mut self.baud_i, i, format!("{}", b));
-                    }
+                ComboBox::from_label("波特率")
+                    .selected_text(format!("{}", BAUDS[self.baud_i]))
+                    .show_ui(ui, |ui| {
+                        for (i, b) in BAUDS.iter().enumerate() {
+                            ui.selectable_value(&mut self.baud_i, i, format!("{}", b));
+                        }
+                    });
+                ui.horizontal(|ui| {
+                    ComboBox::from_label("数据位")
+                        .selected_text(if self.data_i == 0 { "7" } else { "8" })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.data_i, 0, "7");
+                            ui.selectable_value(&mut self.data_i, 1, "8");
+                        });
+                    ComboBox::from_label("校验")
+                        .selected_text(["无", "偶", "奇"][self.parity_i])
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.parity_i, 0, "无");
+                            ui.selectable_value(&mut self.parity_i, 1, "偶");
+                            ui.selectable_value(&mut self.parity_i, 2, "奇");
+                        });
+                    ComboBox::from_label("停止位")
+                        .selected_text(if self.stop_i == 0 { "1" } else { "2" })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.stop_i, 0, "1");
+                            ui.selectable_value(&mut self.stop_i, 1, "2");
+                        });
                 });
-            ui.horizontal(|ui| {
-                ComboBox::from_label("数据位")
-                    .selected_text(if self.data_i == 0 { "7" } else { "8" })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.data_i, 0, "7");
-                        ui.selectable_value(&mut self.data_i, 1, "8");
-                    });
-                ComboBox::from_label("校验")
-                    .selected_text(["无", "偶", "奇"][self.parity_i])
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.parity_i, 0, "无");
-                        ui.selectable_value(&mut self.parity_i, 1, "偶");
-                        ui.selectable_value(&mut self.parity_i, 2, "奇");
-                    });
-                ComboBox::from_label("停止位")
-                    .selected_text(if self.stop_i == 0 { "1" } else { "2" })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.stop_i, 0, "1");
-                        ui.selectable_value(&mut self.stop_i, 1, "2");
-                    });
-            });
             }
         } else {
             ui.horizontal(|ui| {
@@ -3291,7 +3545,12 @@ impl MonitorApp {
                 .label(),
             )
             .show_ui(ui, |ui| {
-                let vals = [(0, ProtoType::None), (1, ProtoType::Rtu), (2, ProtoType::Ascii), (3, ProtoType::Tcp)];
+                let vals = [
+                    (0, ProtoType::None),
+                    (1, ProtoType::Rtu),
+                    (2, ProtoType::Ascii),
+                    (3, ProtoType::Tcp),
+                ];
                 for (i, p) in vals {
                     ui.selectable_value(&mut self.proto_sel, i, p.label());
                 }
@@ -3309,17 +3568,17 @@ impl MonitorApp {
         ui.horizontal(|ui| {
             if ui.button("确定").clicked() {
                 self.new_session();
-                        ui.close_menu();
+                ui.close_menu();
             }
             if ui.button("取消").clicked() {
                 self.dlg_new = false;
-                        ui.close_menu();
+                ui.close_menu();
             }
         });
         ui.separator();
         if ui.button("关闭").clicked() {
             self.dlg_new = false;
-                        ui.close_menu();
+            ui.close_menu();
         }
     }
 
@@ -3390,20 +3649,20 @@ impl MonitorApp {
         ui.horizontal(|ui| {
             if ui.button("全选").clicked() {
                 self.fcs_sel.iter_mut().for_each(|v| *v = true);
-                        ui.close_menu();
+                ui.close_menu();
             }
             if ui.button("反选").clicked() {
                 self.fcs_sel.iter_mut().for_each(|v| *v = !*v);
-                        ui.close_menu();
+                ui.close_menu();
             }
             if ui.button("取消选择").clicked() {
                 self.fcs_sel.iter_mut().for_each(|v| *v = false);
-                        ui.close_menu();
+                ui.close_menu();
             }
             if ui.button("默认设置").clicked() {
                 self.fcs_sel.iter_mut().for_each(|v| *v = false);
                 self.fdir = 0;
-                        ui.close_menu();
+                ui.close_menu();
             }
         });
         ui.separator();
@@ -3431,27 +3690,34 @@ impl MonitorApp {
                 ui.close_menu();
             }
         } else {
-            ScrollArea::vertical().id_source("filter_ports").max_height(120.0).show(ui, |ui| {
-                for name in &port_all {
-                    let mut on = pw_allowed(&self.fport_draft_sel, self.fport_draft_on, name);
-                    if ui.checkbox(&mut on, name).changed() {
-                        pw_toggle(
-                            &mut self.fport_draft_sel,
-                            &mut self.fport_draft_on,
-                            &port_all,
-                            name,
-                            on,
-                        );
+            ScrollArea::vertical()
+                .id_source("filter_ports")
+                .max_height(120.0)
+                .show(ui, |ui| {
+                    for name in &port_all {
+                        let mut on = pw_allowed(&self.fport_draft_sel, self.fport_draft_on, name);
+                        if ui.checkbox(&mut on, name).changed() {
+                            pw_toggle(
+                                &mut self.fport_draft_sel,
+                                &mut self.fport_draft_on,
+                                &port_all,
+                                name,
+                                on,
+                            );
+                        }
                     }
-                }
-            });
+                });
             ui.horizontal(|ui| {
                 if ui.button("全选").clicked() {
                     pw_select_all(&mut self.fport_draft_sel, &mut self.fport_draft_on);
                     ui.close_menu();
                 }
                 if ui.button("反选").clicked() {
-                    pw_invert(&mut self.fport_draft_sel, &mut self.fport_draft_on, &port_all);
+                    pw_invert(
+                        &mut self.fport_draft_sel,
+                        &mut self.fport_draft_on,
+                        &port_all,
+                    );
                     ui.close_menu();
                 }
                 if ui.button("取消选择").clicked() {
@@ -3493,7 +3759,7 @@ impl MonitorApp {
                 self.save_cfg();
                 self.dlg_filter = false;
                 self.fport_draft_sess = None;
-                        ui.close_menu();
+                ui.close_menu();
             }
             if ui.button("关闭").clicked() {
                 self.dlg_filter = false;
@@ -3519,7 +3785,11 @@ impl MonitorApp {
         ui.horizontal(|ui| {
             if self.r_split == 1 {
                 ui.label("时间(分钟)");
-                ui.add(DragValue::new(&mut self.r_time).speed(1.0).range(1..=100000));
+                ui.add(
+                    DragValue::new(&mut self.r_time)
+                        .speed(1.0)
+                        .range(1..=100000),
+                );
             }
             if self.r_split == 2 {
                 ui.label("大小(MB)");
@@ -3539,7 +3809,11 @@ impl MonitorApp {
                 }
             });
         if self.sessions.is_empty() {
-            ui.label(RichText::new("当前没有会话：此设置会作为新建会话的默认值").color(C_REQ).small());
+            ui.label(
+                RichText::new("当前没有会话：此设置会作为新建会话的默认值")
+                    .color(C_REQ)
+                    .small(),
+            );
         }
         ui.separator();
         ui.horizontal(|ui| {
@@ -3574,23 +3848,31 @@ impl MonitorApp {
             if ui.button("取消").clicked() {
                 self.restore_redir();
                 self.dlg_redir = false;
-                        ui.close_menu();
+                ui.close_menu();
             }
         });
         ui.separator();
         if ui.button("关闭").clicked() {
             self.dlg_redir = false;
-                        ui.close_menu();
+            ui.close_menu();
         }
     }
 
     fn dlg_prefs_ui(&mut self, ui: &mut Ui) {
         if self.sessions.is_empty() {
-            ui.label(RichText::new("当前没有会话：此设置会作为新建会话的默认值").color(C_REQ).small());
+            ui.label(
+                RichText::new("当前没有会话：此设置会作为新建会话的默认值")
+                    .color(C_REQ)
+                    .small(),
+            );
         }
         ui.horizontal(|ui| {
             ui.label("Modbus Values 列长度");
-            ui.add(DragValue::new(&mut self.p_strlen).speed(1.0).range(8..=4096));
+            ui.add(
+                DragValue::new(&mut self.p_strlen)
+                    .speed(1.0)
+                    .range(8..=4096),
+            );
         });
         ui.label(
             RichText::new("仅作用于 Modbus 视图的 Values 列；Table/终端/Dump 的数据列不截断")
@@ -3731,7 +4013,8 @@ impl eframe::App for MonitorApp {
                     w = r.width().round() as i32;
                     h = r.height().round() as i32;
                 }
-                if let Err(e) = crate::capture::capture_window(&out, std::process::id(), x, y, w, h) {
+                if let Err(e) = crate::capture::capture_window(&out, std::process::id(), x, y, w, h)
+                {
                     eprintln!("capture failed: {e}");
                 }
                 std::process::exit(0);

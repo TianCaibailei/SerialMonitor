@@ -17,7 +17,10 @@ pub fn list_procs() -> i32 {
     let snap = unsafe { CreateToolhelp32Snapshot(0x2, 0) };
     let snap_err = unsafe { GetLastError() };
     let invalid = snap as isize == -1;
-    println!("list-procs: 快照句柄={:?} 无效={} err={}", snap, invalid, snap_err);
+    println!(
+        "list-procs: 快照句柄={:?} 无效={} err={}",
+        snap, invalid, snap_err
+    );
     if !invalid {
         unsafe { CloseHandle(snap) };
     }
@@ -56,12 +59,24 @@ pub fn handles_self() -> i32 {
     }
     let me = unsafe { GetCurrentProcessId() };
     let snap = crate::autoattach::snapshot_handles_pub();
-    let mine = snap.iter().filter(|e| e.unique_process_id as u32 == me).count();
-    println!("handles-self: 快照总数={} 本进程={} PID={}", snap.len(), mine, me);
+    let mine = snap
+        .iter()
+        .filter(|e| e.unique_process_id as u32 == me)
+        .count();
+    println!(
+        "handles-self: 快照总数={} 本进程={} PID={}",
+        snap.len(),
+        mine,
+        me
+    );
 
     // Open a real file handle we can look for.
     let path = std::env::temp_dir().join("um_handle_probe.txt");
-    let wide: Vec<u16> = path.to_string_lossy().encode_utf16().chain(std::iter::once(0)).collect();
+    let wide: Vec<u16> = path
+        .to_string_lossy()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     let h = unsafe {
         OpenFile(
             wide.as_ptr(),
@@ -227,7 +242,13 @@ pub fn driver_latency(seconds: u64) -> i32 {
                     .data
                     .iter()
                     .take(24)
-                    .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' })
+                    .map(|&b| {
+                        if (0x20..0x7f).contains(&b) {
+                            b as char
+                        } else {
+                            '.'
+                        }
+                    })
                     .collect();
                 println!(
                     "latency: [{}ms] #{count} port={} {} 字节: {preview}",
@@ -240,7 +261,11 @@ pub fn driver_latency(seconds: u64) -> i32 {
         }
     }
     println!("latency: 共 {count} 条");
-    if count > 0 { 0 } else { 1 }
+    if count > 0 {
+        0
+    } else {
+        1
+    }
 }
 pub fn driver_test(seconds: u64) -> i32 {
     let Some(h) = crate::driver::DriverHandle::open() else {
@@ -281,11 +306,21 @@ pub fn driver_test(seconds: u64) -> i32 {
                     .data
                     .iter()
                     .take(40)
-                    .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' })
+                    .map(|&b| {
+                        if (0x20..0x7f).contains(&b) {
+                            b as char
+                        } else {
+                            '.'
+                        }
+                    })
                     .collect();
                 println!(
                     "driver-test: [{}] pid={} port={} {} 字节: {preview}",
-                    if rec.kind == crate::driver::RecordKind::Tx { "TX" } else { "RX" },
+                    if rec.kind == crate::driver::RecordKind::Tx {
+                        "TX"
+                    } else {
+                        "RX"
+                    },
                     rec.pid,
                     rec.port_index,
                     rec.data.len()
@@ -335,8 +370,14 @@ pub fn find_owners(port: &str) -> i32 {
     // 2. Can we query object names at all? Report the NTSTATUS on a known handle.
     let probe = crate::autoattach::probe_object_query();
     println!("find-owners: [2] NtQueryObject 探针: {probe}");
-    println!("find-owners: [2b] 设备句柄探针: {}", crate::autoattach::probe_device_name(port));
-    println!("find-owners: [2c] 串口对象类型索引: {:?}", crate::autoattach::probe_serial_type(&[port.to_string()]));
+    println!(
+        "find-owners: [2b] 设备句柄探针: {}",
+        crate::autoattach::probe_device_name(port)
+    );
+    println!(
+        "find-owners: [2c] 串口对象类型索引: {:?}",
+        crate::autoattach::probe_serial_type(&[port.to_string()])
+    );
 
     // 3. Owner scan (GetFileType-based, no admin needed).
     println!("find-owners: [3] 扫描持有者（GetFileType 方案）...");
@@ -348,7 +389,10 @@ pub fn find_owners(port: &str) -> i32 {
             println!("find-owners: 串口持有者 PID {} {}", o.pid, o.exe);
         }
     }
-    println!("find-owners: [4] 扫描统计: {:?}", crate::autoattach::scan_stats());
+    println!(
+        "find-owners: [4] 扫描统计: {:?}",
+        crate::autoattach::scan_stats()
+    );
     if owners.is_empty() {
         1
     } else {

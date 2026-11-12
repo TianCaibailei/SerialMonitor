@@ -31,7 +31,13 @@ extern "system" {
         flags: u32,
         tmpl: *mut c_void,
     ) -> *mut c_void;
-    fn WriteFile(h: *mut c_void, buf: *const u8, len: u32, written: *mut u32, ov: *mut c_void) -> i32;
+    fn WriteFile(
+        h: *mut c_void,
+        buf: *const u8,
+        len: u32,
+        written: *mut u32,
+        ov: *mut c_void,
+    ) -> i32;
     fn ReadFile(h: *mut c_void, buf: *mut u8, len: u32, read: *mut u32, ov: *mut c_void) -> i32;
     fn CloseHandle(h: *mut c_void) -> i32;
     fn Sleep(ms: u32);
@@ -46,8 +52,10 @@ type CreateFileWFn = unsafe extern "system" fn(
     u32,
     *mut c_void,
 ) -> *mut c_void;
-type WriteFileFn = unsafe extern "system" fn(*mut c_void, *const u8, u32, *mut u32, *mut c_void) -> i32;
-type ReadFileFn = unsafe extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32;
+type WriteFileFn =
+    unsafe extern "system" fn(*mut c_void, *const u8, u32, *mut u32, *mut c_void) -> i32;
+type ReadFileFn =
+    unsafe extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32;
 
 const GENERIC_READ: u32 = 0x8000_0000;
 const GENERIC_WRITE: u32 = 0x4000_0000;
@@ -80,11 +88,9 @@ fn main() {
             )
         }
     } else {
-        (
-            unsafe { CreateFileW },
-            unsafe { WriteFile },
-            unsafe { ReadFile },
-        )
+        (unsafe { CreateFileW }, unsafe { WriteFile }, unsafe {
+            ReadFile
+        })
     };
 
     // Report which addresses we cached, so the test can tell "hook replaced them"
@@ -122,11 +128,25 @@ fn main() {
     unsafe {
         let msg = b"P32TX;";
         let mut w = 0u32;
-        write(h, msg.as_ptr(), msg.len() as u32, &mut w, std::ptr::null_mut());
+        write(
+            h,
+            msg.as_ptr(),
+            msg.len() as u32,
+            &mut w,
+            std::ptr::null_mut(),
+        );
         println!("probe32: wrote {w} bytes");
         let mut buf = [0u8; 256];
         let mut r = 0u32;
-        if read(h, buf.as_mut_ptr(), buf.len() as u32, &mut r, std::ptr::null_mut()) != 0 && r > 0 {
+        if read(
+            h,
+            buf.as_mut_ptr(),
+            buf.len() as u32,
+            &mut r,
+            std::ptr::null_mut(),
+        ) != 0
+            && r > 0
+        {
             println!("probe32: read {r} bytes");
         } else {
             println!("probe32: read 0 bytes (no peer traffic)");

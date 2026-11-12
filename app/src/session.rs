@@ -56,7 +56,13 @@ pub struct ViewToggles {
 
 impl Default for ViewToggles {
     fn default() -> Self {
-        ViewToggles { table: true, terminal: true, dump: true, line: true, modbus: false }
+        ViewToggles {
+            table: true,
+            terminal: true,
+            dump: true,
+            line: true,
+            modbus: false,
+        }
     }
 }
 
@@ -81,9 +87,20 @@ impl ProtoType {
 
 #[derive(Clone, Debug)]
 pub enum Ev {
-    Rx { idx: usize, data: Vec<u8>, secs: u64, millis: u32 },
-    Peer { idx: usize, label: String },
-    Closed { idx: usize, why: String },
+    Rx {
+        idx: usize,
+        data: Vec<u8>,
+        secs: u64,
+        millis: u32,
+    },
+    Peer {
+        idx: usize,
+        label: String,
+    },
+    Closed {
+        idx: usize,
+        why: String,
+    },
 }
 
 pub struct Row {
@@ -124,7 +141,12 @@ pub struct Filters {
 
 impl Default for Filters {
     fn default() -> Self {
-        Filters { dir: 0, fcs: Vec::new(), text: String::new(), text_on: false }
+        Filters {
+            dir: 0,
+            fcs: Vec::new(),
+            text: String::new(),
+            text_on: false,
+        }
     }
 }
 
@@ -209,7 +231,13 @@ pub fn pw_invert(sel: &mut HashSet<String>, on: &mut bool, all: &[String]) {
 
 /// 勾选/取消勾选单个端口，交互对齐「驱动捕获设置」里的 drv_watch：
 /// 第一次收窄时先把当前全部端口塞进白名单再移除；全部选回则清空集合恢复"不限制"。
-pub fn pw_toggle(sel: &mut HashSet<String>, on: &mut bool, all: &[String], name: &str, checked: bool) {
+pub fn pw_toggle(
+    sel: &mut HashSet<String>,
+    on: &mut bool,
+    all: &[String],
+    name: &str,
+    checked: bool,
+) {
     // 第一次收窄：从"全部勾选"出发，把现有端口都算进去。
     if !*on {
         *sel = all.iter().cloned().collect();
@@ -393,7 +421,12 @@ pub fn escape_text(data: &[u8], escape: bool, enc: DisplayEncoding) -> String {
 }
 
 impl Session {
-    pub fn new(name: String, channels: Vec<ChannelCfg>, proto: ProtoType, views: ViewToggles) -> Self {
+    pub fn new(
+        name: String,
+        channels: Vec<ChannelCfg>,
+        proto: ProtoType,
+        views: ViewToggles,
+    ) -> Self {
         let (tx, rx) = std::sync::mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let n = channels.len();
@@ -434,8 +467,12 @@ impl Session {
         for (idx, ch) in sess.channels.clone().iter().enumerate() {
             match ch.kind {
                 ChanKind::Serial => sess.open_serial(idx, ch.clone(), tx.clone(), stop.clone()),
-                ChanKind::TcpClient => sess.open_tcp_client(idx, ch.clone(), tx.clone(), stop.clone()),
-                ChanKind::TcpServer => sess.open_tcp_server(idx, ch.clone(), tx.clone(), stop.clone()),
+                ChanKind::TcpClient => {
+                    sess.open_tcp_client(idx, ch.clone(), tx.clone(), stop.clone())
+                }
+                ChanKind::TcpServer => {
+                    sess.open_tcp_server(idx, ch.clone(), tx.clone(), stop.clone())
+                }
                 ChanKind::Udp => sess.open_udp(idx, ch.clone(), tx.clone(), stop.clone()),
                 ChanKind::HookSerial => {}
             }
@@ -450,7 +487,13 @@ impl Session {
             format!("PID {} {}", pid, exe),
             Vec::new(),
             ProtoType::None,
-            ViewToggles { table: true, terminal: true, dump: true, line: true, modbus: true },
+            ViewToggles {
+                table: true,
+                terminal: true,
+                dump: true,
+                line: true,
+                modbus: true,
+            },
         );
         s.running = true;
         s.cap_pid = Some(pid);
@@ -530,13 +573,24 @@ impl Session {
                                 Ok(0) => {}
                                 Ok(n) => {
                                     let (s, ms) = now_wall();
-                                    if tx.send(Ev::Rx { idx, data: buf[..n].to_vec(), secs: s, millis: ms }).is_err() {
+                                    if tx
+                                        .send(Ev::Rx {
+                                            idx,
+                                            data: buf[..n].to_vec(),
+                                            secs: s,
+                                            millis: ms,
+                                        })
+                                        .is_err()
+                                    {
                                         break;
                                     }
                                 }
                                 Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {}
                                 Err(e) => {
-                                    let _ = tx.send(Ev::Closed { idx, why: e.to_string() });
+                                    let _ = tx.send(Ev::Closed {
+                                        idx,
+                                        why: e.to_string(),
+                                    });
                                     break;
                                 }
                             }
@@ -570,7 +624,13 @@ impl Session {
         }
     }
 
-    fn open_tcp_client(&mut self, idx: usize, ch: ChannelCfg, tx: Sender<Ev>, stop: Arc<AtomicBool>) {
+    fn open_tcp_client(
+        &mut self,
+        idx: usize,
+        ch: ChannelCfg,
+        tx: Sender<Ev>,
+        stop: Arc<AtomicBool>,
+    ) {
         let addr = match ch.name.to_socket_addrs() {
             Ok(mut it) => it.next(),
             Err(e) => {
@@ -604,18 +664,32 @@ impl Session {
                         }
                         match rh.read(&mut buf) {
                             Ok(0) => {
-                                let _ = tx.send(Ev::Closed { idx, why: "连接已关闭".into() });
+                                let _ = tx.send(Ev::Closed {
+                                    idx,
+                                    why: "连接已关闭".into(),
+                                });
                                 break;
                             }
                             Ok(n) => {
                                 let (s, ms) = now_wall();
-                                if tx.send(Ev::Rx { idx, data: buf[..n].to_vec(), secs: s, millis: ms }).is_err() {
+                                if tx
+                                    .send(Ev::Rx {
+                                        idx,
+                                        data: buf[..n].to_vec(),
+                                        secs: s,
+                                        millis: ms,
+                                    })
+                                    .is_err()
+                                {
                                     break;
                                 }
                             }
                             Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {}
                             Err(e) => {
-                                let _ = tx.send(Ev::Closed { idx, why: e.to_string() });
+                                let _ = tx.send(Ev::Closed {
+                                    idx,
+                                    why: e.to_string(),
+                                });
                                 break;
                             }
                         }
@@ -626,7 +700,13 @@ impl Session {
         }
     }
 
-    fn open_tcp_server(&mut self, idx: usize, ch: ChannelCfg, tx: Sender<Ev>, stop: Arc<AtomicBool>) {
+    fn open_tcp_server(
+        &mut self,
+        idx: usize,
+        ch: ChannelCfg,
+        tx: Sender<Ev>,
+        stop: Arc<AtomicBool>,
+    ) {
         let addr = match ch.name.to_socket_addrs() {
             Ok(mut it) => it.next(),
             Err(e) => {
@@ -645,44 +725,50 @@ impl Session {
             Ok(listener) => {
                 let _ = listener.set_nonblocking(true);
                 self.notices.push(format!("TCP服务端监听 {}", ch.name));
-                std::thread::spawn(move || {
-                    loop {
-                        if stop.load(Ordering::Relaxed) {
-                            break;
-                        }
-                        match listener.accept() {
-                            Ok((stream, peer)) => {
-                                let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
-                                let label = peer.to_string();
-                                let _ = tx.send(Ev::Peer { idx, label });
-                                let tx2 = tx.clone();
-                                let stop2 = stop.clone();
-                                let mut rh = stream;
-                                std::thread::spawn(move || {
-                                    let mut buf = [0u8; 8192];
-                                    loop {
-                                        if stop2.load(Ordering::Relaxed) {
-                                            break;
-                                        }
-                                        match rh.read(&mut buf) {
-                                            Ok(0) => break,
-                                            Ok(n) => {
-                                                let (s, ms) = now_wall();
-                                                if tx2.send(Ev::Rx { idx, data: buf[..n].to_vec(), secs: s, millis: ms }).is_err() {
-                                                    break;
-                                                }
-                                            }
-                                            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {}
-                                            Err(_) => break,
-                                        }
+                std::thread::spawn(move || loop {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    match listener.accept() {
+                        Ok((stream, peer)) => {
+                            let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
+                            let label = peer.to_string();
+                            let _ = tx.send(Ev::Peer { idx, label });
+                            let tx2 = tx.clone();
+                            let stop2 = stop.clone();
+                            let mut rh = stream;
+                            std::thread::spawn(move || {
+                                let mut buf = [0u8; 8192];
+                                loop {
+                                    if stop2.load(Ordering::Relaxed) {
+                                        break;
                                     }
-                                });
-                            }
-                            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                                std::thread::sleep(Duration::from_millis(100));
-                            }
-                            Err(_) => break,
+                                    match rh.read(&mut buf) {
+                                        Ok(0) => break,
+                                        Ok(n) => {
+                                            let (s, ms) = now_wall();
+                                            if tx2
+                                                .send(Ev::Rx {
+                                                    idx,
+                                                    data: buf[..n].to_vec(),
+                                                    secs: s,
+                                                    millis: ms,
+                                                })
+                                                .is_err()
+                                            {
+                                                break;
+                                            }
+                                        }
+                                        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {}
+                                        Err(_) => break,
+                                    }
+                                }
+                            });
                         }
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(100));
+                        }
+                        Err(_) => break,
                     }
                 });
             }
@@ -709,7 +795,15 @@ impl Session {
                         match rh.recv_from(&mut buf) {
                             Ok((n, _peer)) => {
                                 let (s, ms) = now_wall();
-                                if tx.send(Ev::Rx { idx, data: buf[..n].to_vec(), secs: s, millis: ms }).is_err() {
+                                if tx
+                                    .send(Ev::Rx {
+                                        idx,
+                                        data: buf[..n].to_vec(),
+                                        secs: s,
+                                        millis: ms,
+                                    })
+                                    .is_err()
+                                {
                                     break;
                                 }
                             }
@@ -742,7 +836,12 @@ impl Session {
         let mut n = 0;
         while let Ok(ev) = self.ev_rx.try_recv() {
             match ev {
-                Ev::Rx { idx, data, secs, millis } => self.ingest(idx, data, secs, millis, false),
+                Ev::Rx {
+                    idx,
+                    data,
+                    secs,
+                    millis,
+                } => self.ingest(idx, data, secs, millis, false),
                 Ev::Peer { idx, label } => {
                     self.notices.push(format!("通道{} 新连接 {}", idx, label));
                 }
@@ -874,7 +973,13 @@ impl Session {
                     e.3 = dir_tx;
                 }
                 loop {
-                    let nl = self.bufs.get(&idx).unwrap().0.iter().position(|&b| b == b'\n');
+                    let nl = self
+                        .bufs
+                        .get(&idx)
+                        .unwrap()
+                        .0
+                        .iter()
+                        .position(|&b| b == b'\n');
                     match nl {
                         Some(pos) => {
                             let e = self.bufs.get_mut(&idx).unwrap();
@@ -895,29 +1000,29 @@ impl Session {
                 }
             }
             ProtoType::Rtu => {
+                let e = self.bufs.entry(idx).or_default();
+                if !e.0.is_empty()
+                    && ((secs > e.1) || (e.2 + FRAME_GAP_MS <= millis && secs == e.1))
                 {
-                    let e = self.bufs.entry(idx).or_default();
-                    if !e.0.is_empty() && ((secs > e.1) || (e.2 + FRAME_GAP_MS <= millis && secs == e.1)) {
-                        let old = std::mem::take(&mut e.0);
-                        let (os, oms, odir) = (e.1, e.2, e.3);
-                        self.flush_rtu(idx, old, odir, os, oms);
-                        let e = self.bufs.get_mut(&idx).unwrap();
-                        e.1 = secs;
-                        e.2 = millis;
-                        e.3 = dir_tx;
-                    }
+                    let old = std::mem::take(&mut e.0);
+                    let (os, oms, odir) = (e.1, e.2, e.3);
+                    self.flush_rtu(idx, old, odir, os, oms);
                     let e = self.bufs.get_mut(&idx).unwrap();
-                    e.0.extend_from_slice(&data);
-                    if e.1 == 0 && e.2 == 0 {
-                        e.1 = secs;
-                        e.2 = millis;
-                        e.3 = dir_tx;
-                    }
-                    if e.0.len() >= 600 {
-                        let old = std::mem::take(&mut e.0);
-                        let (os, oms, odir) = (e.1, e.2, e.3);
-                        self.flush_rtu(idx, old, odir, os, oms);
-                    }
+                    e.1 = secs;
+                    e.2 = millis;
+                    e.3 = dir_tx;
+                }
+                let e = self.bufs.get_mut(&idx).unwrap();
+                e.0.extend_from_slice(&data);
+                if e.1 == 0 && e.2 == 0 {
+                    e.1 = secs;
+                    e.2 = millis;
+                    e.3 = dir_tx;
+                }
+                if e.0.len() >= 600 {
+                    let old = std::mem::take(&mut e.0);
+                    let (os, oms, odir) = (e.1, e.2, e.3);
+                    self.flush_rtu(idx, old, odir, os, oms);
                 }
             }
         }
@@ -931,7 +1036,15 @@ impl Session {
         self.push_row(buf, idx, dir_tx, secs, millis, parsed);
     }
 
-    fn push_row(&mut self, data: Vec<u8>, idx: usize, dir_tx: bool, secs: u64, millis: u32, parsed: Option<ModbusParsed>) {
+    fn push_row(
+        &mut self,
+        data: Vec<u8>,
+        idx: usize,
+        dir_tx: bool,
+        secs: u64,
+        millis: u32,
+        parsed: Option<ModbusParsed>,
+    ) {
         // merge within merge_ms for raw mode (以指定时间区间合并"读"和"写"的数据):
         // - opposite direction: pair a read with its write (original semantics, once per row)
         // - same direction: reassemble reads the OS delivered in fragments (first byte
@@ -958,7 +1071,11 @@ impl Session {
             }
         }
         self.seq += 1;
-        let kind = parsed.as_ref().map(|p| p.kind).unwrap_or(if dir_tx { FrameKind::Req } else { FrameKind::Resp });
+        let kind = parsed.as_ref().map(|p| p.kind).unwrap_or(if dir_tx {
+            FrameKind::Req
+        } else {
+            FrameKind::Resp
+        });
         let row = Row {
             seq: self.seq,
             idx,
@@ -1033,9 +1150,9 @@ impl Session {
 
     /// Peak per-second rate over the retained window (RX, TX).
     pub fn peak_rate(&self) -> (u64, u64) {
-        self.rate.iter().fold((0u64, 0u64), |(prx, ptx), e| {
-            (prx.max(e.1), ptx.max(e.2))
-        })
+        self.rate
+            .iter()
+            .fold((0u64, 0u64), |(prx, ptx), e| (prx.max(e.1), ptx.max(e.2)))
     }
 
     /// Total bytes for the two directions, regardless of capture path.
@@ -1045,7 +1162,10 @@ impl Session {
 
     pub fn visible_count(&self) -> usize {
         let enc = self.display_encoding;
-        self.rows.iter().filter(|r| self.filters.pass(r, enc)).count()
+        self.rows
+            .iter()
+            .filter(|r| self.filters.pass(r, enc))
+            .count()
     }
 
     pub fn stop_all(&self) {
@@ -1072,12 +1192,15 @@ impl Session {
         let mut out = String::new();
         out.push_str("UMSEX 1\n");
         out.push_str(&format!("name\t{}\n", esc_field(&self.name)));
-        out.push_str(&format!("proto\t{}\n", match self.proto {
-            ProtoType::None => "none",
-            ProtoType::Rtu => "rtu",
-            ProtoType::Ascii => "ascii",
-            ProtoType::Tcp => "tcp",
-        }));
+        out.push_str(&format!(
+            "proto\t{}\n",
+            match self.proto {
+                ProtoType::None => "none",
+                ProtoType::Rtu => "rtu",
+                ProtoType::Ascii => "ascii",
+                ProtoType::Tcp => "tcp",
+            }
+        ));
         out.push_str(&format!("encoding\t{}\n", self.display_encoding.as_index()));
         out.push_str(&format!(
             "views\t{}{}{}{}{}\n",
@@ -1227,10 +1350,11 @@ impl Session {
             ProtoType::Ascii => protocol::parse_ascii_text(&data, dir_tx),
             ProtoType::Tcp => protocol::parse_mbap(&data, dir_tx).map(|(p, _)| p),
         };
-        let kind = parsed
-            .as_ref()
-            .map(|p| p.kind)
-            .unwrap_or(if dir_tx { FrameKind::Req } else { FrameKind::Resp });
+        let kind = parsed.as_ref().map(|p| p.kind).unwrap_or(if dir_tx {
+            FrameKind::Req
+        } else {
+            FrameKind::Resp
+        });
         self.rows.push(Row {
             seq,
             idx,
@@ -1266,8 +1390,7 @@ impl Session {
                 .get(r.idx)
                 .map(|c| c.name.clone())
                 .unwrap_or_else(|| "?".into());
-            let text = text_codec::decoded_text(&r.data, dec)
-                .replace(['\r', '\n', '\t'], " ");
+            let text = text_codec::decoded_text(&r.data, dec).replace(['\r', '\n', '\t'], " ");
             out.push_str(&format!(
                 "{}\t{}\t{}\t{}\t{}\n",
                 fmt_time(r.secs, r.millis),
@@ -1292,10 +1415,20 @@ fn autosave_line(chan: &str, row: &Row, a: &mut Autosave, dec: DisplayEncoding) 
         };
     let enc = DisplayEncoding::from_index(a.encoding);
     if need_new {
-        let base = if a.path.is_empty() { "autosave".to_string() } else { a.path.clone() };
+        let base = if a.path.is_empty() {
+            "autosave".to_string()
+        } else {
+            a.path.clone()
+        };
         let p = std::path::Path::new(&base);
-        let stem = p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "autosave".into());
-        let ext = p.extension().map(|s| format!(".{}", s.to_string_lossy())).unwrap_or_else(|| ".log".into());
+        let stem = p
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "autosave".into());
+        let ext = p
+            .extension()
+            .map(|s| format!(".{}", s.to_string_lossy()))
+            .unwrap_or_else(|| ".log".into());
         let n = now.0 % 100000;
         a.cur_file = format!("{}_{}{}", stem, n, ext);
         a.started_at = now.0;
@@ -1304,7 +1437,12 @@ fn autosave_line(chan: &str, row: &Row, a: &mut Autosave, dec: DisplayEncoding) 
         // every rotation would inject it in the middle of a UTF-16 stream.
         let bom = text_codec::bom(enc);
         if !bom.is_empty() {
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).truncate(true).write(true).open(&a.cur_file) {
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(&a.cur_file)
+            {
                 let _ = f.write_all(bom);
                 a.written += bom.len() as u64;
             }
@@ -1323,7 +1461,11 @@ fn autosave_line(chan: &str, row: &Row, a: &mut Autosave, dec: DisplayEncoding) 
     let full = text_codec::encode(&line, enc);
     let bom_len = text_codec::bom(enc).len();
     let bytes = &full[bom_len..];
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&a.cur_file) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&a.cur_file)
+    {
         let _ = f.write_all(bytes);
         a.written += bytes.len() as u64;
     }
@@ -1378,7 +1520,13 @@ mod tests {
     }
 
     fn sample_session() -> Session {
-        let views = ViewToggles { table: true, terminal: true, dump: true, line: true, modbus: true };
+        let views = ViewToggles {
+            table: true,
+            terminal: true,
+            dump: true,
+            line: true,
+            modbus: true,
+        };
         let mut s = Session::new(
             "测试 会话\twith tab".into(),
             vec![
@@ -1403,8 +1551,20 @@ mod tests {
             views,
         );
         s.display_encoding = DisplayEncoding::Gbk;
-        s.ingest(0, protocol::append_crc(&[0x01, 0x03, 0x00, 0x6B, 0x00, 0x03]), 1_700_000_000, 5, true);
-        s.ingest(0, protocol::append_crc(&[0x01, 0x03, 0x06, 0x02, 0x2B, 0x00, 0x00, 0x00, 0x64]), 1_700_000_001, 7, false);
+        s.ingest(
+            0,
+            protocol::append_crc(&[0x01, 0x03, 0x00, 0x6B, 0x00, 0x03]),
+            1_700_000_000,
+            5,
+            true,
+        );
+        s.ingest(
+            0,
+            protocol::append_crc(&[0x01, 0x03, 0x06, 0x02, 0x2B, 0x00, 0x00, 0x00, 0x64]),
+            1_700_000_001,
+            7,
+            false,
+        );
         // GBK "中文" as a raw payload, to prove bytes survive the roundtrip.
         s.ingest(1, vec![0xD6, 0xD0, 0xCE, 0xC4], 1_700_000_002, 9, false);
         s
@@ -1510,5 +1670,142 @@ mod tests {
 
         s.display_encoding = DisplayEncoding::Utf8;
         assert_eq!(s.visible_count(), 0, "same bytes are not 中文 under UTF-8");
+    }
+
+    // ---- frame reassembly -------------------------------------------------------------
+    //
+    // `ingest` decides where one protocol frame ends and the next begins. This is where a
+    // monitor silently loses or merges data if it is wrong, and it had no tests at all.
+
+    fn plain_session(proto: ProtoType) -> Session {
+        let mut s = Session::new(
+            "reassembly".into(),
+            vec![ChannelCfg {
+                kind: ChanKind::Serial,
+                name: "COM1".into(),
+                baud: 9600,
+                data_bits: 8,
+                parity: 0,
+                stop_bits: 1,
+            }],
+            proto,
+            ViewToggles::default(),
+        );
+        // Merging is a display preference for raw streams; frame-level tests must not be
+        // perturbed by it.
+        s.merge_ms = 0;
+        s
+    }
+
+    #[test]
+    fn rtu_splits_two_frames_arriving_in_one_read() {
+        let mut s = plain_session(ProtoType::Rtu);
+        let mut buf = protocol::append_crc(&[0x01, 0x03, 0x00, 0x6B, 0x00, 0x03]);
+        buf.extend_from_slice(&protocol::append_crc(&[
+            0x01, 0x03, 0x06, 0x02, 0x2B, 0x00, 0x00, 0x00, 0x64,
+        ]));
+        s.ingest(0, buf, 1000, 0, false);
+        // RTU relies on the inter-frame gap, so both frames are still buffered as one.
+        assert!(
+            s.rows.is_empty(),
+            "no frame may be emitted without a gap/idle signal"
+        );
+
+        // A second read after the gap flushes the buffered bytes as one frame, then the
+        // newly arrived bytes start a fresh buffer.
+        s.ingest(0, vec![0x01, 0x03], 1001, 0, false);
+        assert_eq!(s.rows.len(), 1, "the first buffered frame must be flushed");
+        assert!(s.rows[0].parsed.is_some(), "flushed frame must be parsed");
+    }
+
+    #[test]
+    fn rtu_frame_is_flushed_once_the_buffer_exceeds_the_guard_size() {
+        let mut s = plain_session(ProtoType::Rtu);
+        // 600+ bytes forces a flush even without an idle gap (see ingest's `>= 600` guard).
+        let payload: Vec<u8> = (0..700u32).map(|i| (i % 251) as u8).collect();
+        s.ingest(0, payload, 1000, 0, false);
+        assert_eq!(
+            s.rows.len(),
+            1,
+            "oversized buffer must be flushed, not held forever"
+        );
+    }
+
+    #[test]
+    fn modbus_ascii_splits_on_newline() {
+        let mut s = plain_session(ProtoType::Ascii);
+        let pdu = [0x01u8, 0x03, 0x00, 0x6B, 0x00, 0x03];
+        let mut hex = String::new();
+        for b in pdu {
+            hex.push_str(&format!("{b:02X}"));
+        }
+        let line = format!(":{hex}{:02X}\r\n", protocol::lrc(&pdu));
+        s.ingest(0, line.clone().into_bytes(), 1000, 0, false);
+        assert_eq!(s.rows.len(), 1);
+
+        // Two frames in a single chunk must produce two rows.
+        let two = format!("{line}{line}");
+        s.ingest(0, two.into_bytes(), 1001, 0, false);
+        assert_eq!(
+            s.rows.len(),
+            3,
+            "each newline-terminated frame is its own row"
+        );
+    }
+
+    #[test]
+    fn modbus_tcp_splits_on_mbap_length() {
+        let mut s = plain_session(ProtoType::Tcp);
+        let f1 = protocol::wrap_mbap(&[0x01, 0x03, 0x00, 0x6B, 0x00, 0x03], 1);
+        let f2 = protocol::wrap_mbap(&[0x01, 0x04, 0x00, 0x08, 0x00, 0x01], 2);
+        // Frames coalesced in one TCP read must be split by their MBAP length field.
+        let mut both = f1.clone();
+        both.extend_from_slice(&f2);
+        s.ingest(0, both, 1000, 0, false);
+        assert_eq!(s.rows.len(), 2);
+        assert!(s.rows.iter().all(|r| r.parsed.is_some()));
+
+        // A partial frame must be buffered, not emitted half-formed.
+        let f3 = protocol::wrap_mbap(&[0x01, 0x03, 0x00, 0x00, 0x00, 0x02], 3);
+        s.ingest(0, f3[..4].to_vec(), 1001, 0, false);
+        assert_eq!(s.rows.len(), 2, "incomplete MBAP frame stays buffered");
+        s.ingest(0, f3[4..].to_vec(), 1001, 10, false);
+        assert_eq!(
+            s.rows.len(),
+            3,
+            "completing the frame emits exactly one row"
+        );
+    }
+
+    #[test]
+    fn raw_mode_emits_one_row_per_read() {
+        let mut s = plain_session(ProtoType::None);
+        s.ingest(0, b"hello".to_vec(), 1000, 0, false);
+        s.ingest(0, b"world".to_vec(), 1000, 50, false);
+        assert_eq!(s.rows.len(), 2);
+        assert_eq!(s.rows[0].data, b"hello");
+        assert_eq!(s.rows[1].data, b"world");
+    }
+
+    #[test]
+    fn pause_drops_samples_instead_of_counting_them() {
+        let mut s = plain_session(ProtoType::None);
+        s.running = false;
+        // Route data the way the live paths do: through poll(), which must discard it.
+        let (tx, rx) = std::sync::mpsc::channel();
+        s.ev_rx = rx;
+        tx.send(Ev::Rx {
+            idx: 0,
+            data: vec![1, 2, 3, 4],
+            secs: 1,
+            millis: 0,
+        })
+        .unwrap();
+        s.poll();
+        assert!(s.rows.is_empty(), "paused sessions must not record rows");
+        assert_eq!(
+            s.bytes_rx, 0,
+            "dropped bytes must not be counted as received"
+        );
     }
 }

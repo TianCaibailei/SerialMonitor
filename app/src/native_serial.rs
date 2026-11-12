@@ -18,7 +18,13 @@ extern "system" {
         flags: u32,
         tmpl: *mut c_void,
     ) -> *mut c_void;
-    fn WriteFile(h: *mut c_void, buf: *const u8, len: u32, written: *mut u32, ov: *mut c_void) -> i32;
+    fn WriteFile(
+        h: *mut c_void,
+        buf: *const u8,
+        len: u32,
+        written: *mut u32,
+        ov: *mut c_void,
+    ) -> i32;
     fn ReadFile(h: *mut c_void, buf: *mut u8, len: u32, read: *mut u32, ov: *mut c_void) -> i32;
     fn CloseHandle(h: *mut c_void) -> i32;
     fn Sleep(ms: u32);
@@ -60,7 +66,13 @@ pub fn run(com: &str, millis: u64) -> i32 {
         let msg = format!("NATIVE{i};");
         let mut written = 0u32;
         unsafe {
-            WriteFile(h, msg.as_ptr(), msg.len() as u32, &mut written, std::ptr::null_mut());
+            WriteFile(
+                h,
+                msg.as_ptr(),
+                msg.len() as u32,
+                &mut written,
+                std::ptr::null_mut(),
+            );
         }
         let mut read = 0u32;
         unsafe {

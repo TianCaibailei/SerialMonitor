@@ -217,7 +217,11 @@ pub fn parse_mbap(buf: &[u8], dir_tx: bool) -> Option<(ModbusParsed, usize)> {
     let body = &buf[8..total];
     let mut p = base(id, fc, dir_tx, true, "-".to_string());
     p.checksum_ok = None;
-    p.remark = format!("MBAP tid={} pid={}", u16::from_be_bytes([buf[0], buf[1]]), pid);
+    p.remark = format!(
+        "MBAP tid={} pid={}",
+        u16::from_be_bytes([buf[0], buf[1]]),
+        pid
+    );
     match fc {
         0x01..=0x06 => {
             if body.len() >= 4 {
@@ -302,29 +306,98 @@ pub struct Preset {
 
 /// Rows copied from modbus/modbus-request.bdp (23 presets).
 pub const REQUEST_PRESETS: &[Preset] = &[
-    Preset { name: "01 (0x01) Read Coils-req", data: "01 01 00 13 00 13" },
-    Preset { name: "02 (0x02) Read Discrete Inputs-req", data: "01 02 00 C4 00 16" },
-    Preset { name: "03 (0x03) Read Holding Registers-req", data: "01 03 00 6B 00 03" },
-    Preset { name: "04 (0x04) Read Input Registers-req", data: "01 04 00 08 00 01" },
-    Preset { name: "05 (0x05) Write Single Coil-req", data: "01 05 00 AC FF 00" },
-    Preset { name: "06 (0x06) Write Single Register-req", data: "01 06 00 01 00 03" },
-    Preset { name: "15 (0x0F) Write Multiple Coils-req", data: "01 0F 00 13 00 0A 02 CD 01" },
-    Preset { name: "16 (0x10) Write Multiple registers-req", data: "01 10 00 01 00 02 04 00 0A 01 02" },
-    Preset { name: "22 (0x16) Mask Write Register-req", data: "01 16 00 04 00 F2 00 25" },
-    Preset { name: "23 (0x17) Read/Write Multiple registers-req", data: "01 17 00 03 00 06 00 0E 00 03 06 00 FF 00 FF 00 FF" },
-    Preset { name: "24 (0x18) Read FIFO Queue-req", data: "01 18 04 DE" },
-    Preset { name: "21 (0x15) Write File Record-req-1", data: "01 15 11 06 00 04 00 07 00 05 06 AF 04 BE 10 0D FF DD CC EE" },
-    Preset { name: "21 (0x15) Write File Record-req", data: "01 15 0D 06 00 04 00 07 00 03 06 AF 04 BE 10 0D" },
-    Preset { name: "20 (0x14) Read File Record-req", data: "01 14 0E 06 00 04 00 01 00 02 06 00 03 00 09 00 02" },
-    Preset { name: "17 (0x11) Report Server ID-req", data: "01 11" },
-    Preset { name: "07 (0x07) Read Exception Status-req", data: "01 07" },
-    Preset { name: "11 (0x0B) Get Comm Event Counter-req", data: "01 0B" },
-    Preset { name: "12 (0x0C) Get Comm Event Log-req", data: "01 0C" },
-    Preset { name: "43 (0x2B) Encapsulated Interface Transport-0D-req", data: "01 2B 0D 00 01 02 03" },
-    Preset { name: "43 (0x2B) Encapsulated Interface Transport-0D-req1", data: "01 2B 0D 00 01 01 02" },
-    Preset { name: "43 (0x2B) Encapsulated Interface Transport-0E-req", data: "01 2B 0E 01 00" },
-    Preset { name: "08 (0x08) Diagnostics-SubFunc-15-3-req", data: "01 08 00 15 00 03" },
-    Preset { name: "08 (0x08) Diagnostics-SubFunc-15-4-req", data: "01 08 00 15 00 04" },
+    Preset {
+        name: "01 (0x01) Read Coils-req",
+        data: "01 01 00 13 00 13",
+    },
+    Preset {
+        name: "02 (0x02) Read Discrete Inputs-req",
+        data: "01 02 00 C4 00 16",
+    },
+    Preset {
+        name: "03 (0x03) Read Holding Registers-req",
+        data: "01 03 00 6B 00 03",
+    },
+    Preset {
+        name: "04 (0x04) Read Input Registers-req",
+        data: "01 04 00 08 00 01",
+    },
+    Preset {
+        name: "05 (0x05) Write Single Coil-req",
+        data: "01 05 00 AC FF 00",
+    },
+    Preset {
+        name: "06 (0x06) Write Single Register-req",
+        data: "01 06 00 01 00 03",
+    },
+    Preset {
+        name: "15 (0x0F) Write Multiple Coils-req",
+        data: "01 0F 00 13 00 0A 02 CD 01",
+    },
+    Preset {
+        name: "16 (0x10) Write Multiple registers-req",
+        data: "01 10 00 01 00 02 04 00 0A 01 02",
+    },
+    Preset {
+        name: "22 (0x16) Mask Write Register-req",
+        data: "01 16 00 04 00 F2 00 25",
+    },
+    Preset {
+        name: "23 (0x17) Read/Write Multiple registers-req",
+        data: "01 17 00 03 00 06 00 0E 00 03 06 00 FF 00 FF 00 FF",
+    },
+    Preset {
+        name: "24 (0x18) Read FIFO Queue-req",
+        data: "01 18 04 DE",
+    },
+    Preset {
+        name: "21 (0x15) Write File Record-req-1",
+        data: "01 15 11 06 00 04 00 07 00 05 06 AF 04 BE 10 0D FF DD CC EE",
+    },
+    Preset {
+        name: "21 (0x15) Write File Record-req",
+        data: "01 15 0D 06 00 04 00 07 00 03 06 AF 04 BE 10 0D",
+    },
+    Preset {
+        name: "20 (0x14) Read File Record-req",
+        data: "01 14 0E 06 00 04 00 01 00 02 06 00 03 00 09 00 02",
+    },
+    Preset {
+        name: "17 (0x11) Report Server ID-req",
+        data: "01 11",
+    },
+    Preset {
+        name: "07 (0x07) Read Exception Status-req",
+        data: "01 07",
+    },
+    Preset {
+        name: "11 (0x0B) Get Comm Event Counter-req",
+        data: "01 0B",
+    },
+    Preset {
+        name: "12 (0x0C) Get Comm Event Log-req",
+        data: "01 0C",
+    },
+    Preset {
+        name: "43 (0x2B) Encapsulated Interface Transport-0D-req",
+        data: "01 2B 0D 00 01 02 03",
+    },
+    Preset {
+        name: "43 (0x2B) Encapsulated Interface Transport-0D-req1",
+        data: "01 2B 0D 00 01 01 02",
+    },
+    Preset {
+        name: "43 (0x2B) Encapsulated Interface Transport-0E-req",
+        data: "01 2B 0E 01 00",
+    },
+    Preset {
+        name: "08 (0x08) Diagnostics-SubFunc-15-3-req",
+        data: "01 08 00 15 00 03",
+    },
+    Preset {
+        name: "08 (0x08) Diagnostics-SubFunc-15-4-req",
+        data: "01 08 00 15 00 04",
+    },
 ];
 
 /// Response presets recovered from the original's modbus/modbus-response.bdp.
@@ -332,44 +405,159 @@ pub const REQUEST_PRESETS: &[Preset] = &[
 /// The count is **38**, not the 43 claimed by earlier comments/docs — the table is the
 /// authority and `preset_counts_match_code` keeps it honest.
 pub const RESPONSE_PRESETS: &[Preset] = &[
-    Preset { name: "01 (0x01) Read Coils-resp", data: "01 01 03 CD 6B 05" },
-    Preset { name: "02 (0x02) Read Discrete Inputs-resp", data: "01 02 03 AC DB 35" },
-    Preset { name: "03 (0x03) Read Holding Registers-resp", data: "01 03 06 02 2B 00 00 00 64" },
-    Preset { name: "04 (0x04) Read Input Registers-resp", data: "01 04 02 00 0A" },
-    Preset { name: "05 (0x05) Write Single Coil-resp", data: "01 05 00 AC FF 00" },
-    Preset { name: "06 (0x06) Write Single Register-resp", data: "01 06 00 01 00 03" },
-    Preset { name: "15 (0x0F) Write Multiple Coils-resp", data: "01 0F 00 13 00 0A" },
-    Preset { name: "16 (0x10) Write Multiple registers-resp", data: "01 10 00 01 00 02" },
-    Preset { name: "17 (0x11) Report Server ID-resp", data: "01 11 04 ff 00 AA BB" },
-    Preset { name: "20 (0x14) Read File Record-resp", data: "01 14 0C 05 06 0D FE 00 20 05 06 33 CD 00 40" },
-    Preset { name: "21 (0x15) Write File Record-resp", data: "01 15 11 06 00 04 00 07 00 05 06 AF 04 BE 10 0D FF DD CC EE" },
-    Preset { name: "22 (0x16) Mask Write Register-resp", data: "01 16 00 04 00 F2 00 25" },
-    Preset { name: "23 (0x17) Read/Write Multiple registers-resp", data: "01 17 0C 00 FE 0A CD 00 01 00 03 00 0D 00 FF" },
-    Preset { name: "24 (0x18) Read FIFO Queue-Resp", data: "01 18 00 0A 00 04 01 B8 12 84 FF 00 00 AA" },
-    Preset { name: "07 (0x07) Read Exception Status-resp", data: "01 07 6D" },
-    Preset { name: "11 (0x0B) Get Comm Event Counter-resp", data: "01 0B FF FF 01 08" },
-    Preset { name: "12 (0x0C) Get Comm Event Log-resp", data: "01 0C 08 00 00 01 08 01 21 20 00" },
-    Preset { name: "08 (0x08) Diagnostics-SubFunc-00-resp", data: "01 08 00 00 A5 37" },
-    Preset { name: "08 (0x08) Diagnostics-01-resp", data: "01 08 00 01 ff 00" },
-    Preset { name: "08 (0x08) Diagnostics-02-resp", data: "01 08 00 02 FF DD" },
-    Preset { name: "08 (0x08) Diagnostics-03-resp", data: "01 08 00 03 AA FF" },
-    Preset { name: "08 (0x08) Diagnostics-04-resp", data: "01 08 00 04 00 00" },
-    Preset { name: "08 (0x08) Diagnostics-0A-resp", data: "01 08 00 0A 00 11" },
-    Preset { name: "08 (0x08) Diagnostics-0B-resp", data: "01 08 00 0B 00 22" },
-    Preset { name: "08 (0x08) Diagnostics-0C-resp", data: "01 08 00 0C 00 33" },
-    Preset { name: "08 (0x08) Diagnostics-0D-resp", data: "01 08 00 0D 22 33" },
-    Preset { name: "08 (0x08) Diagnostics-0E-resp", data: "01 08 00 0E 00 02" },
-    Preset { name: "08 (0x08) Diagnostics-0F-resp", data: "01 08 00 0F CC 1A" },
-    Preset { name: "08 (0x08) Diagnostics-10-resp", data: "01 08 00 10 01 22" },
-    Preset { name: "08 (0x08) Diagnostics-11-resp", data: "01 08 00 11 44 55" },
-    Preset { name: "08 (0x08) Diagnostics-12-resp", data: "01 08 00 12 22 55" },
-    Preset { name: "08 (0x08) Diagnostics-13-resp", data: "01 08 00 13 77 01" },
-    Preset { name: "08 (0x08) Diagnostics-14-resp", data: "01 08 00 14 00 11" },
-    Preset { name: "08 (0x08) Diagnostics-15-3resp", data: "01 08 00 15 00 03 00 06 01 02 03 04 05 06" },
-    Preset { name: "08 (0x08) Diagnostics-15-4resp", data: "01 08 00 15 00 04" },
-    Preset { name: "43 (0x2B) Encapsulated-0D-resp1", data: "01 2B 0D 00 01 02 03" },
-    Preset { name: "43 (0x2B) Encapsulated-0D-resp2", data: "01 2B 0D 00 01 01 02" },
-    Preset { name: "43 (0x2B) Encapsulated-0E-resp", data: "01 2B 0E 01 01 ff 00 03 00 04 31 32 33 35 01 06 35 36 37 38 39 40 02 05 35 36 38 39 50" },
+    Preset {
+        name: "01 (0x01) Read Coils-resp",
+        data: "01 01 03 CD 6B 05",
+    },
+    Preset {
+        name: "02 (0x02) Read Discrete Inputs-resp",
+        data: "01 02 03 AC DB 35",
+    },
+    Preset {
+        name: "03 (0x03) Read Holding Registers-resp",
+        data: "01 03 06 02 2B 00 00 00 64",
+    },
+    Preset {
+        name: "04 (0x04) Read Input Registers-resp",
+        data: "01 04 02 00 0A",
+    },
+    Preset {
+        name: "05 (0x05) Write Single Coil-resp",
+        data: "01 05 00 AC FF 00",
+    },
+    Preset {
+        name: "06 (0x06) Write Single Register-resp",
+        data: "01 06 00 01 00 03",
+    },
+    Preset {
+        name: "15 (0x0F) Write Multiple Coils-resp",
+        data: "01 0F 00 13 00 0A",
+    },
+    Preset {
+        name: "16 (0x10) Write Multiple registers-resp",
+        data: "01 10 00 01 00 02",
+    },
+    Preset {
+        name: "17 (0x11) Report Server ID-resp",
+        data: "01 11 04 ff 00 AA BB",
+    },
+    Preset {
+        name: "20 (0x14) Read File Record-resp",
+        data: "01 14 0C 05 06 0D FE 00 20 05 06 33 CD 00 40",
+    },
+    Preset {
+        name: "21 (0x15) Write File Record-resp",
+        data: "01 15 11 06 00 04 00 07 00 05 06 AF 04 BE 10 0D FF DD CC EE",
+    },
+    Preset {
+        name: "22 (0x16) Mask Write Register-resp",
+        data: "01 16 00 04 00 F2 00 25",
+    },
+    Preset {
+        name: "23 (0x17) Read/Write Multiple registers-resp",
+        data: "01 17 0C 00 FE 0A CD 00 01 00 03 00 0D 00 FF",
+    },
+    Preset {
+        name: "24 (0x18) Read FIFO Queue-Resp",
+        data: "01 18 00 0A 00 04 01 B8 12 84 FF 00 00 AA",
+    },
+    Preset {
+        name: "07 (0x07) Read Exception Status-resp",
+        data: "01 07 6D",
+    },
+    Preset {
+        name: "11 (0x0B) Get Comm Event Counter-resp",
+        data: "01 0B FF FF 01 08",
+    },
+    Preset {
+        name: "12 (0x0C) Get Comm Event Log-resp",
+        data: "01 0C 08 00 00 01 08 01 21 20 00",
+    },
+    Preset {
+        name: "08 (0x08) Diagnostics-SubFunc-00-resp",
+        data: "01 08 00 00 A5 37",
+    },
+    Preset {
+        name: "08 (0x08) Diagnostics-01-resp",
+        data: "01 08 00 01 ff 00",
+    },
+    Preset {
+        name: "08 (0x08) Diagnostics-02-resp",
+        data: "01 08 00 02 FF DD",
+    },
+    Preset {
+        name: "08 (0x08) Diagnostics-03-resp",
+        data: "01 08 00 03 AA FF",
+    },
+    Preset {
+        name: "08 (0x08) Diagnostics-04-resp",
+        data: "01 08 00 04 00 00",
+    },
+    Preset {
+        name: "08 (0x08) Diagnostics-0A-resp",
+        data: "01 08 00 0A 00 11",
+    },
+    Preset {
+        name: "08 (0x08) Diagnostics-0B-resp",
+        data: "01 08 00 0B 00 22",
+    },
+    Preset {
+        name: "08 (0x08) Diagnostics-0C-resp",
+        data: "01 08 00 0C 00 33",
+    },
+    Preset {
+        name: "08 (0x08) Diagnostics-0D-resp",
+        data: "01 08 00 0D 22 33",
+    },
+    Preset {
+        name: "08 (0x08) Diagnostics-0E-resp",
+        data: "01 08 00 0E 00 02",
+    },
+    Preset {
+        name: "08 (0x08) Diagnostics-0F-resp",
+        data: "01 08 00 0F CC 1A",
+    },
+    Preset {
+        name: "08 (0x08) Diagnostics-10-resp",
+        data: "01 08 00 10 01 22",
+    },
+    Preset {
+        name: "08 (0x08) Diagnostics-11-resp",
+        data: "01 08 00 11 44 55",
+    },
+    Preset {
+        name: "08 (0x08) Diagnostics-12-resp",
+        data: "01 08 00 12 22 55",
+    },
+    Preset {
+        name: "08 (0x08) Diagnostics-13-resp",
+        data: "01 08 00 13 77 01",
+    },
+    Preset {
+        name: "08 (0x08) Diagnostics-14-resp",
+        data: "01 08 00 14 00 11",
+    },
+    Preset {
+        name: "08 (0x08) Diagnostics-15-3resp",
+        data: "01 08 00 15 00 03 00 06 01 02 03 04 05 06",
+    },
+    Preset {
+        name: "08 (0x08) Diagnostics-15-4resp",
+        data: "01 08 00 15 00 04",
+    },
+    Preset {
+        name: "43 (0x2B) Encapsulated-0D-resp1",
+        data: "01 2B 0D 00 01 02 03",
+    },
+    Preset {
+        name: "43 (0x2B) Encapsulated-0D-resp2",
+        data: "01 2B 0D 00 01 01 02",
+    },
+    Preset {
+        name: "43 (0x2B) Encapsulated-0E-resp",
+        data:
+            "01 2B 0E 01 01 ff 00 03 00 04 31 32 33 35 01 06 35 36 37 38 39 40 02 05 35 36 38 39 50",
+    },
 ];
 
 pub fn parse_hex(text: &str) -> Option<Vec<u8>> {
@@ -499,7 +687,10 @@ mod tests {
         // ':' + 2 hex chars per byte + 2 LRC chars + CRLF
         assert_eq!(ascii.len(), 1 + pdu.len() * 2 + 2 + 2);
         let inner = &ascii[1..ascii.len() - 2];
-        assert_eq!(parse_ascii_text(inner, true).unwrap().checksum_ok, Some(true));
+        assert_eq!(
+            parse_ascii_text(inner, true).unwrap().checksum_ok,
+            Some(true)
+        );
 
         let tcp = build_frame(&pdu, ProtoType::Tcp, 0x0042);
         let (p, used) = parse_mbap(&tcp, true).unwrap();
@@ -521,7 +712,11 @@ mod tests {
     #[test]
     fn every_preset_is_valid_hex() {
         for p in REQUEST_PRESETS.iter().chain(RESPONSE_PRESETS.iter()) {
-            assert!(parse_hex(p.data).is_some(), "preset not valid hex: {}", p.name);
+            assert!(
+                parse_hex(p.data).is_some(),
+                "preset not valid hex: {}",
+                p.name
+            );
         }
     }
 }

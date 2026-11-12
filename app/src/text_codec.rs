@@ -76,7 +76,11 @@ pub fn decode(data: &[u8], enc: DisplayEncoding) -> String {
     if data.starts_with(&[0xFE, 0xFF]) {
         return decode_utf16(&data[2..], false);
     }
-    let body = if data.starts_with(&[0xEF, 0xBB, 0xBF]) { &data[3..] } else { data };
+    let body = if data.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        &data[3..]
+    } else {
+        data
+    };
     match enc {
         DisplayEncoding::Utf8 => String::from_utf8_lossy(body).into_owned(),
         DisplayEncoding::Gbk => {
@@ -225,8 +229,14 @@ mod tests {
 
     #[test]
     fn control_bytes_still_escape() {
-        assert_eq!(escape_text(&[0x01, 0x03, b'A', b'\r'], true, DisplayEncoding::Utf8), "\\x01\\x03A\\r");
-        assert_eq!(escape_text(&[0x01, 0x03, b'A', b'\r'], false, DisplayEncoding::Utf8), "??A\\r");
+        assert_eq!(
+            escape_text(&[0x01, 0x03, b'A', b'\r'], true, DisplayEncoding::Utf8),
+            "\\x01\\x03A\\r"
+        );
+        assert_eq!(
+            escape_text(&[0x01, 0x03, b'A', b'\r'], false, DisplayEncoding::Utf8),
+            "??A\\r"
+        );
     }
 
     #[test]
@@ -237,7 +247,10 @@ mod tests {
         assert_eq!(out, "\u{FFFD}");
         assert!(!out.contains("\\xFD"));
         // Disabling escaping must not change the "this did not decode" signal either.
-        assert_eq!(escape_text(&[0xFF], false, DisplayEncoding::Utf8), "\u{FFFD}");
+        assert_eq!(
+            escape_text(&[0xFF], false, DisplayEncoding::Utf8),
+            "\u{FFFD}"
+        );
     }
 
     #[test]

@@ -25,11 +25,29 @@ const TAG_RX: u32 = 4;
 const TAG_TX: u32 = 5;
 
 pub enum CapMsg {
-    Attach { pid: u32, exe: String },
-    Open { pid: u32, handle: u64, port: String },
-    Close { pid: u32, handle: u64 },
-    Rx { pid: u32, handle: u64, data: Vec<u8> },
-    Tx { pid: u32, handle: u64, data: Vec<u8> },
+    Attach {
+        pid: u32,
+        exe: String,
+    },
+    Open {
+        pid: u32,
+        handle: u64,
+        port: String,
+    },
+    Close {
+        pid: u32,
+        handle: u64,
+    },
+    Rx {
+        pid: u32,
+        handle: u64,
+        data: Vec<u8>,
+    },
+    Tx {
+        pid: u32,
+        handle: u64,
+        data: Vec<u8>,
+    },
 }
 
 const GENERIC_READ: u32 = 0x8000_0000;
@@ -246,10 +264,10 @@ fn pipe_instance(tx: std::sync::mpsc::Sender<CapMsg>) {
                 PIPE_ACCESS_DUPLEX, // server side reads; mode keeps clients happy
                 PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
                 255, // max instances: one connection per injected process, and the
-                     // auto-attach hook lives in many processes at once. With the old
-                     // value of 4, every process beyond the fourth got
-                     // ERROR_PIPE_BUSY (231) and silently streamed nothing — which is
-                     // exactly why a monitored program could look completely idle.
+                // auto-attach hook lives in many processes at once. With the old
+                // value of 4, every process beyond the fourth got
+                // ERROR_PIPE_BUSY (231) and silently streamed nothing — which is
+                // exactly why a monitored program could look completely idle.
                 4096,
                 4096,
                 0,
@@ -263,7 +281,11 @@ fn pipe_instance(tx: std::sync::mpsc::Sender<CapMsg>) {
         }
         dbg("instance created, waiting connect");
         let connected = unsafe { ConnectNamedPipe(h, std::ptr::null_mut()) };
-        dbg(&format!("connect ret={} err={}", connected, get_last_error()));
+        dbg(&format!(
+            "connect ret={} err={}",
+            connected,
+            get_last_error()
+        ));
         if connected == 0 {
             let err = get_last_error();
             if err != ERROR_PIPE_CONNECTED {
@@ -279,7 +301,15 @@ fn pipe_instance(tx: std::sync::mpsc::Sender<CapMsg>) {
         let mut buf = [0u8; 65536];
         'conn: loop {
             let mut n = 0u32;
-            let ok = unsafe { ReadFile(h, buf.as_mut_ptr(), buf.len() as u32, &mut n, std::ptr::null_mut()) };
+            let ok = unsafe {
+                ReadFile(
+                    h,
+                    buf.as_mut_ptr(),
+                    buf.len() as u32,
+                    &mut n,
+                    std::ptr::null_mut(),
+                )
+            };
             if ok == 0 || n == 0 {
                 break;
             }
@@ -331,7 +361,10 @@ fn get_last_error() -> u32 {
 // RX/TX handle u64 + bytes. pid rides in the record header.
 fn decode(tag: u32, pid: u32, p: &[u8]) -> Option<CapMsg> {
     match tag {
-        TAG_ATTACH => Some(CapMsg::Attach { pid, exe: String::from_utf8_lossy(p).into_owned() }),
+        TAG_ATTACH => Some(CapMsg::Attach {
+            pid,
+            exe: String::from_utf8_lossy(p).into_owned(),
+        }),
         TAG_OPEN if p.len() >= 8 => Some(CapMsg::Open {
             pid,
             handle: u64::from_le_bytes(p[0..8].try_into().ok()?),
@@ -372,9 +405,20 @@ pub fn start_capture_server() -> Receiver<CapMsg> {
 // ---------------- process listing ----------------
 
 const BLACKLIST: &[&str] = &[
-    "system", "csrss.exe", "smss.exe", "wininit.exe", "winlogon.exe", "lsass.exe",
-    "services.exe", "svchost.exe", "dwm.exe", "fontdrvhost.exe", "winidle0.exe",
-    "securityhealthservice.exe", "memory compression", "registry",
+    "system",
+    "csrss.exe",
+    "smss.exe",
+    "wininit.exe",
+    "winlogon.exe",
+    "lsass.exe",
+    "services.exe",
+    "svchost.exe",
+    "dwm.exe",
+    "fontdrvhost.exe",
+    "winidle0.exe",
+    "securityhealthservice.exe",
+    "memory compression",
+    "registry",
 ];
 
 /// (pid, exe name) of injectable processes — OS-critical ones excluded.
@@ -408,7 +452,9 @@ pub fn list_processes() -> Vec<(u32, String)> {
                         String::from_utf16_lossy(&pe.szExeFile[..end])
                     };
                     let lower = name.to_lowercase();
-                    let critical = BLACKLIST.iter().any(|b| lower == *b || lower == format!("{}.exe", *b));
+                    let critical = BLACKLIST
+                        .iter()
+                        .any(|b| lower == *b || lower == format!("{}.exe", *b));
                     let critical = critical || lower == "system" || lower == "system idle process";
                     if !critical {
                         out.push((pe.th32ProcessID, name));
@@ -421,7 +467,10 @@ pub fn list_processes() -> Vec<(u32, String)> {
         }
         CloseHandle(snap);
     }
-    out.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+    // Sort case-insensitively for the process picker: `sort_by_key` would have to
+    // allocate a lowercased String per element anyway, and clippy's suggestion applies
+    // here because the key is computed on the fly.
+    out.sort_by_key(|a| a.1.to_lowercase());
     out
 }
 
@@ -476,7 +525,11 @@ fn inject_via_x86_helper(pid: u32, dll: &str) -> Result<(), String> {
 /// picked from the target's bitness rather than from the monitor's own.
 pub fn dll_path_for(wow64_target: bool) -> Option<std::path::PathBuf> {
     let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
-    let name = if wow64_target { "monitor_hook_x86.dll" } else { "monitor_hook.dll" };
+    let name = if wow64_target {
+        "monitor_hook_x86.dll"
+    } else {
+        "monitor_hook.dll"
+    };
     let p = dir.join(name);
     if p.exists() {
         Some(p)
@@ -585,7 +638,10 @@ pub fn inject(pid: u32, dll: &str) -> Result<(), String> {
         v.push(0);
         (v, false)
     } else {
-        (wide(dll).iter().flat_map(|u| u.to_le_bytes()).collect(), true)
+        (
+            wide(dll).iter().flat_map(|u| u.to_le_bytes()).collect(),
+            true,
+        )
     };
     let bytes = path_bytes.len();
     let _ = is_wide;
@@ -596,7 +652,13 @@ pub fn inject(pid: u32, dll: &str) -> Result<(), String> {
         MEM_COMMIT | MEM_RESERVE
     };
     let remote = unsafe {
-        VirtualAllocEx(proc, std::ptr::null_mut(), bytes, alloc_flags, PAGE_READWRITE)
+        VirtualAllocEx(
+            proc,
+            std::ptr::null_mut(),
+            bytes,
+            alloc_flags,
+            PAGE_READWRITE,
+        )
     };
     if remote.is_null() {
         unsafe { CloseHandle(proc) };
@@ -610,13 +672,18 @@ pub fn inject(pid: u32, dll: &str) -> Result<(), String> {
             VirtualFreeEx(proc, remote, 0, MEM_RELEASE);
             CloseHandle(proc);
         }
-        return Err(format!(
-            "32 位目标的分配地址超出 4GB 范围 ({:p})",
-            remote
-        ));
+        return Err(format!("32 位目标的分配地址超出 4GB 范围 ({:p})", remote));
     }
     let mut written = 0usize;
-    let ok = unsafe { WriteProcessMemory(proc, remote, path_bytes.as_ptr() as *const u8, bytes, &mut written) };
+    let ok = unsafe {
+        WriteProcessMemory(
+            proc,
+            remote,
+            path_bytes.as_ptr() as *const u8,
+            bytes,
+            &mut written,
+        )
+    };
     // Verify the path only when the target grants read access. Some processes deny
     // PROCESS_VM_READ (VirtualAllocEx then fails with ERROR_ACCESS_DENIED), and a failed
     // *verification* must not abort an injection that is otherwise fine.
@@ -646,7 +713,10 @@ pub fn inject(pid: u32, dll: &str) -> Result<(), String> {
             VirtualFreeEx(proc, remote, 0, MEM_RELEASE);
             CloseHandle(proc);
         }
-        return Err(format!("WriteProcessMemory 失败 (err={})", get_last_error()));
+        return Err(format!(
+            "WriteProcessMemory 失败 (err={})",
+            get_last_error()
+        ));
     }
     let entry = hmod;
     let th = unsafe {
@@ -876,9 +946,7 @@ fn native_module_bases(proc: *mut std::ffi::c_void) -> Vec<(*mut std::ffi::c_voi
     const LIST_MODULES_ALL: u32 = 0x03;
     let mut out = Vec::new();
     let mut needed: u32 = 0;
-    unsafe {
-        EnumProcessModulesEx(proc, std::ptr::null_mut(), 0, &mut needed, LIST_MODULES_ALL)
-    };
+    unsafe { EnumProcessModulesEx(proc, std::ptr::null_mut(), 0, &mut needed, LIST_MODULES_ALL) };
     if needed == 0 {
         return out;
     }
@@ -913,7 +981,6 @@ fn native_module_bases(proc: *mut std::ffi::c_void) -> Vec<(*mut std::ffi::c_voi
     }
     out
 }
-
 
 /// Module bases of a 32-bit (WOW64) process, via EnumProcessModulesEx.
 ///
@@ -1009,7 +1076,10 @@ fn wow64_export_address(
     }
     eprintln!("inject: {module} 基址 = {hit_base:#x}");
     let addr = export_rva_of(proc, hit_base, symbol)?;
-    eprintln!("inject: {symbol} RVA = {addr:#x} → 绝对地址 {:#x}", hit_base + addr as u64);
+    eprintln!(
+        "inject: {symbol} RVA = {addr:#x} → 绝对地址 {:#x}",
+        hit_base + addr as u64
+    );
     Ok((hit_base + addr as u64) as *mut std::ffi::c_void)
 }
 
@@ -1042,7 +1112,10 @@ fn peb32_module_base(proc: *mut std::ffi::c_void, want: &str) -> Result<u64, Str
         )
     };
     if st != 0 || pbi.peb == 0 {
-        return Err(format!("NtQueryInformationProcess 失败 (0x{:08X})", st as u32));
+        return Err(format!(
+            "NtQueryInformationProcess 失败 (0x{:08X})",
+            st as u32
+        ));
     }
     // The 64-bit PEB of a WOW64 process does NOT begin with a pointer to the 32-bit
     // PEB (that is a common misconception; the pointer lives further in). The reliable
@@ -1122,7 +1195,11 @@ fn peb32_module_base(proc: *mut std::ffi::c_void, want: &str) -> Result<u64, Str
                     .map(|c| u16::from_le_bytes([c[0], c[1]]))
                     .collect();
                 let full = String::from_utf16_lossy(&units);
-                let leaf = full.rsplit(['\\', '/']).next().unwrap_or(&full).to_lowercase();
+                let leaf = full
+                    .rsplit(['\\', '/'])
+                    .next()
+                    .unwrap_or(&full)
+                    .to_lowercase();
                 if leaf == needle && base != 0 {
                     // Verify this really is the module image base: a PE header must be
                     // there. Reading the wrong field is the classic failure mode here,
@@ -1139,9 +1216,7 @@ fn peb32_module_base(proc: *mut std::ffi::c_void, want: &str) -> Result<u64, Str
                             return Ok(cand);
                         }
                     }
-                    return Err(format!(
-                        "{needle} 的 PE 基址无效 (读到 {base:#x})"
-                    ));
+                    return Err(format!("{needle} 的 PE 基址无效 (读到 {base:#x})"));
                 }
             }
         }
@@ -1173,8 +1248,10 @@ fn export_rva_of(proc: *mut std::ffi::c_void, base: u64, symbol: &str) -> Result
     }
     // Optional header: DataDirectory[0] = export table, at optional header + 96 (PE32).
     let opt = 24usize; // after signature(4) + file header(20)
-    let export_rva = u32::from_le_bytes([nt[opt + 96], nt[opt + 97], nt[opt + 98], nt[opt + 99]]) as u64;
-    let export_size = u32::from_le_bytes([nt[opt + 100], nt[opt + 101], nt[opt + 102], nt[opt + 103]]);
+    let export_rva =
+        u32::from_le_bytes([nt[opt + 96], nt[opt + 97], nt[opt + 98], nt[opt + 99]]) as u64;
+    let export_size =
+        u32::from_le_bytes([nt[opt + 100], nt[opt + 101], nt[opt + 102], nt[opt + 103]]);
     if export_rva == 0 {
         return Err("模块没有导出表".into());
     }
@@ -1191,7 +1268,8 @@ fn export_rva_of(proc: *mut std::ffi::c_void, base: u64, symbol: &str) -> Result
     let addr_of_ords = u32::from_le_bytes([ed[36], ed[37], ed[38], ed[39]]) as u64;
     let want = symbol.as_bytes();
     for i in 0..num_names.min(8192) {
-        let name_rva = read_remote_u32(proc, base + addr_of_names + i as u64 * 4).unwrap_or(0) as u64;
+        let name_rva =
+            read_remote_u32(proc, base + addr_of_names + i as u64 * 4).unwrap_or(0) as u64;
         if name_rva == 0 {
             continue;
         }
@@ -1199,7 +1277,10 @@ fn export_rva_of(proc: *mut std::ffi::c_void, base: u64, symbol: &str) -> Result
         if !read_remote(proc, base + name_rva, &mut name_buf) {
             continue;
         }
-        let end = name_buf.iter().position(|&c| c == 0).unwrap_or(name_buf.len());
+        let end = name_buf
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(name_buf.len());
         if &name_buf[..end] == want {
             let ord = u16::from_le_bytes([
                 read_remote_u32(proc, base + addr_of_ords + i as u64 * 2)
@@ -1286,7 +1367,9 @@ pub fn smoke_inject() -> i32 {
     let _ = child.wait();
     if result != 0 {
         println!("smoke: FAIL no attach within 5s");
-        if let Ok(log) = std::fs::read_to_string(std::env::temp_dir().join(format!("um_hook_{}.log", pid))) {
+        if let Ok(log) =
+            std::fs::read_to_string(std::env::temp_dir().join(format!("um_hook_{}.log", pid)))
+        {
             println!("smoke: hook log: {:?}", log);
         } else {
             println!("smoke: hook log: (none)");
@@ -1379,7 +1462,9 @@ pub fn comtest_inject(com: &str, peer: &str) -> i32 {
                 attach = true;
                 println!("comtest: attach {} {}", p, exe);
             }
-            Ok(CapMsg::Open { pid: p, port: name, .. }) if p == pid => {
+            Ok(CapMsg::Open {
+                pid: p, port: name, ..
+            }) if p == pid => {
                 open = true;
                 println!("comtest: open {} handle port {}", p, name);
             }
@@ -1413,7 +1498,9 @@ pub fn comtest_inject(com: &str, peer: &str) -> i32 {
         println!("comtest: child: {}", String::from_utf8_lossy(&b).trim());
     }
     let ok = attach && open && tx > 0 && rxc > 0;
-    if let Ok(log) = std::fs::read_to_string(std::env::temp_dir().join(format!("um_hook_{}.log", pid))) {
+    if let Ok(log) =
+        std::fs::read_to_string(std::env::temp_dir().join(format!("um_hook_{}.log", pid)))
+    {
         for line in log.lines().take(60) {
             println!("comtest: hook| {}", line);
         }

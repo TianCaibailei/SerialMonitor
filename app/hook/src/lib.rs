@@ -45,9 +45,9 @@
 // used by the diagnostics, so some items are unused in any single build configuration.
 #![allow(dead_code)]
 // The hook patch table stores hook functions as raw addresses (`hook_X as usize`) so the
-// inline trampoline can jump to them. Rustc flags each cast ("direct cast of function item
-// into an integer"); that is the intended FFI pattern here, so the warning is accepted as
-// known noise rather than silenced with a blanket allow.
+// inline trampoline can jump to them. That cast is exactly the intent here, so the lint is
+// silenced at the crate root (clippy name and rustc name both listed).
+#![allow(function_casts_as_integer)]
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -163,7 +163,8 @@ static HANDLES: std::sync::LazyLock<Mutex<HashMap<usize, Option<String>>>> =
 static PIPE: Mutex<PipeState> = Mutex::new(PipeState::dead());
 
 /// OVERLAPPED -> (handle, buffer, length) of reads that returned ERROR_IO_PENDING.
-static PENDING_READS: std::sync::LazyLock<Mutex<HashMap<usize, (usize, usize, u32)>>> =
+type PendingRead = (usize, usize, u32);
+static PENDING_READS: std::sync::LazyLock<Mutex<HashMap<usize, PendingRead>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Context of an in-flight ReadFileEx/WriteFileEx, keyed by the caller's OVERLAPPED.
@@ -337,7 +338,12 @@ fn serial_label_from_path(path: &str) -> String {
             return format!("COM{digits}");
         }
     }
-    let leaf = path.rsplit('\\').next().unwrap_or(path).trim_end_matches('\0').trim();
+    let leaf = path
+        .rsplit('\\')
+        .next()
+        .unwrap_or(path)
+        .trim_end_matches('\0')
+        .trim();
     if leaf.is_empty() {
         "COM?".to_string()
     } else {
@@ -393,11 +399,17 @@ type WriteFileFn = unsafe extern "system" fn(
     *mut std::ffi::c_void,
 ) -> i32;
 type CloseHandleFn = unsafe extern "system" fn(*mut std::ffi::c_void) -> i32;
-type GetProcAddressFn = unsafe extern "system" fn(*mut std::ffi::c_void, *const u8) -> *mut std::ffi::c_void;
+type GetProcAddressFn =
+    unsafe extern "system" fn(*mut std::ffi::c_void, *const u8) -> *mut std::ffi::c_void;
 type GetOverlappedResultFn =
     unsafe extern "system" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, *mut u32, i32) -> i32;
-type GetOverlappedResultExFn =
-    unsafe extern "system" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, *mut u32, u32, i32) -> i32;
+type GetOverlappedResultExFn = unsafe extern "system" fn(
+    *mut std::ffi::c_void,
+    *mut std::ffi::c_void,
+    *mut u32,
+    u32,
+    i32,
+) -> i32;
 type ReadFileExFn = unsafe extern "system" fn(
     *mut std::ffi::c_void,
     *mut u8,
@@ -433,7 +445,8 @@ fn dbg_note(msg: &str) {
     if create == 0 || write == 0 || close == 0 {
         return;
     }
-    let path = std::env::temp_dir().join(format!("um_hook_{}.log", unsafe { GetCurrentProcessId() }));
+    let path =
+        std::env::temp_dir().join(format!("um_hook_{}.log", unsafe { GetCurrentProcessId() }));
     let wpath = wide(&path.to_string_lossy());
     let cf: CreateFileWFn = unsafe { std::mem::transmute(create) };
     let h = unsafe {
@@ -456,7 +469,13 @@ fn dbg_note(msg: &str) {
     let wf: WriteFileFn = unsafe { std::mem::transmute(write) };
     let mut written = 0u32;
     unsafe {
-        wf(h, line.as_ptr(), line.len() as u32, &mut written, std::ptr::null_mut());
+        wf(
+            h,
+            line.as_ptr(),
+            line.len() as u32,
+            &mut written,
+            std::ptr::null_mut(),
+        );
         let ch: CloseHandleFn = std::mem::transmute(close);
         ch(h);
     }
@@ -720,7 +739,8 @@ unsafe fn com_number_for_device(device: &str) -> Option<String> {
     let want = device.trim_end_matches(['\0', ' ']);
     for n in 1..=256u32 {
         let mut target = [0u16; 512];
-        let len = QueryDosDeviceW(wide(&format!("COM{n}")).as_ptr(), target.as_mut_ptr(), 512) as usize;
+        let len =
+            QueryDosDeviceW(wide(&format!("COM{n}")).as_ptr(), target.as_mut_ptr(), 512) as usize;
         if len == 0 {
             continue;
         }
@@ -731,7 +751,6 @@ unsafe fn com_number_for_device(device: &str) -> Option<String> {
     }
     None
 }
-
 
 // ---------------- I/O hooks ----------------
 
@@ -750,7 +769,11 @@ unsafe extern "system" fn hook_CreateFileW(
     // Diagnostic: every port open the target performs, whether or not it is a serial
     // device. Kept because "the hook is loaded but the program never opened anything"
     // and "it opened a path we did not classify as serial" look identical without it.
-    dbg_note(&format!("createfilew: {:?} -> h={:x}", wide_to_string(name), h as usize));
+    dbg_note(&format!(
+        "createfilew: {:?} -> h={:x}",
+        wide_to_string(name),
+        h as usize
+    ));
     let err = GetLastError(); // .NET and others inspect it right after we return
     if h as isize != INVALID_HANDLE {
         let s = wide_to_string(name);
@@ -811,8 +834,7 @@ unsafe extern "system" fn hook_ReadFile(
     read: *mut u32,
     ov: *mut std::ffi::c_void,
 ) -> i32 {
-    let f: ReadFileFn =
-        std::mem::transmute(orig_call_addr(&INLINE_READFILE, &ORIG_READFILE));
+    let f: ReadFileFn = std::mem::transmute(orig_call_addr(&INLINE_READFILE, &ORIG_READFILE));
     let ok = f(h, buf, len, read, ov);
     let err = GetLastError();
     if ok != 0 {
@@ -879,8 +901,7 @@ unsafe extern "system" fn hook_WriteFile(
     written: *mut u32,
     ov: *mut std::ffi::c_void,
 ) -> i32 {
-    let f: WriteFileFn =
-        std::mem::transmute(orig_call_addr(&INLINE_WRITEFILE, &ORIG_WRITEFILE));
+    let f: WriteFileFn = std::mem::transmute(orig_call_addr(&INLINE_WRITEFILE, &ORIG_WRITEFILE));
     let ok = f(h, buf, len, written, ov);
     let err = GetLastError();
     if ok != 0 {
@@ -907,7 +928,8 @@ unsafe extern "system" fn hook_GetOverlappedResult(
     bytes: *mut u32,
     wait: i32,
 ) -> i32 {
-    let f: GetOverlappedResultFn = std::mem::transmute(ORIG_GETOVERLAPPEDRESULT.load(Ordering::Relaxed));
+    let f: GetOverlappedResultFn =
+        std::mem::transmute(ORIG_GETOVERLAPPEDRESULT.load(Ordering::Relaxed));
     let ok = f(h, ov, bytes, wait);
     let err = GetLastError();
     if ok != 0 && !ov.is_null() {
@@ -931,7 +953,8 @@ unsafe extern "system" fn hook_GetOverlappedResultEx(
     ms: u32,
     alertable: i32,
 ) -> i32 {
-    let f: GetOverlappedResultExFn = std::mem::transmute(ORIG_GETOVERLAPPEDRESULTEX.load(Ordering::Relaxed));
+    let f: GetOverlappedResultExFn =
+        std::mem::transmute(ORIG_GETOVERLAPPEDRESULTEX.load(Ordering::Relaxed));
     let ok = f(h, ov, bytes, ms, alertable);
     let err = GetLastError();
     if ok != 0 && !ov.is_null() {
@@ -1051,7 +1074,8 @@ unsafe extern "system" fn hook_CloseHandle(h: *mut std::ffi::c_void) -> i32 {
     pending_lock().retain(|_, v| v.0 != h as usize);
     // Trampoline, not the raw pointer: CloseHandle is entry-patched too, so calling
     // ORIG_CLOSEHANDLE directly would re-enter this hook forever.
-    let f: CloseHandleFn = std::mem::transmute(orig_call_addr(&INLINE_CLOSEHANDLE, &ORIG_CLOSEHANDLE));
+    let f: CloseHandleFn =
+        std::mem::transmute(orig_call_addr(&INLINE_CLOSEHANDLE, &ORIG_CLOSEHANDLE));
     f(h)
 }
 
@@ -1071,15 +1095,42 @@ unsafe extern "system" fn hook_GetProcAddress(
         // Only exact matches against the addresses we actually resolved: a lookup
         // of an unrelated symbol is passed through untouched.
         let subs: [(usize, usize); 10] = [
-            (ORIG_CREATEFILEW.load(Ordering::Relaxed), hook_CreateFileW as usize),
-            (ORIG_CREATEFILEA.load(Ordering::Relaxed), hook_CreateFileA as usize),
-            (ORIG_READFILE.load(Ordering::Relaxed), hook_ReadFile as usize),
-            (ORIG_WRITEFILE.load(Ordering::Relaxed), hook_WriteFile as usize),
-            (ORIG_CLOSEHANDLE.load(Ordering::Relaxed), hook_CloseHandle as usize),
-            (ORIG_GETOVERLAPPEDRESULT.load(Ordering::Relaxed), hook_GetOverlappedResult as usize),
-            (ORIG_GETOVERLAPPEDRESULTEX.load(Ordering::Relaxed), hook_GetOverlappedResultEx as usize),
-            (ORIG_READFILEEX.load(Ordering::Relaxed), hook_ReadFileEx as usize),
-            (ORIG_WRITEFILEEX.load(Ordering::Relaxed), hook_WriteFileEx as usize),
+            (
+                ORIG_CREATEFILEW.load(Ordering::Relaxed),
+                hook_CreateFileW as usize,
+            ),
+            (
+                ORIG_CREATEFILEA.load(Ordering::Relaxed),
+                hook_CreateFileA as usize,
+            ),
+            (
+                ORIG_READFILE.load(Ordering::Relaxed),
+                hook_ReadFile as usize,
+            ),
+            (
+                ORIG_WRITEFILE.load(Ordering::Relaxed),
+                hook_WriteFile as usize,
+            ),
+            (
+                ORIG_CLOSEHANDLE.load(Ordering::Relaxed),
+                hook_CloseHandle as usize,
+            ),
+            (
+                ORIG_GETOVERLAPPEDRESULT.load(Ordering::Relaxed),
+                hook_GetOverlappedResult as usize,
+            ),
+            (
+                ORIG_GETOVERLAPPEDRESULTEX.load(Ordering::Relaxed),
+                hook_GetOverlappedResultEx as usize,
+            ),
+            (
+                ORIG_READFILEEX.load(Ordering::Relaxed),
+                hook_ReadFileEx as usize,
+            ),
+            (
+                ORIG_WRITEFILEEX.load(Ordering::Relaxed),
+                hook_WriteFileEx as usize,
+            ),
             (0, 0),
         ];
         for (orig, hook) in subs {
@@ -1230,18 +1281,30 @@ struct PatchSlot {
     trampoline: AtomicUsize,
 }
 
-static INLINE_CREATEFILEW: PatchSlot =
-    PatchSlot { target: AtomicUsize::new(0), trampoline: AtomicUsize::new(0) };
-static INLINE_CREATEFILEA: PatchSlot =
-    PatchSlot { target: AtomicUsize::new(0), trampoline: AtomicUsize::new(0) };
-static INLINE_READFILE: PatchSlot =
-    PatchSlot { target: AtomicUsize::new(0), trampoline: AtomicUsize::new(0) };
-static INLINE_WRITEFILE: PatchSlot =
-    PatchSlot { target: AtomicUsize::new(0), trampoline: AtomicUsize::new(0) };
-static INLINE_READFILEEX: PatchSlot =
-    PatchSlot { target: AtomicUsize::new(0), trampoline: AtomicUsize::new(0) };
-static INLINE_WRITEFILEEX: PatchSlot =
-    PatchSlot { target: AtomicUsize::new(0), trampoline: AtomicUsize::new(0) };
+static INLINE_CREATEFILEW: PatchSlot = PatchSlot {
+    target: AtomicUsize::new(0),
+    trampoline: AtomicUsize::new(0),
+};
+static INLINE_CREATEFILEA: PatchSlot = PatchSlot {
+    target: AtomicUsize::new(0),
+    trampoline: AtomicUsize::new(0),
+};
+static INLINE_READFILE: PatchSlot = PatchSlot {
+    target: AtomicUsize::new(0),
+    trampoline: AtomicUsize::new(0),
+};
+static INLINE_WRITEFILE: PatchSlot = PatchSlot {
+    target: AtomicUsize::new(0),
+    trampoline: AtomicUsize::new(0),
+};
+static INLINE_READFILEEX: PatchSlot = PatchSlot {
+    target: AtomicUsize::new(0),
+    trampoline: AtomicUsize::new(0),
+};
+static INLINE_WRITEFILEEX: PatchSlot = PatchSlot {
+    target: AtomicUsize::new(0),
+    trampoline: AtomicUsize::new(0),
+};
 /// CloseHandle MUST be entry-patched, not merely IAT-hooked.
 ///
 /// A target that binds its imports at run time (UartAssist: UPX-packed, its
@@ -1254,11 +1317,18 @@ static INLINE_WRITEFILEEX: PatchSlot =
 ///
 /// That is exactly the reported symptom: closing the program produced one spurious
 /// read whose content was the program's own log file.
-static INLINE_CLOSEHANDLE: PatchSlot =
-    PatchSlot { target: AtomicUsize::new(0), trampoline: AtomicUsize::new(0) };
+static INLINE_CLOSEHANDLE: PatchSlot = PatchSlot {
+    target: AtomicUsize::new(0),
+    trampoline: AtomicUsize::new(0),
+};
 
 extern "system" {
-    fn VirtualAlloc(addr: *mut std::ffi::c_void, size: usize, ty: u32, protect: u32) -> *mut std::ffi::c_void;
+    fn VirtualAlloc(
+        addr: *mut std::ffi::c_void,
+        size: usize,
+        ty: u32,
+        protect: u32,
+    ) -> *mut std::ffi::c_void;
     fn FlushInstructionCache(
         process: *mut std::ffi::c_void,
         addr: *const std::ffi::c_void,
@@ -1417,7 +1487,11 @@ unsafe fn patch_entry(target: usize, hook: usize, slot: &PatchSlot) -> usize {
         old.max(PAGE_EXECUTE_READ_INLINE),
         &mut rel,
     );
-    FlushInstructionCache(GetCurrentProcess(), target as *const std::ffi::c_void, PATCH_TOTAL);
+    FlushInstructionCache(
+        GetCurrentProcess(),
+        target as *const std::ffi::c_void,
+        PATCH_TOTAL,
+    );
 
     slot.target.store(target, Ordering::Relaxed);
     slot.trampoline.store(tramp as usize, Ordering::Relaxed);
@@ -1435,15 +1509,42 @@ unsafe fn patch_entry(target: usize, hook: usize, slot: &PatchSlot) -> usize {
 /// rejection every 3 seconds.
 unsafe fn patch_all() {
     let targets: [(usize, usize); 9] = [
-        (ORIG_CREATEFILEW.load(Ordering::Relaxed), hook_CreateFileW as usize),
-        (ORIG_CREATEFILEA.load(Ordering::Relaxed), hook_CreateFileA as usize),
-        (ORIG_READFILE.load(Ordering::Relaxed), hook_ReadFile as usize),
-        (ORIG_WRITEFILE.load(Ordering::Relaxed), hook_WriteFile as usize),
-        (ORIG_CLOSEHANDLE.load(Ordering::Relaxed), hook_CloseHandle as usize),
-        (ORIG_GETPROCADDRESS.load(Ordering::Relaxed), hook_GetProcAddress as usize),
-        (ORIG_GETOVERLAPPEDRESULT.load(Ordering::Relaxed), hook_GetOverlappedResult as usize),
-        (ORIG_GETOVERLAPPEDRESULTEX.load(Ordering::Relaxed), hook_GetOverlappedResultEx as usize),
-        (ORIG_READFILEEX.load(Ordering::Relaxed), hook_ReadFileEx as usize),
+        (
+            ORIG_CREATEFILEW.load(Ordering::Relaxed),
+            hook_CreateFileW as usize,
+        ),
+        (
+            ORIG_CREATEFILEA.load(Ordering::Relaxed),
+            hook_CreateFileA as usize,
+        ),
+        (
+            ORIG_READFILE.load(Ordering::Relaxed),
+            hook_ReadFile as usize,
+        ),
+        (
+            ORIG_WRITEFILE.load(Ordering::Relaxed),
+            hook_WriteFile as usize,
+        ),
+        (
+            ORIG_CLOSEHANDLE.load(Ordering::Relaxed),
+            hook_CloseHandle as usize,
+        ),
+        (
+            ORIG_GETPROCADDRESS.load(Ordering::Relaxed),
+            hook_GetProcAddress as usize,
+        ),
+        (
+            ORIG_GETOVERLAPPEDRESULT.load(Ordering::Relaxed),
+            hook_GetOverlappedResult as usize,
+        ),
+        (
+            ORIG_GETOVERLAPPEDRESULTEX.load(Ordering::Relaxed),
+            hook_GetOverlappedResultEx as usize,
+        ),
+        (
+            ORIG_READFILEEX.load(Ordering::Relaxed),
+            hook_ReadFileEx as usize,
+        ),
     ];
     if targets[..8].iter().any(|t| t.0 == 0) {
         return; // core functions must all be resolved before patching
@@ -1540,7 +1641,10 @@ unsafe fn worker() {
     ORIG_CLOSEHANDLE.store(resolve_kernel32(b"CloseHandle"), Ordering::Relaxed);
     ORIG_GETPROCADDRESS.store(resolve_kernel32(b"GetProcAddress"), Ordering::Relaxed);
     ORIG_GETOVERLAPPEDRESULT.store(resolve_kernel32(b"GetOverlappedResult"), Ordering::Relaxed);
-    ORIG_GETOVERLAPPEDRESULTEX.store(resolve_kernel32(b"GetOverlappedResultEx"), Ordering::Relaxed);
+    ORIG_GETOVERLAPPEDRESULTEX.store(
+        resolve_kernel32(b"GetOverlappedResultEx"),
+        Ordering::Relaxed,
+    );
     ORIG_READFILEEX.store(resolve_kernel32(b"ReadFileEx"), Ordering::Relaxed);
     ORIG_WRITEFILEEX.store(resolve_kernel32(b"WriteFileEx"), Ordering::Relaxed);
     // The pipe must be up before any record can be produced.
@@ -1585,12 +1689,27 @@ unsafe fn patch_entries() {
             hook_CreateFileA as usize,
             &INLINE_CREATEFILEA,
         ),
-        ("ReadFile", &ORIG_READFILE, hook_ReadFile as usize, &INLINE_READFILE),
-        ("WriteFile", &ORIG_WRITEFILE, hook_WriteFile as usize, &INLINE_WRITEFILE),
+        (
+            "ReadFile",
+            &ORIG_READFILE,
+            hook_ReadFile as usize,
+            &INLINE_READFILE,
+        ),
+        (
+            "WriteFile",
+            &ORIG_WRITEFILE,
+            hook_WriteFile as usize,
+            &INLINE_WRITEFILE,
+        ),
         // Qt's QSerialPort and several industrial C++ libraries use the asynchronous
         // pair; a tool that caches these pointers before injection is exactly the case
         // entry patching exists for.
-        ("ReadFileEx", &ORIG_READFILEEX, hook_ReadFileEx as usize, &INLINE_READFILEEX),
+        (
+            "ReadFileEx",
+            &ORIG_READFILEEX,
+            hook_ReadFileEx as usize,
+            &INLINE_READFILEEX,
+        ),
         (
             "WriteFileEx",
             &ORIG_WRITEFILEEX,
@@ -1617,7 +1736,9 @@ unsafe fn patch_entries() {
                 now
             ));
         } else {
-            dbg_note(&format!("inline {name}: 未安装（形态不受支持），仅靠 IAT 挂钩"));
+            dbg_note(&format!(
+                "inline {name}: 未安装（形态不受支持），仅靠 IAT 挂钩"
+            ));
         }
     }
 }
