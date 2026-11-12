@@ -1844,9 +1844,34 @@ impl MonitorApp {
             ui.label(RichText::new("点击上方任一行查看详情").weak());
         }
         ui.separator();
-        // send controls
+        // ---- send controls ----
+        //
+        // 发送能力取决于通道类型：被动监听（拦截串口）的句柄由被监控进程持有，本软件
+        // 根本没有可写句柄。以前按钮始终可用、点了必然失败，错误只塞进 notices，
+        // 用户看到的就是「点了没反应」。现在按可用性禁用并在原位说明原因。
+        let sel_kind = s.channels.get(s.send_chan).map(|c| c.kind.clone());
+        let can_send = matches!(
+            sel_kind,
+            Some(ChanKind::Serial) | Some(ChanKind::TcpClient) | Some(ChanKind::TcpServer) | Some(ChanKind::Udp)
+        );
+        let reason = match (&sel_kind, can_send) {
+            (None, _) => "该会话没有通道",
+            (Some(ChanKind::HookSerial), _) => {
+                "监听模式只读：串口句柄由被监控进程持有，本软件无法写入。需要主动收发请新建「串口独占用」会话。"
+            }
+            (_, true) => "",
+            _ => "当前通道不可发送",
+        };
+        if !reason.is_empty() {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("ⓘ").color(C_REQ));
+                ui.label(RichText::new(reason).color(C_REQ).small());
+            });
+        }
+        // `s` holds a mutable borrow of self.sessions for the whole block, so collect the
+        // user-visible feedback here and emit it after the closure ends.
+        let mut feedback: Option<String> = None;
         ui.horizontal(|ui| {
-            let n = s.channels.len();
             ComboBox::from_id_source("send_chan")
                 .selected_text(s.channels.get(s.send_chan).map(|c| c.name.as_str()).unwrap_or("-"))
                 .width(160.0)
@@ -1855,38 +1880,40 @@ impl MonitorApp {
                         ui.selectable_value(&mut s.send_chan, i, &c.name);
                     }
                 })
-                .response.on_disabled_hover_text("没有通道");
-            let _ = n;
+                .response
+                .on_disabled_hover_text("没有通道");
             ui.checkbox(&mut s.send_hex, "HEX");
             let resp = ui.add(
                 TextEdit::singleline(&mut s.send_text)
                     .hint_text(if s.send_hex { "01 03 00 6B 00 03" } else { "hello" })
-                    .desired_width(320.0),
+                    .desired_width(300.0),
             );
-            if ui.button("发送").clicked() {
+            let _ = resp;
+            if ui
+                .add_enabled(can_send, egui::Button::new("发送"))
+                .on_disabled_hover_text(reason)
+                .clicked()
+            {
                 let bytes = if s.send_hex {
                     protocol::parse_hex(&s.send_text)
                 } else {
                     Some(s.send_text.bytes().collect())
                 };
-                match bytes {
-                    Some(data) => match s.send_bytes(s.send_chan, &data) {
-                        Ok(()) => {}
-                        Err(e) => s.notices.push(format!("发送失败: {}", e)),
+                feedback = Some(match bytes {
+                    Some(data) if !data.is_empty() => match s.send_bytes(s.send_chan, &data) {
+                        Ok(()) => format!("已发送 {} 字节", data.len()),
+                        Err(e) => format!("发送失败: {e}"),
                     },
-                    None => s.notices.push("HEX格式错误".into()),
-                }
-                let _ = resp;
-                        ui.close_menu();
+                    Some(_) => "没有可发送的内容".to_string(),
+                    None => "HEX 格式错误：需要偶数个十六进制字符".to_string(),
+                });
             }
             ui.separator();
             if ui.button("请求预设").clicked() {
                 s.preset_req = true;
-                        ui.close_menu();
             }
             if ui.button("响应预设").clicked() {
                 s.preset_req = false;
-                        ui.close_menu();
             }
             let list = if s.preset_req { REQUEST_PRESETS } else { RESPONSE_PRESETS };
             if s.preset_sel >= list.len() {
@@ -1894,41 +1921,35 @@ impl MonitorApp {
             }
             ComboBox::from_id_source("preset_cb")
                 .selected_text(list[s.preset_sel].name)
-                .width(340.0)
+                .width(320.0)
                 .show_ui(ui, |ui| {
                     for (i, p) in list.iter().enumerate() {
                         ui.selectable_value(&mut s.preset_sel, i, p.name);
                     }
                 });
-            if ui.button("发送预设").clicked() {
+            if ui
+                .add_enabled(can_send, egui::Button::new("发送预设"))
+                .on_disabled_hover_text(reason)
+                .clicked()
+            {
                 let pdu = protocol::parse_hex(list[s.preset_sel].data).unwrap_or_default();
-                let frame = match s.proto {
-                    ProtoType::Rtu => protocol::append_crc(&pdu),
-                    ProtoType::Ascii => {
-                        let mut v = vec![b':'];
-                        v.extend(pdu.iter().flat_map(|b| format!("{:02X}", b).into_bytes()));
-                        v.extend(protocol::lrc(&pdu).to_string().bytes());
-                        let lrc = protocol::lrc(&pdu);
-                        v.extend(format!("{:02X}", lrc).into_bytes());
-                        v.extend_from_slice(b"\r\n");
-                        v
-                    }
-                    ProtoType::Tcp => protocol::wrap_mbap(&pdu, s.seq as u16),
-                    ProtoType::None => pdu,
-                };
-                match s.send_bytes(s.send_chan, &frame) {
-                    Ok(()) => {}
-                    Err(e) => s.notices.push(format!("发送失败: {}", e)),
-                }
-                        ui.close_menu();
+                // One shared frame builder: the ASCII branch used to append the LRC
+                // twice here, so every Modbus-ASCII preset was sent as a corrupt frame.
+                let frame = protocol::build_frame(&pdu, s.proto, s.seq as u16);
+                feedback = Some(match s.send_bytes(s.send_chan, &frame) {
+                    Ok(()) => format!("已发送预设（{}，{} 字节）", s.proto.label(), frame.len()),
+                    Err(e) => format!("发送失败: {e}"),
+                });
             }
             ui.separator();
             if ui.button("清空数据").clicked() {
                 s.clear();
-                        ui.close_menu();
             }
             ui.checkbox(&mut s.auto_scroll, "滚屏显示");
         });
+        if let Some(msg) = feedback {
+            self.toast(msg);
+        }
     }
 
     fn dialogs(&mut self, ctx: &Context) {

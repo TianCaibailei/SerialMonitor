@@ -245,15 +245,46 @@ pub fn append_crc(frame: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Wrap a PDU (uid + function...) in a Modbus TCP MBAP header.
+/// Wrap a PDU (unit id + function code + data) in a Modbus TCP MBAP header.
+///
+/// MBAP `len` counts the bytes that follow it — i.e. **unit id + PDU data** — which is
+/// exactly `pdu.len()`, because `pdu` already starts with the unit id. The previous
+/// implementation wrote `pdu.len() + 1`, so every frame the "发送预设" button produced
+/// carried a length one byte too large and `parse_mbap` (which computes `total = 6 + len`)
+/// would wait for a byte that never arrives. Send and receive must agree on this layout:
+/// `[tid][pid][len][uid][fc][data]`.
 pub fn wrap_mbap(pdu: &[u8], tid: u16) -> Vec<u8> {
-    let len = (pdu.len() + 1) as u16;
-    let mut out = Vec::with_capacity(7 + pdu.len());
+    let len = pdu.len() as u16;
+    let mut out = Vec::with_capacity(6 + pdu.len());
     out.extend_from_slice(&tid.to_be_bytes());
     out.extend_from_slice(&0u16.to_be_bytes());
     out.extend_from_slice(&len.to_be_bytes());
     out.extend_from_slice(pdu);
     out
+}
+
+/// Build the on-wire frame for a PDU according to the session's protocol.
+///
+/// Single source of truth for the send paths (manual send and 发送预设). It used to be
+/// duplicated in the UI, where the ASCII branch appended the LRC twice — once as a
+/// decimal string and once as hex — producing frames the receiver always rejected.
+pub fn build_frame(pdu: &[u8], proto: crate::session::ProtoType, tid: u16) -> Vec<u8> {
+    use crate::session::ProtoType;
+    match proto {
+        ProtoType::Rtu => append_crc(pdu),
+        ProtoType::Ascii => {
+            let mut v = Vec::with_capacity(pdu.len() * 2 + 5);
+            v.push(b':');
+            for b in pdu {
+                v.extend_from_slice(format!("{b:02X}").as_bytes());
+            }
+            v.extend_from_slice(format!("{:02X}", lrc(pdu)).as_bytes());
+            v.extend_from_slice(b"\r\n");
+            v
+        }
+        ProtoType::Tcp => wrap_mbap(pdu, tid),
+        ProtoType::None => pdu.to_vec(),
+    }
 }
 
 pub struct Preset {
@@ -288,7 +319,10 @@ pub const REQUEST_PRESETS: &[Preset] = &[
     Preset { name: "08 (0x08) Diagnostics-SubFunc-15-4-req", data: "01 08 00 15 00 04" },
 ];
 
-/// Rows copied from modbus/modbus-response.bdp (43 presets).
+/// Response presets recovered from the original's modbus/modbus-response.bdp.
+///
+/// The count is **38**, not the 43 claimed by earlier comments/docs — the table is the
+/// authority and `preset_counts_match_code` keeps it honest.
 pub const RESPONSE_PRESETS: &[Preset] = &[
     Preset { name: "01 (0x01) Read Coils-resp", data: "01 01 03 CD 6B 05" },
     Preset { name: "02 (0x02) Read Discrete Inputs-resp", data: "01 02 03 AC DB 35" },
@@ -351,4 +385,135 @@ pub fn parse_hex(text: &str) -> Option<Vec<u8>> {
         out.push(((hi << 4) | lo) as u8);
     }
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn crc16_modbus_known_vector() {
+        // Classic reference: 01 03 00 00 00 0A -> CRC 0xCDC5 (low byte first: C5 CD)
+        assert_eq!(crc16_modbus(&[0x01, 0x03, 0x00, 0x00, 0x00, 0x0A]), 0xCDC5);
+    }
+
+    #[test]
+    fn lrc_is_twos_complement_of_sum() {
+        // sum = 0x01+0x03+0x00+0x00+0x00+0x0A = 0x0E -> LRC = 0xF2
+        assert_eq!(lrc(&[0x01, 0x03, 0x00, 0x00, 0x00, 0x0A]), 0xF2);
+    }
+
+    #[test]
+    fn rtu_roundtrip_parses_address_and_quantity() {
+        let pdu = [0x01, 0x03, 0x00, 0x6B, 0x00, 0x03];
+        let frame = append_crc(&pdu);
+        let p = parse_rtu(&frame, true).expect("parsed");
+        assert_eq!(p.id, 0x01);
+        assert_eq!(p.function, 0x03);
+        assert_eq!(p.address, Some(0x006B));
+        assert_eq!(p.quantity, Some(3));
+        assert_eq!(p.checksum_ok, Some(true));
+        assert_eq!(p.kind, FrameKind::Req);
+    }
+
+    #[test]
+    fn rtu_corrupt_crc_is_flagged_failed() {
+        let mut frame = append_crc(&[0x01, 0x03, 0x00, 0x6B, 0x00, 0x03]);
+        frame[2] ^= 0xFF; // corrupt payload, CRC no longer matches
+        let p = parse_rtu(&frame, true).expect("parsed");
+        assert_eq!(p.checksum_ok, Some(false));
+        assert_eq!(p.kind, FrameKind::Failed);
+    }
+
+    /// The send path (wrap_mbap) and the receive path (parse_mbap) must agree; they used
+    /// to disagree by one byte in the MBAP length field, making "发送预设" emit frames
+    /// that could never be parsed.
+    #[test]
+    fn mbap_send_and_receive_agree() {
+        let pdu = [0x01, 0x03, 0x00, 0x6B, 0x00, 0x03];
+        let frame = wrap_mbap(&pdu, 0x1234);
+        assert_eq!(frame.len(), 6 + pdu.len());
+        assert_eq!(&frame[..2], &[0x12, 0x34]); // tid
+        assert_eq!(&frame[2..4], &[0x00, 0x00]); // pid
+        assert_eq!(&frame[4..6], &[0x00, 0x06]); // len = uid + fc + 4 data bytes
+        let (p, used) = parse_mbap(&frame, true).expect("parsed");
+        assert_eq!(used, frame.len());
+        assert_eq!(p.id, 0x01);
+        assert_eq!(p.function, 0x03);
+        assert_eq!(p.address, Some(0x006B));
+        assert_eq!(p.quantity, Some(3));
+    }
+
+    #[test]
+    fn mbap_rejects_non_modbus_protocol_id() {
+        let mut frame = wrap_mbap(&[0x01, 0x03, 0x00, 0x00, 0x00, 0x01], 1);
+        frame[3] = 0x01; // pid != 0
+        assert!(parse_mbap(&frame, true).is_none());
+    }
+
+    #[test]
+    fn mbap_incomplete_frame_is_not_consumed() {
+        let frame = wrap_mbap(&[0x01, 0x03, 0x00, 0x6B, 0x00, 0x03], 7);
+        assert!(parse_mbap(&frame[..frame.len() - 1], true).is_none());
+    }
+
+    /// An ASCII frame is ':' + hex(PDU) + hex(LRC) + CRLF. This pins the layout that the
+    /// send button must produce; the old code appended the LRC twice (once decimal,
+    /// once hex), which parse_ascii_text correctly rejected.
+    #[test]
+    fn ascii_frame_roundtrip() {
+        let pdu = [0x01, 0x03, 0x00, 0x6B, 0x00, 0x03];
+        let mut hex = String::new();
+        for b in pdu {
+            hex.push_str(&format!("{b:02X}"));
+        }
+        let text = format!("{hex}{:02X}", lrc(&pdu));
+        let p = parse_ascii_text(text.as_bytes(), true).expect("parsed");
+        assert_eq!(p.id, 0x01);
+        assert_eq!(p.function, 0x03);
+        assert_eq!(p.checksum_ok, Some(true));
+    }
+
+    /// build_frame must produce, for each protocol, a frame that the matching parser
+    /// accepts — the ASCII branch in particular used to emit a doubled LRC.
+    #[test]
+    fn build_frame_roundtrips_for_every_protocol() {
+        use crate::session::ProtoType;
+        let pdu = [0x01, 0x03, 0x00, 0x6B, 0x00, 0x03];
+
+        let rtu = build_frame(&pdu, ProtoType::Rtu, 0);
+        assert_eq!(rtu.len(), pdu.len() + 2);
+        assert_eq!(parse_rtu(&rtu, true).unwrap().checksum_ok, Some(true));
+
+        let ascii = build_frame(&pdu, ProtoType::Ascii, 0);
+        assert_eq!(ascii[0], b':');
+        assert_eq!(&ascii[ascii.len() - 2..], b"\r\n");
+        // ':' + 2 hex chars per byte + 2 LRC chars + CRLF
+        assert_eq!(ascii.len(), 1 + pdu.len() * 2 + 2 + 2);
+        let inner = &ascii[1..ascii.len() - 2];
+        assert_eq!(parse_ascii_text(inner, true).unwrap().checksum_ok, Some(true));
+
+        let tcp = build_frame(&pdu, ProtoType::Tcp, 0x0042);
+        let (p, used) = parse_mbap(&tcp, true).unwrap();
+        assert_eq!(used, tcp.len());
+        assert_eq!(p.id, 0x01);
+
+        assert_eq!(build_frame(&pdu, ProtoType::None, 0), pdu.to_vec());
+    }
+
+    #[test]
+    fn preset_counts_match_code() {
+        // Guard against documentation drifting from the tables again. The code comment
+        // and README used to claim "43 响应" while the table actually holds 38 — this
+        // assertion pins the real numbers so the docs must be updated with them.
+        assert_eq!(REQUEST_PRESETS.len(), 23);
+        assert_eq!(RESPONSE_PRESETS.len(), 38);
+    }
+
+    #[test]
+    fn every_preset_is_valid_hex() {
+        for p in REQUEST_PRESETS.iter().chain(RESPONSE_PRESETS.iter()) {
+            assert!(parse_hex(p.data).is_some(), "preset not valid hex: {}", p.name);
+        }
+    }
 }
