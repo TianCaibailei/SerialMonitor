@@ -267,14 +267,15 @@ pub struct Session {
     pub find_pos: usize,
     pub seq: u64,
     pub notices: Vec<String>,
-    pub tcp_writes: Arc<Mutex<HashMap<usize, Vec<(String, TcpStream)>>>>,
-    pub serial_writes: Vec<Option<Box<dyn serialport::SerialPort>>>,
-    pub udp_sends: Vec<Option<Arc<UdpSocket>>>,
-    pub send_hex: bool,
-    pub send_text: String,
-    pub send_chan: usize,
-    pub preset_req: bool,
-    pub preset_sel: usize,
+    /// Keeps TCP client sockets alive for the lifetime of the session.
+    ///
+    /// The read loop owns a clone for reading; the original must stay somewhere or the
+    /// connection would be closed as soon as `open_tcp_client` returns. This is a
+    /// keep-alive holder only — the monitor never writes to it.
+    pub tcp_conns: Arc<Mutex<HashMap<usize, Vec<TcpStream>>>>,
+    pub serial_ports: Vec<Option<Box<dyn serialport::SerialPort>>>,
+    pub udp_socks: Vec<Option<Arc<UdpSocket>>>,
+
     pub auto_scroll: bool,
     /// PID of the intercepted process (capture sessions only).
     pub cap_pid: Option<u32>,
@@ -420,14 +421,10 @@ impl Session {
             find_pos: 0,
             seq: 0,
             notices: Vec::new(),
-            tcp_writes: Arc::new(Mutex::new(HashMap::new())),
-            serial_writes: Vec::with_capacity(n),
-            udp_sends: Vec::with_capacity(n),
-            send_hex: true,
-            send_text: String::new(),
-            send_chan: 0,
-            preset_req: true,
-            preset_sel: 0,
+            tcp_conns: Arc::new(Mutex::new(HashMap::new())),
+            serial_ports: Vec::with_capacity(n),
+            udp_socks: Vec::with_capacity(n),
+
             auto_scroll: true,
             cap_pid: None,
             cap_map: HashMap::new(),
@@ -471,8 +468,8 @@ impl Session {
             parity: 0,
             stop_bits: 1,
         });
-        self.serial_writes.push(None);
-        self.udp_sends.push(None);
+        self.serial_ports.push(None);
+        self.udp_socks.push(None);
         idx
     }
 
@@ -499,7 +496,7 @@ impl Session {
     }
 
     fn open_serial(&mut self, idx: usize, ch: ChannelCfg, tx: Sender<Ev>, stop: Arc<AtomicBool>) {
-        self.serial_writes.push(None);
+        self.serial_ports.push(None);
         let builder = serialport::new(&ch.name, ch.baud)
             .data_bits(if ch.data_bits == 7 {
                 serialport::DataBits::Seven
@@ -520,7 +517,7 @@ impl Session {
         match builder.open() {
             Ok(port) => {
                 let read_half = port.try_clone().ok();
-                self.serial_writes[idx] = Some(port);
+                self.serial_ports[idx] = Some(port);
                 if let Some(mut rh) = read_half {
                     let tx = tx.clone();
                     std::thread::spawn(move || {
@@ -598,7 +595,7 @@ impl Session {
                         return;
                     }
                 };
-                self.tcp_writes.lock().unwrap().insert(idx, vec![(ch.name.clone(), stream)]);
+                self.tcp_conns.lock().unwrap().insert(idx, vec![stream]);
                 std::thread::spawn(move || {
                     let mut buf = [0u8; 8192];
                     loop {
@@ -648,7 +645,6 @@ impl Session {
             Ok(listener) => {
                 let _ = listener.set_nonblocking(true);
                 self.notices.push(format!("TCP服务端监听 {}", ch.name));
-                let writes = self.tcp_writes.clone();
                 std::thread::spawn(move || {
                     loop {
                         if stop.load(Ordering::Relaxed) {
@@ -658,10 +654,7 @@ impl Session {
                             Ok((stream, peer)) => {
                                 let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
                                 let label = peer.to_string();
-                                let _ = tx.send(Ev::Peer { idx, label: label.clone() });
-                                if let Ok(w) = stream.try_clone() {
-                                    writes.lock().unwrap().entry(idx).or_default().push((label, w));
-                                }
+                                let _ = tx.send(Ev::Peer { idx, label });
                                 let tx2 = tx.clone();
                                 let stop2 = stop.clone();
                                 let mut rh = stream;
@@ -701,8 +694,8 @@ impl Session {
         match UdpSocket::bind("0.0.0.0:0") {
             Ok(sock) => {
                 let _ = sock.set_read_timeout(Some(Duration::from_millis(50)));
-                self.udp_sends.push(Some(Arc::new(sock)));
-                let sock = self.udp_sends[idx].clone().unwrap();
+                self.udp_socks.push(Some(Arc::new(sock)));
+                let sock = self.udp_socks[idx].clone().unwrap();
                 std::thread::spawn(move || {
                     let rh = match sock.try_clone() {
                         Ok(s) => s,
@@ -1053,47 +1046,6 @@ impl Session {
     pub fn visible_count(&self) -> usize {
         let enc = self.display_encoding;
         self.rows.iter().filter(|r| self.filters.pass(r, enc)).count()
-    }
-
-    pub fn send_bytes(&mut self, idx: usize, data: &[u8]) -> Result<(), String> {
-        if self.channels.is_empty() {
-            return Err("该会话没有通道".into());
-        }
-        let ch = &self.channels[idx.min(self.channels.len() - 1)];
-        let res: Result<(), String> = match ch.kind {
-            ChanKind::Serial => match self.serial_writes.get_mut(idx) {
-                Some(Some(w)) => w.write_all(data).map_err(|e| e.to_string()),
-                _ => Err("串口未打开".into()),
-            },
-            ChanKind::TcpClient | ChanKind::TcpServer => {
-                let mut map = self.tcp_writes.lock().unwrap();
-                match map.get_mut(&idx) {
-                    Some(conns) => {
-                        let mut err = None;
-                        for (_, s) in conns.iter_mut() {
-                            if let Err(e) = s.write_all(data) {
-                                err = Some(e.to_string());
-                            }
-                        }
-                        match err {
-                            Some(e) => Err(e),
-                            None => Ok(()),
-                        }
-                    }
-                    None => Err("没有连接".into()),
-                }
-            }
-            ChanKind::Udp => match self.udp_sends.get(idx) {
-                Some(Some(s)) => s.send_to(data, &ch.name).map(|_| ()).map_err(|e| e.to_string()),
-                _ => Err("UDP未打开".into()),
-            },
-            ChanKind::HookSerial => Err("拦截通道只读：串口句柄由被监控进程持有".into()),
-        };
-        if res.is_ok() {
-            let (s, ms) = now_wall();
-            self.ingest(idx, data.to_vec(), s, ms, true);
-        }
-        res
     }
 
     pub fn stop_all(&self) {

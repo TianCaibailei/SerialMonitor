@@ -37,6 +37,9 @@ mod native_serial;
 mod native_serial_delayed;
 #[allow(dead_code)]
 mod portowners;
+// The protocol module keeps frame builders and the recovered preset corpus for round-trip
+// tests even though a monitor never transmits (see the note at the top of protocol.rs).
+#[allow(dead_code)]
 mod protocol;
 mod session;
 mod text_codec;

@@ -19,6 +19,7 @@ edition = "2021"
 name = "universal_injector_x86"
 path = "src/main.rs"
 
-[profile.release]
-opt-level = 2
-panic = "abort"
+# NOTE: no `[profile.release]` here. Cargo ignores profiles declared in non-root workspace
+# packages (it warns about it), so this setting used to be silently dead. The injector is
+# built with the same release profile as the workspace, which is defined once in
+# `app/Cargo.toml` (opt-level 2, panic = "abort").

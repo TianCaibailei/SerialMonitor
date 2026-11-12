@@ -165,7 +165,7 @@ pub fn enable_debug_privilege() -> bool {
             std::ptr::null_mut(),
             std::ptr::null_mut(),
         ) != 0
-            && unsafe { GetLastErrorC() } == 0;
+            && GetLastErrorC() == 0;
         CloseHandle(token);
         ok
     }

@@ -1,5 +1,13 @@
-// Protocol layer: CRC-16/MODBUS, LRC, frame parsing (RTU / ASCII / TCP-MBAP), preset library.
-// Preset rows replicate modbus/modbus-request.bdp and modbus-response.bdp from the original.
+// Protocol layer: CRC-16/MODBUS, LRC, frame parsing (RTU / ASCII / TCP-MBAP) and the
+// Modbus sample corpus recovered from the reference product.
+//
+// NOTE on the frame *builders* (`append_crc` / `wrap_mbap` / `build_frame`) and the preset
+// corpus below: this program is a **monitor** and never transmits on the bus it observes,
+// so nothing in the UI calls them anymore. They are kept deliberately because they are the
+// reference half of every round-trip test — a parser is only trustworthy if a frame built
+// from the spec is parsed back to the same values — and because the presets are recovered
+// evidence of the original's protocol behaviour. The module-level `allow(dead_code)` in
+// main.rs marks that intent.
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FrameKind {

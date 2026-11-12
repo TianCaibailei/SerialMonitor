@@ -1,7 +1,7 @@
 // Main window: menus, session tabs, five views, dialogs, send pane, status bar.
 
 use crate::inject::{self, CapMsg};
-use crate::protocol::{self, REQUEST_PRESETS, RESPONSE_PRESETS};
+use crate::protocol;
 use crate::session::{
     bytes_hex, escape_text, fmt_time, now_wall, pw_allowed, pw_invert, pw_select_all,
     pw_select_none, pw_toggle, seed_demo, Autosave, ChanKind, ChannelCfg, Filters, RowOrigin,
@@ -231,10 +231,71 @@ pub struct MonitorApp {
     pub redir_backup: Option<(bool, String, usize, u64, u64, usize)>,
     /// 「退出」在有会话时先确认，避免未保存的采集数据被直接丢弃。
     pub dlg_confirm_exit: bool,
+    /// Text queued for the clipboard; written by `update` once the frame is done, so the
+    /// copy never fights an active `&mut self` borrow inside a widget closure.
+    pub pending_clipboard: Option<String>,
 }
 
 fn b(v: bool) -> &'static str {
     if v { "1" } else { "0" }
+}
+
+/// Quote a string for JSON output (handles the escapes that actually occur in session
+/// names, paths and user filter text).
+fn json_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// RFC 4180 CSV field: quote when the value contains a delimiter, quote or newline.
+fn csv_field(s: &str) -> String {
+    if s.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
+}
+
+#[cfg(test)]
+mod export_tests {
+    use super::{csv_field, json_str};
+
+    #[test]
+    fn json_escapes_quotes_and_control_chars() {
+        assert_eq!(json_str(r#"a"b"#), r#""a\"b""#);
+        assert_eq!(json_str("a\\b"), r#""a\\b""#);
+        assert_eq!(json_str("a\nb"), r#""a\nb""#);
+        // A raw control byte must not leak into the JSON stream.
+        assert_eq!(json_str("\u{01}"), "\"\\u0001\"");
+    }
+
+    #[test]
+    fn json_keeps_cjk_literal() {
+        // CJK is valid JSON when the document is written as UTF-8; escaping it would
+        // make the file harder for humans to read.
+        assert_eq!(json_str("串口监控"), "\"串口监控\"");
+    }
+
+    #[test]
+    fn csv_quotes_only_when_needed() {
+        assert_eq!(csv_field("COM6"), "COM6");
+        assert_eq!(csv_field("a,b"), "\"a,b\"");
+        assert_eq!(csv_field("say \"hi\""), "\"say \"\"hi\"\"\"");
+        assert_eq!(csv_field("line1\nline2"), "\"line1\nline2\"");
+    }
 }
 
 /// 端口白名单在 config.ini 里的编码：逗号分隔（`COM6,COM7`）。
@@ -365,6 +426,7 @@ impl MonitorApp {
             prefs_backup: None,
             redir_backup: None,
             dlg_confirm_exit: false,
+            pending_clipboard: None,
         };
         app.load_cfg();
         if screenshot.is_some() {
@@ -2005,32 +2067,78 @@ impl MonitorApp {
         }
     }
 
-    fn send_pane(&mut self, ui: &mut Ui) {
-        let Some(s) = self.sessions.get_mut(self.active) else {
-            ui.label("无会话");
-            return;
+    /// Detail panel for the selected frame: read-only inspection plus copy/export.
+    ///
+    /// This used to be a *send* pane (write bytes to the port, fire Modbus presets).
+    /// A serial monitor observes traffic and must never write to the bus it is watching:
+    /// injecting bytes would corrupt the very conversation the user is trying to
+    /// diagnose, and on a passive (hook) session there is no writable handle anyway.
+    /// The send capability was therefore removed entirely rather than disabled.
+    fn detail_pane(&mut self, ui: &mut Ui) {
+        // Snapshot everything first: rendering must not hold a borrow of `self.sessions`
+        // while also needing `&mut self` for the action buttons below.
+        struct Snapshot {
+            seq: u64,
+            when: String,
+            chan: String,
+            dir_tx: bool,
+            len: usize,
+            hex: String,
+            text: String,
+            parsed: Option<(crate::protocol::FrameKind, u8, Option<u16>, Option<u16>, String, Option<bool>)>,
+            control: Option<String>,
+        }
+        let snap: Option<Snapshot> = {
+            let Some(s) = self.sessions.get(self.active) else {
+                ui.label("无会话");
+                return;
+            };
+            let enc = s.display_encoding;
+            s.selected.and_then(|si| s.rows.get(si)).map(|r| Snapshot {
+                seq: r.seq,
+                when: fmt_time(r.secs, r.millis),
+                chan: s
+                    .channels
+                    .get(r.idx)
+                    .map(|c| c.name.clone())
+                    .unwrap_or_else(|| format!("UNKNOWN({})", r.idx)),
+                dir_tx: r.dir_tx,
+                len: r.data.len(),
+                hex: bytes_hex(&r.data),
+                text: escape_text(&r.data, s.ascii_escape, enc),
+                parsed: r.parsed.as_ref().map(|p| {
+                    (p.kind, p.function, p.address, p.quantity, p.checksum.clone(), p.checksum_ok)
+                }),
+                control: r.control.as_ref().map(|c| c.summary()),
+            })
         };
-        // detail of selected row
-        if let Some(si) = s.selected {
-            if let Some(r) = s.rows.get(si) {
-                let chan = chan_label(s, r.idx);
+
+        // A read-only detail view: this pane used to be a *send* pane. A monitor must not
+        // write to the bus it observes — that would corrupt the conversation being
+        // diagnosed, and on a passive session there is no writable handle anyway.
+        let mut do_copy_line = false;
+        let mut do_copy_hex = false;
+        let mut do_copy_text = false;
+        match &snap {
+            Some(v) => {
                 ui.horizontal_wrapped(|ui| {
-                    ui.monospace(RichText::new(format!("#{} ", r.seq)).strong());
-                    ui.monospace(fmt_time(r.secs, r.millis));
-                    ui.label(chan);
-                    let (t, c) = if r.dir_tx { ("写 TX", C_TX) } else { ("读 RX", C_RX) };
+                    ui.monospace(RichText::new(format!("#{}", v.seq)).strong());
+                    ui.monospace(&v.when);
+                    ui.label(&v.chan);
+                    let (t, c) = if v.dir_tx { ("写 TX", C_TX) } else { ("读 RX", C_RX) };
                     ui.colored_label(c, t);
-                    if let Some(p) = &r.parsed {
+                    ui.label(RichText::new(format!("{} 字节", v.len)).weak());
+                    if let Some((kind, fc, addr, qty, crc, ok)) = &v.parsed {
                         ui.colored_label(
-                            Self::kind_color(p.kind),
+                            Self::kind_color(*kind),
                             format!(
                                 "{} · {} · Addr={} Qty={} CRC={} {}",
-                                p.kind.name(),
-                                protocol::fc_name(p.function),
-                                p.address.map(|a| a.to_string()).unwrap_or_else(|| "-".into()),
-                                p.quantity.map(|a| a.to_string()).unwrap_or_else(|| "-".into()),
-                                p.checksum,
-                                match p.checksum_ok {
+                                kind.name(),
+                                protocol::fc_name(*fc),
+                                addr.map(|a| a.to_string()).unwrap_or_else(|| "-".into()),
+                                qty.map(|a| a.to_string()).unwrap_or_else(|| "-".into()),
+                                crc,
+                                match ok {
                                     Some(true) => "✓",
                                     Some(false) => "✗",
                                     None => "-",
@@ -2039,119 +2147,301 @@ impl MonitorApp {
                         );
                     }
                 });
-                ui.monospace(RichText::new(bytes_hex(&r.data)).color(Self::kind_color(r.kind)));
-                ui.monospace(escape_text(&r.data, s.ascii_escape, s.display_encoding));
+                if let Some(c) = &v.control {
+                    ui.label(RichText::new(c).color(C_REQ));
+                }
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("HEX").weak().small());
+                    ui.monospace(&v.hex);
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("文本").weak().small());
+                    ui.monospace(&v.text);
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("复制整行").clicked() {
+                        do_copy_line = true;
+                    }
+                    if ui.button("复制 HEX").clicked() {
+                        do_copy_hex = true;
+                    }
+                    if ui.button("复制文本").clicked() {
+                        do_copy_text = true;
+                    }
+                    ui.separator();
+                    ui.label(
+                        RichText::new("解码失败的字节显示为 □，不是字面的 0xFD 字节")
+                            .weak()
+                            .small(),
+                    );
+                });
             }
-        } else {
-            ui.label(RichText::new("点击上方任一行查看详情").weak());
+            None => {
+                ui.label(RichText::new("点击任一数据行查看完整内容").weak());
+            }
         }
+
+        if do_copy_line {
+            if let Some(v) = &snap {
+                self.pending_clipboard = Some(format!(
+                    "#{}\t{}\t{}\t{}\t{}",
+                    v.seq,
+                    v.when,
+                    v.chan,
+                    if v.dir_tx { "写" } else { "读" },
+                    v.hex
+                ));
+                self.toast("已复制整行（含 HEX）");
+            }
+        } else if do_copy_hex {
+            if let Some(v) = &snap {
+                self.pending_clipboard = Some(v.hex.clone());
+                self.toast("已复制 HEX");
+            }
+        } else if do_copy_text {
+            if let Some(v) = &snap {
+                self.pending_clipboard = Some(v.text.clone());
+                self.toast("已复制文本");
+            }
+        }
+
         ui.separator();
-        // ---- send controls ----
-        //
-        // 发送能力取决于通道类型：被动监听（拦截串口）的句柄由被监控进程持有，本软件
-        // 根本没有可写句柄。以前按钮始终可用、点了必然失败，错误只塞进 notices，
-        // 用户看到的就是「点了没反应」。现在按可用性禁用并在原位说明原因。
-        let sel_kind = s.channels.get(s.send_chan).map(|c| c.kind.clone());
-        let can_send = matches!(
-            sel_kind,
-            Some(ChanKind::Serial) | Some(ChanKind::TcpClient) | Some(ChanKind::TcpServer) | Some(ChanKind::Udp)
-        );
-        let reason = match (&sel_kind, can_send) {
-            (None, _) => "该会话没有通道",
-            (Some(ChanKind::HookSerial), _) => {
-                "监听模式只读：串口句柄由被监控进程持有，本软件无法写入。需要主动收发请新建「串口独占用」会话。"
-            }
-            (_, true) => "",
-            _ => "当前通道不可发送",
-        };
-        if !reason.is_empty() {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("ⓘ").color(C_REQ));
-                ui.label(RichText::new(reason).color(C_REQ).small());
-            });
-        }
-        // `s` holds a mutable borrow of self.sessions for the whole block, so collect the
-        // user-visible feedback here and emit it after the closure ends.
-        let mut feedback: Option<String> = None;
+        // Session-level, read-only inspection actions.
+        let mut do_archive = false;
+        let mut do_log = false;
+        let mut do_info = false;
+        let mut do_csv = false;
+        let mut do_clear = false;
+        let has = !self.sessions.is_empty();
+        let mut auto_scroll = self
+            .sessions
+            .get(self.active)
+            .map(|s| s.auto_scroll)
+            .unwrap_or(true);
         ui.horizontal(|ui| {
-            ComboBox::from_id_source("send_chan")
-                .selected_text(s.channels.get(s.send_chan).map(|c| c.name.as_str()).unwrap_or("-"))
-                .width(160.0)
-                .show_ui(ui, |ui| {
-                    for (i, c) in s.channels.iter().enumerate() {
-                        ui.selectable_value(&mut s.send_chan, i, &c.name);
-                    }
-                })
-                .response
-                .on_disabled_hover_text("没有通道");
-            ui.checkbox(&mut s.send_hex, "HEX");
-            let resp = ui.add(
-                TextEdit::singleline(&mut s.send_text)
-                    .hint_text(if s.send_hex { "01 03 00 6B 00 03" } else { "hello" })
-                    .desired_width(300.0),
-            );
-            let _ = resp;
-            if ui
-                .add_enabled(can_send, egui::Button::new("发送"))
-                .on_disabled_hover_text(reason)
-                .clicked()
-            {
-                let bytes = if s.send_hex {
-                    protocol::parse_hex(&s.send_text)
-                } else {
-                    Some(s.send_text.bytes().collect())
-                };
-                feedback = Some(match bytes {
-                    Some(data) if !data.is_empty() => match s.send_bytes(s.send_chan, &data) {
-                        Ok(()) => format!("已发送 {} 字节", data.len()),
-                        Err(e) => format!("发送失败: {e}"),
-                    },
-                    Some(_) => "没有可发送的内容".to_string(),
-                    None => "HEX 格式错误：需要偶数个十六进制字符".to_string(),
-                });
+            if ui.add_enabled(has, egui::Button::new("导出会话（.umses）")).clicked() {
+                do_archive = true;
+            }
+            if ui.add_enabled(has, egui::Button::new("导出日志（文本+HEX）")).clicked() {
+                do_log = true;
+            }
+            if ui.add_enabled(has, egui::Button::new("导出项目信息（JSON）")).clicked() {
+                do_info = true;
+            }
+            if ui.add_enabled(has, egui::Button::new("复制全部为 CSV")).clicked() {
+                do_csv = true;
             }
             ui.separator();
-            if ui.button("请求预设").clicked() {
-                s.preset_req = true;
+            if ui.add_enabled(has, egui::Button::new("清空数据")).clicked() {
+                do_clear = true;
             }
-            if ui.button("响应预设").clicked() {
-                s.preset_req = false;
+            ui.checkbox(&mut auto_scroll, "滚屏显示");
+        });
+        if let Some(s) = self.sessions.get_mut(self.active) {
+            if s.auto_scroll != auto_scroll {
+                s.auto_scroll = auto_scroll;
             }
-            let list = if s.preset_req { REQUEST_PRESETS } else { RESPONSE_PRESETS };
-            if s.preset_sel >= list.len() {
-                s.preset_sel = 0;
-            }
-            ComboBox::from_id_source("preset_cb")
-                .selected_text(list[s.preset_sel].name)
-                .width(320.0)
-                .show_ui(ui, |ui| {
-                    for (i, p) in list.iter().enumerate() {
-                        ui.selectable_value(&mut s.preset_sel, i, p.name);
-                    }
-                });
-            if ui
-                .add_enabled(can_send, egui::Button::new("发送预设"))
-                .on_disabled_hover_text(reason)
-                .clicked()
-            {
-                let pdu = protocol::parse_hex(list[s.preset_sel].data).unwrap_or_default();
-                // One shared frame builder: the ASCII branch used to append the LRC
-                // twice here, so every Modbus-ASCII preset was sent as a corrupt frame.
-                let frame = protocol::build_frame(&pdu, s.proto, s.seq as u16);
-                feedback = Some(match s.send_bytes(s.send_chan, &frame) {
-                    Ok(()) => format!("已发送预设（{}，{} 字节）", s.proto.label(), frame.len()),
-                    Err(e) => format!("发送失败: {e}"),
-                });
-            }
-            ui.separator();
-            if ui.button("清空数据").clicked() {
+            if do_clear {
                 s.clear();
             }
-            ui.checkbox(&mut s.auto_scroll, "滚屏显示");
-        });
-        if let Some(msg) = feedback {
-            self.toast(msg);
         }
+        if do_archive {
+            self.save_archive_active();
+        }
+        if do_log {
+            self.save_active();
+        }
+        if do_info {
+            self.export_project_info();
+        }
+        if do_csv {
+            self.copy_all_csv();
+        }
+    }
+    /// Export a machine-readable description of the current capture.
+    ///
+    /// "Project info" means everything needed to reproduce or report a session:
+    /// environment, channel configuration, protocol settings, capture statistics and the
+    /// current filters — but **not** the payload bytes (use 导出日志/.umses for those).
+    /// Written as JSON so it can be attached to a bug report or diffed between runs.
+    fn export_project_info(&mut self) {
+        let Some(s) = self.sessions.get(self.active) else {
+            self.toast("没有可导出的会话");
+            return;
+        };
+        let (secs, _) = now_wall();
+        let safe: String = s
+            .name
+            .chars()
+            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .collect();
+        let path = format!("project_info_{safe}_{secs}.json");
+
+        let (tot_rx, tot_tx) = s.totals();
+        let (cur_rx, cur_tx) = s.current_rate();
+        let (pk_rx, pk_tx) = s.peak_rate();
+        let channels: Vec<String> = s
+            .channels
+            .iter()
+            .map(|c| {
+                format!(
+                    "    {{\"kind\": \"{}\", \"name\": {}, \"baud\": {}, \"data_bits\": {}, \"parity\": {}, \"stop_bits\": {}}}",
+                    c.kind.label(),
+                    json_str(&c.name),
+                    c.baud,
+                    c.data_bits,
+                    c.parity,
+                    c.stop_bits
+                )
+            })
+            .collect();
+        let dir_filter = match s.filters.dir {
+            1 => "读",
+            2 => "写",
+            _ => "全部",
+        };
+        let started = s
+            .rows
+            .first()
+            .map(|r| fmt_time(r.secs, r.millis))
+            .unwrap_or_else(|| "-".into());
+        let ended = s
+            .rows
+            .last()
+            .map(|r| fmt_time(r.secs, r.millis))
+            .unwrap_or_else(|| "-".into());
+
+        let json = format!(
+            r#"{{
+  "tool": "万能串口监控",
+  "exported_at": {},
+  "session": {{
+    "name": {},
+    "running": {},
+    "protocol": {},
+    "display_encoding": {},
+    "ascii_escape": {},
+    "values_decimal": {},
+    "merge_window_ms": {},
+    "modbus_values_len": {},
+    "views": {{"table": {}, "terminal": {}, "dump": {}, "line": {}, "modbus": {}}}
+  }},
+  "channels": [
+{}
+  ],
+  "capture": {{
+    "rows": {},
+    "visible_rows": {},
+    "first_frame": {},
+    "last_frame": {},
+    "bytes_rx": {},
+    "bytes_tx": {},
+    "rate_now_rx_bps": {},
+    "rate_now_tx_bps": {},
+    "rate_peak_rx_bps": {},
+    "rate_peak_tx_bps": {}
+  }},
+  "filters": {{
+    "direction": {},
+    "modbus_functions": {:?},
+    "text": {},
+    "text_enabled": {},
+    "port_watch_enabled": {},
+    "port_watch": {:?}
+  }}
+}}
+"#,
+            json_str(&fmt_time(secs, 0)),
+            json_str(&s.name),
+            s.running,
+            json_str(s.proto.label()),
+            json_str(s.display_encoding.label()),
+            s.ascii_escape,
+            s.values_dec,
+            s.merge_ms,
+            s.string_len,
+            s.views.table,
+            s.views.terminal,
+            s.views.dump,
+            s.views.line,
+            s.views.modbus,
+            channels.join(",\n"),
+            s.rows.len(),
+            s.visible_count(),
+            json_str(&started),
+            json_str(&ended),
+            tot_rx,
+            tot_tx,
+            cur_rx,
+            cur_tx,
+            pk_rx,
+            pk_tx,
+            json_str(dir_filter),
+            s.filters.fcs,
+            json_str(&s.filters.text),
+            s.filters.text_on,
+            s.port_watch_on,
+            json_str(&{
+                let mut v: Vec<&String> = s.port_watch.iter().collect();
+                v.sort();
+                v.iter().map(|x| x.as_str()).collect::<Vec<_>>().join(",")
+            })
+        );
+        match std::fs::write(&path, json.as_bytes()) {
+            Ok(()) => self.toast(format!("项目信息已导出：{path}")),
+            Err(e) => self.toast(format!("导出失败: {e}")),
+        }
+    }
+
+    /// Copy every visible row as CSV (header included), honouring the current filters
+    /// and display encoding — the fastest way to get a capture into a spreadsheet.
+    fn copy_all_csv(&mut self) {
+        let Some(s) = self.sessions.get(self.active) else { return };
+        let enc = s.display_encoding;
+        let mut out = String::from("序号,时间,通道,方向,功能,长度,HEX,文本\n");
+        let mut n = 0usize;
+        for (i, r) in s.rows.iter().enumerate() {
+            if !s.filters.pass(r, enc) {
+                continue;
+            }
+            let chan = s
+                .channels
+                .get(r.idx)
+                .map(|c| c.name.as_str())
+                .unwrap_or("?");
+            let func = if let Some(p) = &r.parsed {
+                format!("{:02X} {}", p.function, protocol::fc_name(p.function))
+            } else if let Some(c) = &r.control {
+                c.summary()
+            } else if r.origin == RowOrigin::Driver {
+                if r.dir_tx { "串口写".to_string() } else { "串口读".to_string() }
+            } else {
+                r.kind.name().to_string()
+            };
+            let text = text_codec::decoded_text(&r.data, enc).replace(['\r', '\n', '\t'], " ");
+            out.push_str(&format!(
+                "{},{},{},{},{},{},{},{}\n",
+                r.seq,
+                fmt_time(r.secs, r.millis),
+                csv_field(chan),
+                if r.dir_tx { "写" } else { "读" },
+                csv_field(&func),
+                r.data.len(),
+                bytes_hex(&r.data),
+                csv_field(&text)
+            ));
+            n += 1;
+            // Guard against copying an unbounded dump by accident.
+            if i > 2_000_000 {
+                break;
+            }
+        }
+        if n == 0 {
+            self.toast("没有可复制的行（可能被过滤条件挡住了）");
+            return;
+        }
+        self.pending_clipboard = Some(out);
+        self.toast(format!("已复制 {n} 行为 CSV（可直接粘贴到表格软件）"));
     }
 
     fn dialogs(&mut self, ctx: &Context) {
@@ -3458,15 +3748,21 @@ impl eframe::App for MonitorApp {
         for s in self.sessions.iter_mut() {
             s.poll();
         }
+        // Flush a queued clipboard write (bulk CSV copy) now that no session borrow is
+        // active. Doing it inside the widget closure would require &mut self mid-layout.
+        if let Some(text) = self.pending_clipboard.take() {
+            ctx.copy_text(text);
+        }
         if self.active >= self.sessions.len() {
             self.active = self.sessions.len().saturating_sub(1);
         }
         self.top_panel(ctx);
         egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| self.status_bar(ui));
-        egui::TopBottomPanel::bottom("send_pane")
+        // Read-only detail pane. Kept resizable because users size it to their payloads.
+        egui::TopBottomPanel::bottom("detail_pane")
             .resizable(true)
-            .default_height(190.0)
-            .show(ctx, |ui| self.send_pane(ui));
+            .default_height(170.0)
+            .show(ctx, |ui| self.detail_pane(ui));
         egui::CentralPanel::default().show(ctx, |ui| self.main_area(ui));
         self.dialogs(ctx);
         // Live monitoring must repaint continuously: rows arrive from background threads
