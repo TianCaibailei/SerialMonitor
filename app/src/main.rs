@@ -19,6 +19,7 @@ mod native_serial_delayed;
 mod portowners;
 mod protocol;
 mod session;
+mod text_codec;
 mod ui;
 
 fn parse_args() -> Option<String> {

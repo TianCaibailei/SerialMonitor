@@ -7,6 +7,7 @@ use crate::session::{
     pw_select_none, pw_toggle, seed_demo, Autosave, ChanKind, ChannelCfg, Filters, RowOrigin,
     ProtoType, Session, ViewToggles,
 };
+use crate::text_codec::{self, DisplayEncoding};
 use egui::{
     Color32, ComboBox, Context, DragValue, RichText, ScrollArea, SelectableLabel, TextEdit, Ui,
     ViewportCommand, Window,
@@ -80,6 +81,10 @@ pub struct MonitorApp {
     pub sessions: Vec<Session>,
     pub active: usize,
     pub view_sel: usize,
+    /// 显示编码的全局默认值（新建会话时继承）。菜单「设置→编码方式」同时改它和
+    /// 当前活动会话，使切换立刻对所有视图生效；落盘到 config.ini。
+    pub display_enc: DisplayEncoding,
+    /// 导出文件编码；与显示编码分离，仍由「自动保存日志设置」里的编码选择管理。
     pub save_enc: usize,
     pub frame_count: u64,
     pub toast_msg: String,
@@ -211,6 +216,11 @@ pub struct MonitorApp {
     pub p_scroll: bool,
 
     pub find_text: String,
+    /// Row index the views should scroll to on the next frame (set by 查找 / 查找下一个).
+    /// Cleared as soon as a view consumed it, so it is a one-shot request.
+    pub scroll_to_row: Option<usize>,
+    /// Last search result feedback, e.g. "3/128 匹配". Shown in the find dialog.
+    pub find_note: String,
 }
 
 fn b(v: bool) -> &'static str {
@@ -265,6 +275,7 @@ impl MonitorApp {
             sessions: Vec::new(),
             active: 0,
             view_sel: 0,
+            display_enc: DisplayEncoding::Utf8,
             save_enc: 0,
             frame_count: 0,
             toast_msg: String::new(),
@@ -337,6 +348,8 @@ impl MonitorApp {
             p_esc: true,
             p_scroll: true,
             find_text: String::new(),
+            scroll_to_row: None,
+            find_note: String::new(),
         };
         app.load_cfg();
         if screenshot.is_some() {
@@ -383,6 +396,19 @@ impl MonitorApp {
         self.toast_until = self.frame_count + 600;
     }
 
+    /// Apply a display encoding: to the global default (new sessions inherit it), to
+    /// every open session (so switching takes effect immediately), and to config.ini.
+    /// This is the single entry point the menu uses — previously the menu only changed
+    /// `save_enc`, which nothing in the rendering path ever read.
+    fn set_display_encoding(&mut self, enc: DisplayEncoding) {
+        self.display_enc = enc;
+        for s in &mut self.sessions {
+            s.display_encoding = enc;
+        }
+        self.save_cfg();
+        self.toast(format!("显示编码已切换为 {}（全部视图即时生效）", enc.label()));
+    }
+
     fn load_cfg(&mut self) {
         if let Ok(txt) = std::fs::read_to_string("config.ini") {
             for line in txt.lines().skip_while(|l| !l.trim().eq_ignore_ascii_case("[NewMon]")) {
@@ -404,6 +430,8 @@ impl MonitorApp {
                             // 缺省（历史配置里没有这两项）= 不限制。
                             "portFilter" => self.fport_on = on,
                             "portWatch" => self.fport_sel = parse_port_list(v),
+                            "displayEnc" => self.display_enc = DisplayEncoding::from_index(v.parse().unwrap_or(0)),
+                            "exportEnc" => self.save_enc = v.parse().unwrap_or(0).min(2),
                             _ => {}
                         }
                     }
@@ -414,7 +442,7 @@ impl MonitorApp {
 
     fn save_cfg(&self) {
         let t = format!(
-            "[NewMon]\ntableView={} terminalView={} dumpView={} modbusView={} lineView={} autoMon={} modbusType={} portFilter={} portWatch={}\n",
+            "[NewMon]\ntableView={} terminalView={} dumpView={} modbusView={} lineView={} autoMon={} modbusType={} portFilter={} portWatch={} displayEnc={} exportEnc={}\n",
             b(self.views_new.table),
             b(self.views_new.terminal),
             b(self.views_new.dump),
@@ -423,7 +451,9 @@ impl MonitorApp {
             b(self.auto_mon),
             self.proto_sel,
             b(self.fport_on),
-            fmt_port_list(&self.fport_sel)
+            fmt_port_list(&self.fport_sel),
+            self.display_enc.as_index(),
+            self.save_enc
         );
         let _ = std::fs::write("config.ini", t);
     }
@@ -499,6 +529,7 @@ impl MonitorApp {
         s.values_dec = self.p_dec;
         s.ascii_escape = self.p_esc;
         s.auto_scroll = self.p_scroll;
+        s.display_encoding = self.display_enc;
         s.filters = Filters {
             dir: self.fdir,
             fcs: self.sel_fcs(),
@@ -917,21 +948,48 @@ impl MonitorApp {
         self.view_sel = 0;
     }
 
+    /// Export the active session's rows.
+    ///
+    /// File encoding = the user's export choice; text column = the session's display
+    /// encoding, so exported Chinese is readable. Auto-named to avoid silently
+    /// overwriting an earlier export (the old fixed `session_N.log` did).
     fn save_active(&mut self) {
         let Some(s) = self.sessions.get(self.active) else { return };
-        let path = format!("session_{}.log", self.active + 1);
-        match s.save_log(&path, self.save_enc) {
-            Ok(()) => self.toast(format!("已保存 {}", path)),
+        let enc = DisplayEncoding::from_index(self.save_enc);
+        let (secs, _) = now_wall();
+        let safe_name = s
+            .name
+            .chars()
+            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .collect::<String>();
+        let path = format!("session_{}_{secs}.log", safe_name);
+        match s.save_log(&path, enc) {
+            Ok(()) => self.toast(format!(
+                "已导出 {}（文件编码 {}，文本按 {} 解码）",
+                path,
+                enc.label(),
+                s.display_encoding.label()
+            )),
             Err(e) => self.toast(format!("保存失败: {}", e)),
         }
+    }
+
+    /// Restart a search from the first row (the 「查找」 button).
+    fn find_reset(&mut self) {
+        if let Some(s) = self.sessions.get_mut(self.active) {
+            s.find_pos = 0;
+        }
+        self.find_note.clear();
     }
 
     fn find_next(&mut self) {
         let t = self.find_text.trim().to_lowercase();
         if t.is_empty() {
+            self.find_note = "请输入查找内容".into();
             return;
         }
         let Some(s) = self.sessions.get_mut(self.active) else { return };
+        let enc = s.display_encoding;
         let n = s.rows.len();
         let mut hit = None;
         for k in 0..=n {
@@ -941,18 +999,39 @@ impl MonitorApp {
             }
             let r = &s.rows[i];
             let hex = bytes_hex(&r.data).to_lowercase();
-            let txt = String::from_utf8_lossy(&r.data).to_lowercase();
+            // Search the *decoded* text, so a query typed as Chinese matches GBK/UTF-16
+            // payloads exactly as they are displayed.
+            let txt = text_codec::decoded_text(&r.data, enc).to_lowercase();
             if hex.contains(&t) || txt.contains(&t) {
                 hit = Some(i);
                 break;
             }
         }
+        let total = s
+            .rows
+            .iter()
+            .filter(|r| {
+                bytes_hex(&r.data).to_lowercase().contains(&t)
+                    || text_codec::decoded_text(&r.data, enc).to_lowercase().contains(&t)
+            })
+            .count();
         match hit {
             Some(i) => {
                 s.selected = Some(i);
                 s.find_pos = i + 1;
+                let ordinal = s.rows[..=i.min(s.rows.len().saturating_sub(1))]
+                    .iter()
+                    .filter(|r| {
+                        bytes_hex(&r.data).to_lowercase().contains(&t)
+                            || text_codec::decoded_text(&r.data, enc).to_lowercase().contains(&t)
+                    })
+                    .count();
+                self.scroll_to_row = Some(i);
+                self.find_note = format!("命中 {ordinal}/{total}（行 #{i}）");
             }
-            None => self.toast("未找到"),
+            None => {
+                self.find_note = format!("未找到（共 {total} 处匹配，已到末尾）");
+            }
         }
     }
 
@@ -977,8 +1056,14 @@ impl MonitorApp {
             );
         }
         line += &format!("\t{}", bytes_hex(&r.data));
+        // Include the decoded text so copying a GBK / UTF-16 frame yields something the
+        // user can paste into a document, not just hex.
+        let txt = text_codec::decoded_text(&r.data, s.display_encoding);
+        if !txt.is_empty() {
+            line += &format!("\t{}", txt.replace(['\r', '\n', '\t'], " "));
+        }
         ctx.copy_text(line);
-        self.toast("已复制");
+        self.toast("已复制（含解码文本）");
     }
 
     fn top_panel(&mut self, ctx: &Context) {
@@ -1087,12 +1172,26 @@ impl MonitorApp {
                         ui.close_menu();
                     }
                     ui.separator();
-                    ui.menu_button("编码方式", |ui| {
-                        for (i, name) in ENCS.iter().enumerate() {
-                            if ui.radio(self.save_enc == i, *name).clicked() {
-                                self.save_enc = i;
+                    ui.menu_button("显示编码（决定监控内容如何解码）", |ui| {
+                        ui.label(RichText::new("作用于全部视图 / 查找 / 过滤 / 复制 / 导出文本").weak().small());
+                        for e in DisplayEncoding::ALL {
+                            let r = ui.radio(self.display_enc == e, e.label());
+                            if r.clicked() {
+                                self.set_display_encoding(e);
+                                ui.close_menu();
                             }
+                            r.on_hover_text(e.hint());
                         }
+                        ui.separator();
+                        ui.menu_button("导出文件编码（仅决定日志文件的字节格式）", |ui| {
+                            for (i, name) in ENCS.iter().enumerate() {
+                                if ui.radio(self.save_enc == i, *name).clicked() {
+                                    self.save_enc = i;
+                                    self.save_cfg();
+                                    ui.close_menu();
+                                }
+                            }
+                        });
                     });
                 });
                 ui.menu_button("帮助", |ui| {
@@ -1153,6 +1252,11 @@ impl MonitorApp {
                 ui.label(st);
                 ui.separator();
                 ui.label(format!("协议 {}", s.proto.label()));
+                ui.separator();
+                // Always show which encoding the payloads are rendered with: the old UI
+                // had no indication at all, which is why switching 编码方式 looked broken.
+                ui.label(RichText::new(format!("编码 {}", s.display_encoding.label())).weak())
+                    .on_hover_text(s.display_encoding.hint());
                 if let Some(n) = s.notices.last() {
                     ui.separator();
                     ui.label(RichText::new(n).small().color(Color32::GRAY));
@@ -1266,20 +1370,34 @@ impl MonitorApp {
 
     fn view_table(&mut self, ui: &mut Ui) {
         let Some(s) = self.sessions.get_mut(self.active) else { return };
+        let enc = s.display_encoding;
         let vis: Vec<usize> = s
             .rows
             .iter()
             .enumerate()
-            .filter(|(_, r)| s.filters.pass(r))
+            .filter(|(_, r)| s.filters.pass(r, enc))
             .map(|(i, _)| i)
             .collect();
         let start = vis.len().saturating_sub(20000);
         let mut clicked: Option<usize> = None;
-        TableBuilder::new(ui)
+        // Scroll to a search hit. The row index is a `rows` index, so translate it into
+        // a position within the visible window; hits outside the window cannot be shown
+        // (the table intentionally renders only the tail), so widen by reporting it.
+        let scroll_idx = self.scroll_to_row.take().and_then(|ri| {
+            vis.iter()
+                .enumerate()
+                .skip(start)
+                .find(|(_, &v)| v == ri)
+                .map(|(pos, _)| pos)
+        });
+        let mut tb = TableBuilder::new(ui)
             .striped(true)
             .vscroll(true)
-            .stick_to_bottom(s.auto_scroll)
-            .column(Column::initial(52.0).at_least(36.0))
+            .stick_to_bottom(s.auto_scroll && scroll_idx.is_none());
+        if let Some(pos) = scroll_idx {
+            tb = tb.scroll_to_row(pos, Some(egui::Align::Center));
+        }
+        tb.column(Column::initial(52.0).at_least(36.0))
             .column(Column::initial(150.0).at_least(110.0))
             .column(Column::initial(72.0).at_least(52.0))
             .column(Column::initial(44.0).at_least(36.0))
@@ -1372,7 +1490,7 @@ impl MonitorApp {
                             // "Welcome to UartAssist 23" became "Welcome to UartA".
                             // The column scrolls/clips visually if it is too narrow, which
                             // is the right behaviour: the data is still there.
-                            let t = escape_text(&r.data, s.ascii_escape);
+                            let t = escape_text(&r.data, s.ascii_escape, enc);
                             // Same direction colouring as the hex column.
                             let color = if r.control.is_some() {
                                 C_REQ
@@ -1393,11 +1511,12 @@ impl MonitorApp {
 
     fn view_terminal(&mut self, ui: &mut Ui) {
         let Some(s) = self.sessions.get_mut(self.active) else { return };
+        let enc = s.display_encoding;
         let vis: Vec<usize> = s
             .rows
             .iter()
             .enumerate()
-            .filter(|(_, r)| s.filters.pass(r))
+            .filter(|(_, r)| s.filters.pass(r, enc))
             .map(|(i, _)| i)
             .collect();
         let start = vis.len().saturating_sub(3000);
@@ -1409,7 +1528,7 @@ impl MonitorApp {
                 let r = &s.rows[ri];
                 let chan = chan_label(s, r.idx);
                 let (tag, c) = if r.dir_tx { ("[TX]", C_TX) } else { ("[RX]", C_RX) };
-                let line = escape_text(&r.data, esc);
+                let line = escape_text(&r.data, esc, enc);
                 let resp = ui.horizontal(|ui| {
                     ui.monospace(RichText::new(fmt_time(r.secs, r.millis)).weak().small());
                     ui.monospace(RichText::new(chan.as_str()).weak().small());
@@ -1428,11 +1547,12 @@ impl MonitorApp {
 
     fn view_dump(&mut self, ui: &mut Ui) {
         let Some(s) = self.sessions.get_mut(self.active) else { return };
+        let enc = s.display_encoding;
         let vis: Vec<usize> = s
             .rows
             .iter()
             .enumerate()
-            .filter(|(_, r)| s.filters.pass(r))
+            .filter(|(_, r)| s.filters.pass(r, enc))
             .map(|(i, _)| i)
             .collect();
         let start = vis.len().saturating_sub(1200);
@@ -1475,6 +1595,27 @@ impl MonitorApp {
                         clicked = Some(ri);
                     }
                 }
+                // Hex dump stays byte-for-byte (that is what a dump *is*), but a decoded
+                // preview is what makes GBK/UTF-16 payloads readable — the dump view used
+                // to be the one place where even the ASCII column was byte-wise.
+                let preview = text_codec::decoded_text(&r.data, enc)
+                    .replace(['\r', '\n', '\t'], " ");
+                if !preview.is_empty() {
+                    let shown: String = if preview.chars().count() > 160 {
+                        let mut t: String = preview.chars().take(160).collect();
+                        t.push('…');
+                        t
+                    } else {
+                        preview
+                    };
+                    let hr = ui.horizontal(|ui| {
+                        ui.monospace(RichText::new("文本  ").weak());
+                        ui.monospace(RichText::new(shown).color(c));
+                    });
+                    if hr.response.clicked() {
+                        clicked = Some(ri);
+                    }
+                }
                 ui.separator();
             }
         });
@@ -1499,15 +1640,35 @@ impl MonitorApp {
 
     fn view_modbus(&mut self, ui: &mut Ui) {
         let Some(s) = self.sessions.get_mut(self.active) else { return };
+        let enc = s.display_encoding;
         let vis: Vec<usize> = s
             .rows
             .iter()
             .enumerate()
-            .filter(|(_, r)| r.parsed.is_some() && s.filters.pass(r))
+            .filter(|(_, r)| r.parsed.is_some() && s.filters.pass(r, enc))
             .map(|(i, _)| i)
             .collect();
         let dec = s.values_dec;
         let mut clicked: Option<usize> = None;
+        // The Modbus table only ever shows parsed frames, so with "无(原始数据)" or a
+        // driver-captured session it used to be a permanently blank panel with no
+        // explanation. Say why instead of showing an empty grid.
+        if vis.is_empty() {
+            ui.add_space(24.0);
+            ui.vertical_centered(|ui| {
+                ui.label(RichText::new("没有可解析的 Modbus 帧").strong());
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(
+                        "本视图只显示能被解析的 Modbus 帧。若会话协议是「无(原始数据)」，\
+                         或数据来自驱动/串口原始抓包，请把协议改为 Modbus RTU / ASCII / TCP。",
+                    )
+                    .weak()
+                    .small(),
+                );
+            });
+            return;
+        }
         TableBuilder::new(ui)
             .striped(true)
             .vscroll(true)
@@ -1635,7 +1796,7 @@ impl MonitorApp {
                     }
                 });
                 ui.monospace(RichText::new(bytes_hex(&r.data)).color(Self::kind_color(r.kind)));
-                ui.monospace(escape_text(&r.data, s.ascii_escape));
+                ui.monospace(escape_text(&r.data, s.ascii_escape, s.display_encoding));
             }
         } else {
             ui.label(RichText::new("点击上方任一行查看详情").weak());
@@ -1764,20 +1925,29 @@ impl MonitorApp {
                         ui.label("查找内容");
                         ui.add(TextEdit::singleline(&mut self.find_text).desired_width(220.0));
                     });
+                    ui.label(
+                        RichText::new("匹配 HEX，以及按当前显示编码解码后的文本（含中文）")
+                            .weak()
+                            .small(),
+                    );
                     ui.horizontal(|ui| {
+                        // 查找 restarts from the top; 查找下一个 continues from the last hit.
+                        // Both used to call the same function, so 查找 felt like a no-op
+                        // whenever the previous hit was already near the end.
                         if ui.button("查找").clicked() {
+                            self.find_reset();
                             self.find_next();
-                        ui.close_menu();
                         }
                         if ui.button("查找下一个").clicked() {
                             self.find_next();
-                        ui.close_menu();
                         }
                         if ui.button("关闭").clicked() {
                             self.dlg_find = false;
-                        ui.close_menu();
                         }
                     });
+                    if !self.find_note.is_empty() {
+                        ui.label(RichText::new(&self.find_note).color(C_REQ).small());
+                    }
                 });
         }
         if self.dlg_about {

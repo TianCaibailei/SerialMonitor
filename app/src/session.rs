@@ -2,6 +2,7 @@
 // row storage, filters, rate history, auto-save logging.
 
 use crate::protocol::{self, FrameKind, ModbusParsed};
+use crate::text_codec::{self, DisplayEncoding};
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
@@ -128,7 +129,10 @@ impl Default for Filters {
 }
 
 impl Filters {
-    pub fn pass(&self, r: &Row) -> bool {
+    /// `enc` is the session's display encoding: text matching must see the same
+    /// decoded characters the user sees in the views. GBK / UTF-16 content used to be
+    /// unsearchable because this function went through `String::from_utf8_lossy`.
+    pub fn pass(&self, r: &Row, enc: DisplayEncoding) -> bool {
         if self.dir == 1 && r.dir_tx {
             return false;
         }
@@ -148,7 +152,7 @@ impl Filters {
         if self.text_on && !self.text.is_empty() {
             let t = self.text.to_lowercase();
             let hex = bytes_hex(&r.data).to_lowercase();
-            let txt = String::from_utf8_lossy(&r.data).to_lowercase();
+            let txt = text_codec::decoded_text(&r.data, enc).to_lowercase();
             if !hex.contains(&t) && !txt.contains(&t) {
                 return false;
             }
@@ -255,6 +259,10 @@ pub struct Session {
     pub string_len: usize,
     pub values_dec: bool,
     pub ascii_escape: bool,
+    /// Encoding used to turn captured bytes into readable text in every view, in
+    /// search/filter, in copy and in export. This is deliberately separate from the
+    /// old `save_enc`/`r_enc` fields (which only ever chose the export file bytes).
+    pub display_encoding: DisplayEncoding,
     pub selected: Option<usize>,
     pub find_pos: usize,
     pub seq: u64,
@@ -329,24 +337,11 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (y + i64::from(m <= 2), m, d)
 }
 
-pub fn escape_text(data: &[u8], escape: bool) -> String {
-    let mut s = String::new();
-    for &b in data {
-        if b == b'\r' {
-            s.push_str("\\r");
-        } else if b == b'\n' {
-            s.push_str("\\n");
-        } else if b == b'\t' {
-            s.push_str("\\t");
-        } else if (0x20..0x7F).contains(&b) {
-            s.push(b as char);
-        } else if escape {
-            s.push_str(&format!("\\x{:02X}", b));
-        } else {
-            s.push('?');
-        }
-    }
-    s
+/// Decode-then-escape. Kept under the old name so all existing call sites keep the
+/// same shape; the extra `enc` argument forces every consumer to state which encoding
+/// it renders with (there is no longer a hidden "bytes are ASCII" assumption).
+pub fn escape_text(data: &[u8], escape: bool, enc: DisplayEncoding) -> String {
+    text_codec::escape_text(data, escape, enc)
 }
 
 impl Session {
@@ -373,6 +368,7 @@ impl Session {
             string_len: 16, // cbb_OutPutCharLen DFM default (items 2/4/8/10/12/16/32)
             values_dec: false,
             ascii_escape: true,
+            display_encoding: DisplayEncoding::Utf8,
             selected: None,
             find_pos: 0,
             seq: 0,
@@ -776,7 +772,7 @@ impl Session {
             .unwrap_or_else(|| "?".into());
         if let Some(a) = &mut self.autosave {
             if a.on {
-                autosave_line(&chan, &row, a);
+                autosave_line(&chan, &row, a, self.display_encoding);
             }
         }
         match self.rate.last_mut() {
@@ -952,7 +948,7 @@ impl Session {
             .unwrap_or_else(|| "?".into());
         if let Some(a) = &mut self.autosave {
             if a.on {
-                autosave_line(&chan, &row, a);
+                autosave_line(&chan, &row, a, self.display_encoding);
             }
         }
         // rate bucket
@@ -984,7 +980,8 @@ impl Session {
     }
 
     pub fn visible_count(&self) -> usize {
-        self.rows.iter().filter(|r| self.filters.pass(r)).count()
+        let enc = self.display_encoding;
+        self.rows.iter().filter(|r| self.filters.pass(r, enc)).count()
     }
 
     pub fn send_bytes(&mut self, idx: usize, data: &[u8]) -> Result<(), String> {
@@ -1038,38 +1035,35 @@ impl Session {
         self.find_pos = 0;
     }
 
-    pub fn save_log(&self, path: &str, enc: usize) -> std::io::Result<()> {
-        let mut out = String::from("# 万能监控日志 v1\n");
+    /// `enc` selects the **file** encoding; the text column always uses the session's
+    /// display encoding so exported Chinese is readable (the old version exported only
+    /// HEX, so switching encoding had no effect on the captured content at all).
+    pub fn save_log(&self, path: &str, enc: DisplayEncoding) -> std::io::Result<()> {
+        let dec = self.display_encoding;
+        let mut out = String::from("# 万能监控日志 v2\n");
+        out.push_str("# 列: 时间\t通道\t方向\tHEX\t文本(按显示编码解码)\n");
         for r in &self.rows {
             let chan = self
                 .channels
                 .get(r.idx)
                 .map(|c| c.name.clone())
                 .unwrap_or_else(|| "?".into());
+            let text = text_codec::decoded_text(&r.data, dec)
+                .replace(['\r', '\n', '\t'], " ");
             out.push_str(&format!(
-                "{}\t{}\t{}\t{}\n",
+                "{}\t{}\t{}\t{}\t{}\n",
                 fmt_time(r.secs, r.millis),
                 chan,
                 if r.dir_tx { "写" } else { "读" },
-                bytes_hex(&r.data)
+                bytes_hex(&r.data),
+                text
             ));
         }
-        let bytes: Vec<u8> = match enc {
-            1 => {
-                let (b, _, _) = encoding_rs::GBK.encode(&out);
-                b.to_vec()
-            }
-            2 => {
-                let (b, _, _) = encoding_rs::UTF_16LE.encode(&out);
-                b.to_vec()
-            }
-            _ => out.into_bytes(),
-        };
-        std::fs::write(path, bytes)
+        std::fs::write(path, text_codec::encode(&out, enc))
     }
 }
 
-fn autosave_line(chan: &str, row: &Row, a: &mut Autosave) {
+fn autosave_line(chan: &str, row: &Row, a: &mut Autosave, dec: DisplayEncoding) {
     // rotation
     let now = now_wall();
     let need_new = a.cur_file.is_empty()
@@ -1078,6 +1072,7 @@ fn autosave_line(chan: &str, row: &Row, a: &mut Autosave) {
             2 => a.written >= a.size_mb * 1024 * 1024,
             _ => false,
         };
+    let enc = DisplayEncoding::from_index(a.encoding);
     if need_new {
         let base = if a.path.is_empty() { "autosave".to_string() } else { a.path.clone() };
         let p = std::path::Path::new(&base);
@@ -1087,27 +1082,31 @@ fn autosave_line(chan: &str, row: &Row, a: &mut Autosave) {
         a.cur_file = format!("{}_{}{}", stem, n, ext);
         a.started_at = now.0;
         a.written = 0;
+        // A BOM belongs at the very beginning of a new file only — appending it on
+        // every rotation would inject it in the middle of a UTF-16 stream.
+        let bom = text_codec::bom(enc);
+        if !bom.is_empty() {
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).truncate(true).write(true).open(&a.cur_file) {
+                let _ = f.write_all(bom);
+                a.written += bom.len() as u64;
+            }
+        }
     }
+    let text = text_codec::decoded_text(&row.data, dec).replace(['\r', '\n', '\t'], " ");
     let line = format!(
-        "{}\t{}\t{}\t{}\n",
+        "{}\t{}\t{}\t{}\t{}\n",
         fmt_time(row.secs, row.millis),
         chan,
         if row.dir_tx { "写" } else { "读" },
-        bytes_hex(&row.data)
+        bytes_hex(&row.data),
+        text
     );
-    let bytes: Vec<u8> = match a.encoding {
-        1 => {
-            let (b, _, _) = encoding_rs::GBK.encode(&line);
-            b.to_vec()
-        }
-        2 => {
-            let (b, _, _) = encoding_rs::UTF_16LE.encode(&line);
-            b.to_vec()
-        }
-        _ => line.into_bytes(),
-    };
+    // encode() prepends a BOM; for append chunks we strip it so it is written once only.
+    let full = text_codec::encode(&line, enc);
+    let bom_len = text_codec::bom(enc).len();
+    let bytes = &full[bom_len..];
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&a.cur_file) {
-        let _ = f.write_all(&bytes);
+        let _ = f.write_all(bytes);
         a.written += bytes.len() as u64;
     }
 }
