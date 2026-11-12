@@ -6,16 +6,36 @@
 // parent console when one exists, so running it from PowerShell keeps its output.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+// Diagnostics / Win32-FFI layer.
+//
+// These modules intentionally declare APIs that not every build path reaches: the extern
+// blocks mirror the real Windows signatures (so the linker resolves them and the struct
+// layouts stay documented) and the helpers back the CLI diagnostic modes
+// (`--driver-test`, `--inject-test`, `--holders`, `--hook-e2e`, …) plus the PowerShell
+// verification scripts. Allowing dead_code here keeps those capabilities compiled
+// without drowning genuine warnings in noise; the GUI/server modules below are not
+// allowed and must stay warning-clean.
+#[allow(dead_code)]
 mod autoattach;
+#[allow(dead_code)]
 mod capture;
+#[allow(dead_code)]
 mod diag;
+#[allow(dead_code)]
 mod driver;
+#[allow(dead_code)]
 mod e2e;
+#[allow(dead_code)]
 mod headless;
+#[allow(dead_code)]
 mod inject;
+#[allow(dead_code)]
 mod layout_probe;
+#[allow(dead_code)]
 mod native_serial;
+#[allow(dead_code)]
 mod native_serial_delayed;
+#[allow(dead_code)]
 mod portowners;
 mod protocol;
 mod session;
@@ -64,7 +84,15 @@ fn parse_args() -> Option<String> {
         if args[i] == "--handles-self" {
             std::process::exit(diag::handles_self());
         }
-        // --driver-latency [seconds] — measure how promptly records arrive`r`n        if args[i] == "--driver-latency" {`r`n            let secs: u64 = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(15);`r`n            std::process::exit(diag::driver_latency(secs));`r`n        }
+        // --driver-latency [seconds] — measure how promptly records arrive
+        //
+        // This branch was previously inside a single commented-out line (literal `r`n
+        // escapes), so the documented `--driver-latency` diagnostic silently fell
+        // through to the GUI. Restored as real code.
+        if args[i] == "--driver-latency" {
+            let secs: u64 = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(15);
+            std::process::exit(diag::driver_latency(secs));
+        }
         // --driver-test [seconds] — verify the kernel filter driver end to end
         if args[i] == "--driver-test" {
             let secs: u64 = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(15);

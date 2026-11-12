@@ -101,7 +101,7 @@ pub fn capture_window(out: &str, pid: u32, x: i32, y: i32, w: i32, h: i32) -> st
         let mut ch = h;
         let mut pixels: Vec<u8> = Vec::new();
 
-        let mut bi = |cw: i32, ch: i32| BitmapInfo {
+        let bi = |cw: i32, ch: i32| BitmapInfo {
             header: BitmapInfoHeader {
                 size: std::mem::size_of::<BitmapInfoHeader>() as u32,
                 width: cw,

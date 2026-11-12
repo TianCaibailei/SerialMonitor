@@ -41,6 +41,13 @@
 //      one lock and no system call.
 
 #![allow(non_snake_case)]
+// The hook declares every Win32 function it may intercept, plus the struct/layout mirrors
+// used by the diagnostics, so some items are unused in any single build configuration.
+#![allow(dead_code)]
+// The hook patch table stores hook functions as raw addresses (`hook_X as usize`) so the
+// inline trampoline can jump to them. Rustc flags each cast ("direct cast of function item
+// into an integer"); that is the intended FFI pattern here, so the warning is accepted as
+// known noise rather than silenced with a blanket allow.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};

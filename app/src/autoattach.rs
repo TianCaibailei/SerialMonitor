@@ -482,8 +482,9 @@ extern "system" {
     fn GetFileType(h: *mut std::ffi::c_void) -> u32;
 }
 
-/// DCB query. Declared with the Win32 name so the linker resolves kernel32!GetCommState.
-#[link_name = "GetCommState"]
+// DCB query. The Rust identifier is already the Win32 export name, so the linker
+// resolves kernel32!GetCommState directly — `#[link_name]` cannot be applied to an
+// entire `extern` block (the compiler warns it will become a hard error).
 extern "system" {
     fn GetCommState(h: *mut std::ffi::c_void, dcb: *mut std::ffi::c_void) -> i32;
 }

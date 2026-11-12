@@ -137,6 +137,10 @@ extern "system" {
 /// character array is 8-byte aligned, so Windows leaves 8 bytes of padding before it.
 /// Modelling that padding explicitly is what makes the process names come out instead
 /// of an empty string, and `dwSize` must be the full 568.
+// Field names intentionally mirror the Win32 PROCESSENTRY32W definition: this is a
+// #[repr(C)] ABI mirror, and renaming them to snake_case would obscure the mapping for
+// anyone checking the layout against the SDK header.
+#[allow(non_snake_case)]
 #[repr(C)]
 struct ProcessEntry32W {
     dwSize: u32,

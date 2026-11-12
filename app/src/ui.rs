@@ -229,6 +229,8 @@ pub struct MonitorApp {
     pub prefs_backup: Option<(u64, usize, bool, bool, bool)>,
     /// Snapshot taken when 自动保存日志设置 opened, restored on 取消.
     pub redir_backup: Option<(bool, String, usize, u64, u64, usize)>,
+    /// 「退出」在有会话时先确认，避免未保存的采集数据被直接丢弃。
+    pub dlg_confirm_exit: bool,
 }
 
 fn b(v: bool) -> &'static str {
@@ -362,6 +364,7 @@ impl MonitorApp {
             recent_archives: Vec::new(),
             prefs_backup: None,
             redir_backup: None,
+            dlg_confirm_exit: false,
         };
         app.load_cfg();
         if screenshot.is_some() {
@@ -1243,8 +1246,13 @@ impl MonitorApp {
                     }
                     ui.separator();
                     if ui.button("退出").clicked() {
-                        std::process::exit(0);
                         ui.close_menu();
+                        // 有正在采集的会话时提醒一次：退出不会自动保存，数据会丢。
+                        if has {
+                            self.dlg_confirm_exit = true;
+                        } else {
+                            std::process::exit(0);
+                        }
                     }
                 });
                 ui.menu_button("监控", |ui| {
@@ -2205,6 +2213,28 @@ impl MonitorApp {
                     if !self.find_note.is_empty() {
                         ui.label(RichText::new(&self.find_note).color(C_REQ).small());
                     }
+                });
+        }
+        if self.dlg_confirm_exit {
+            Window::new("确认退出")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label("当前还有监控会话。退出前建议先「保存会话」，否则本次采集的数据会丢失。");
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("保存会话并退出").clicked() {
+                            self.save_archive_active();
+                            std::process::exit(0);
+                        }
+                        if ui.button("直接退出").clicked() {
+                            std::process::exit(0);
+                        }
+                        if ui.button("取消").clicked() {
+                            self.dlg_confirm_exit = false;
+                        }
+                    });
                 });
         }
         if self.dlg_about {

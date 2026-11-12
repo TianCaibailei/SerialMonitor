@@ -24,8 +24,6 @@
 //
 // `object` pointers are only reused after the port object is destroyed, and the
 // scan is short-lived, so a match is trustworthy for the duration of one scan.
-use std::collections::HashMap;
-
 use crate::autoattach::com_device_map;
 
 extern "system" {

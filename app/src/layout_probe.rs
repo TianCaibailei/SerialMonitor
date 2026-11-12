@@ -5,6 +5,11 @@
 
 use std::ffi::c_void;
 
+// This probe deliberately declares the Toolhelp32 functions with `*mut u8` buffers: its
+// whole purpose is to inspect the *raw bytes* of PROCESSENTRY32W so a wrong struct layout
+// becomes visible. The differing signature from the typed declarations in `inject` is the
+// point, not a mistake.
+#[allow(clashing_extern_declarations)]
 extern "system" {
     fn CreateToolhelp32Snapshot(flags: u32, pid: u32) -> *mut c_void;
     fn Process32FirstW(snap: *mut c_void, pe: *mut u8) -> i32;
