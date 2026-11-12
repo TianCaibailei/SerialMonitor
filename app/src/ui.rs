@@ -214,6 +214,8 @@ pub struct MonitorApp {
     pub p_dec: bool,
     pub p_esc: bool,
     pub p_scroll: bool,
+    /// 显示设置对话框：是否应用到全部会话（仅对话框内使用）。
+    pub p_apply_all: bool,
 
     pub find_text: String,
     /// Row index the views should scroll to on the next frame (set by 查找 / 查找下一个).
@@ -221,6 +223,12 @@ pub struct MonitorApp {
     pub scroll_to_row: Option<usize>,
     /// Last search result feedback, e.g. "3/128 匹配". Shown in the find dialog.
     pub find_note: String,
+    /// Recently saved / opened `.umses` archives, newest first (persisted to config.ini).
+    pub recent_archives: Vec<String>,
+    /// Snapshot taken when 显示设置 opened, restored on 取消.
+    pub prefs_backup: Option<(u64, usize, bool, bool, bool)>,
+    /// Snapshot taken when 自动保存日志设置 opened, restored on 取消.
+    pub redir_backup: Option<(bool, String, usize, u64, u64, usize)>,
 }
 
 fn b(v: bool) -> &'static str {
@@ -347,9 +355,13 @@ impl MonitorApp {
             p_dec: false,
             p_esc: true,
             p_scroll: true,
+            p_apply_all: false,
             find_text: String::new(),
             scroll_to_row: None,
             find_note: String::new(),
+            recent_archives: Vec::new(),
+            prefs_backup: None,
+            redir_backup: None,
         };
         app.load_cfg();
         if screenshot.is_some() {
@@ -432,6 +444,14 @@ impl MonitorApp {
                             "portWatch" => self.fport_sel = parse_port_list(v),
                             "displayEnc" => self.display_enc = DisplayEncoding::from_index(v.parse().unwrap_or(0)),
                             "exportEnc" => self.save_enc = v.parse().unwrap_or(0).min(2),
+                            "recentArchive" => {
+                                // Paths are tokenised by whitespace in this ini format, so
+                                // spaces travel as %20 (see the writer).
+                                let p = v.replace("%20", " ");
+                                if !p.is_empty() && !self.recent_archives.iter().any(|q| q == &p) {
+                                    self.recent_archives.push(p);
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -455,6 +475,11 @@ impl MonitorApp {
             self.display_enc.as_index(),
             self.save_enc
         );
+        let mut t = t;
+        for p in self.recent_archives.iter().take(8) {
+            // Whitespace-delimited ini: encode spaces so a path with spaces survives.
+            t.push_str(&format!("recentArchive={}\n", p.replace(' ', "%20")));
+        }
         let _ = std::fs::write("config.ini", t);
     }
 
@@ -941,6 +966,10 @@ impl MonitorApp {
     }
 
     fn close_active(&mut self) {
+        let closed_name = self.sessions.get(self.active).map(|s| s.name.clone());
+        let had_hook = self.sessions.get(self.active).map_or(false, |s| {
+            s.cap_pid.is_some() || s.channels.iter().any(|c| c.kind == ChanKind::HookSerial)
+        });
         if let Some(s) = self.sessions.get(self.active) {
             s.stop_all();
         }
@@ -951,6 +980,16 @@ impl MonitorApp {
             self.active = self.sessions.len().saturating_sub(1);
         }
         self.view_sel = 0;
+        // Closing a session never stopped the application-level capture paths. Say so
+        // instead of leaving the user to wonder why data keeps arriving (and why a
+        // driver session can reappear on its own).
+        if had_hook {
+            self.toast(format!(
+                "已关闭{}。注意：{}仍在后台运行，新数据可能自动建会话；需要完全停止请用「监控→停止驱动捕获」",
+                closed_name.unwrap_or_else(|| "会话".into()),
+                if self.drv_rx.is_some() { "驱动捕获" } else { "进程拦截" }
+            ));
+        }
     }
 
     /// Export the active session's rows.
@@ -976,6 +1015,114 @@ impl MonitorApp {
                 s.display_encoding.label()
             )),
             Err(e) => self.toast(format!("保存失败: {}", e)),
+        }
+    }
+
+    /// Load the active session's display/auto-save settings into the dialog drafts.
+    ///
+    /// The dialogs used to open showing `MonitorApp`'s global defaults instead of the
+    /// values actually in effect, so editing one field silently reset the others to the
+    /// defaults. Cancelling also left the edits in place. Both are fixed by these two
+    /// sync functions plus the `*_backup` restore on 取消.
+    fn sync_prefs_from_session(&mut self) {
+        if let Some(s) = self.sessions.get(self.active) {
+            self.p_merge = s.merge_ms;
+            self.p_strlen = s.string_len;
+            self.p_dec = s.values_dec;
+            self.p_esc = s.ascii_escape;
+            self.p_scroll = s.auto_scroll;
+        }
+        self.prefs_backup = Some((self.p_merge, self.p_strlen, self.p_dec, self.p_esc, self.p_scroll));
+    }
+
+    fn sync_redir_from_session(&mut self) {
+        if let Some(s) = self.sessions.get(self.active) {
+            if let Some(a) = &s.autosave {
+                self.r_on = a.on;
+                self.r_path = a.path.clone();
+                self.r_split = a.split;
+                self.r_time = a.time_min;
+                self.r_size = a.size_mb;
+                self.r_enc = a.encoding;
+            }
+        }
+        self.redir_backup = Some((
+            self.r_on,
+            self.r_path.clone(),
+            self.r_split,
+            self.r_time,
+            self.r_size,
+            self.r_enc,
+        ));
+    }
+
+    fn restore_prefs(&mut self) {
+        if let Some((m, l, d, e, s)) = self.prefs_backup.take() {
+            self.p_merge = m;
+            self.p_strlen = l;
+            self.p_dec = d;
+            self.p_esc = e;
+            self.p_scroll = s;
+        }
+    }
+
+    fn restore_redir(&mut self) {
+        if let Some((on, path, split, t, sz, enc)) = self.redir_backup.take() {
+            self.r_on = on;
+            self.r_path = path;
+            self.r_split = split;
+            self.r_time = t;
+            self.r_size = sz;
+            self.r_enc = enc;
+        }
+    }
+
+    /// Save the active session as a reopenable archive.
+    fn save_archive_active(&mut self) {
+        let Some(s) = self.sessions.get(self.active) else { return };
+        let (secs, _) = now_wall();
+        let safe: String = s
+            .name
+            .chars()
+            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .collect();
+        let path = format!("session_{safe}_{secs}.umses");
+        match s.save_archive(&path) {
+            Ok(()) => {
+                self.push_recent_archive(&path);
+                self.toast(format!("会话已保存：{path}（可用「打开会话」回看）"));
+            }
+            Err(e) => self.toast(format!("保存会话失败: {e}")),
+        }
+    }
+
+    fn push_recent_archive(&mut self, path: &str) {
+        self.recent_archives.retain(|p| p != path);
+        self.recent_archives.insert(0, path.to_string());
+        self.recent_archives.truncate(8);
+    }
+
+    /// Open an archive. Without a native file dialog in the dependency set, the most
+    /// recently saved/opened files are offered directly — which is also the fastest path
+    /// for the common "save, then look at it again" workflow.
+    fn open_archive_recent(&mut self) {
+        if self.recent_archives.is_empty() {
+            self.toast("还没有可打开的会话文件：请先「保存会话」");
+            return;
+        }
+        let path = self.recent_archives[0].clone();
+        match Session::load_archive(&path) {
+            Ok(s) => {
+                self.sessions.push(s);
+                self.active = self.sessions.len() - 1;
+                self.view_sel = 0;
+                self.push_recent_archive(&path);
+                self.toast(format!("已打开 {path}（只读回看，未占用任何端口）"));
+            }
+            Err(e) => {
+                self.recent_archives.retain(|p| p != &path);
+                self.toast(format!("打开失败: {e}"));
+            }
         }
     }
 
@@ -1074,12 +1221,23 @@ impl MonitorApp {
     fn top_panel(&mut self, ctx: &Context) {
         egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
+                let has = !self.sessions.is_empty();
                 ui.menu_button("文件", |ui| {
                     if ui.button("新建监控会话…").clicked() {
                         self.dlg_new = true;
                         ui.close_menu();
                     }
-                    if ui.button("保存当前会话").clicked() {
+                    ui.separator();
+                    if ui.add_enabled(has, egui::Button::new("保存会话（.umses，可重新打开）")).clicked() {
+                        self.save_archive_active();
+                        ui.close_menu();
+                    }
+                    if ui.button("打开会话（.umses）…").clicked() {
+                        self.open_archive_recent();
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.add_enabled(has, egui::Button::new("导出日志（文本/HEX）")).clicked() {
                         self.save_active();
                         ui.close_menu();
                     }
@@ -1089,7 +1247,6 @@ impl MonitorApp {
                         ui.close_menu();
                     }
                 });
-                let has = !self.sessions.is_empty();
                 ui.menu_button("监控", |ui| {
                     if ui.add_enabled(has, egui::Button::new("开启监控")).clicked() {
                         if let Some(s) = self.sessions.get_mut(self.active) {
@@ -1169,10 +1326,12 @@ impl MonitorApp {
                 });
                 ui.menu_button("设置", |ui| {
                     if ui.button("自动保存日志设置…").clicked() {
+                        self.sync_redir_from_session();
                         self.dlg_redir = true;
                         ui.close_menu();
                     }
                     if ui.button("显示设置…").clicked() {
+                        self.sync_prefs_from_session();
                         self.dlg_prefs = true;
                         ui.close_menu();
                     }
@@ -1198,6 +1357,41 @@ impl MonitorApp {
                             }
                         });
                     });
+                });
+                ui.menu_button("视图", |ui| {
+                    if !has {
+                        ui.label(RichText::new("先新建一个会话").weak());
+                    } else {
+                        // View visibility used to be settable only at creation time, so a
+                        // session created without the Modbus view could never show it.
+                        ui.label(RichText::new("显示/隐藏视图（对当前会话即时生效）").weak().small());
+                        let s = &mut self.sessions[self.active];
+                        let mut changed = false;
+                        changed |= ui.checkbox(&mut s.views.table, "Table 视图").changed();
+                        changed |= ui.checkbox(&mut s.views.terminal, "终端视图").changed();
+                        changed |= ui.checkbox(&mut s.views.dump, "Dump 视图").changed();
+                        changed |= ui.checkbox(&mut s.views.line, "Line 曲线图").changed();
+                        changed |= ui.checkbox(&mut s.views.modbus, "Modbus 视图").changed();
+                        if changed {
+                            // Keep the tab selection valid after a view disappears.
+                            let enabled = self.enabled_views();
+                            if !enabled.contains(&self.view_sel) {
+                                self.view_sel = *enabled.first().unwrap_or(&0);
+                            }
+                        }
+                        ui.separator();
+                        if ui.button("全部显示").clicked() {
+                            if let Some(s) = self.sessions.get_mut(self.active) {
+                                s.views = ViewToggles {
+                                    table: true,
+                                    terminal: true,
+                                    dump: true,
+                                    line: true,
+                                    modbus: true,
+                                };
+                            }
+                        }
+                    }
                 });
                 ui.menu_button("帮助", |ui| {
                     if ui.button("关于…").clicked() {
@@ -3012,16 +3206,25 @@ impl MonitorApp {
                 ui.add(DragValue::new(&mut self.r_size).speed(1.0).range(1..=10000));
             }
         });
-        ComboBox::from_label("编码方式")
+        ui.label(
+            RichText::new("日志文件编码（只影响写出的文件字节；界面显示编码在「设置→显示编码」）")
+                .weak()
+                .small(),
+        );
+        ComboBox::from_label("文件编码")
             .selected_text(ENCS[self.r_enc])
             .show_ui(ui, |ui| {
                 for (i, e) in ENCS.iter().enumerate() {
                     ui.selectable_value(&mut self.r_enc, i, *e);
                 }
             });
+        if self.sessions.is_empty() {
+            ui.label(RichText::new("当前没有会话：此设置会作为新建会话的默认值").color(C_REQ).small());
+        }
         ui.separator();
         ui.horizontal(|ui| {
             if ui.button("保存").clicked() {
+                let applied = self.sessions.get_mut(self.active).is_some();
                 if let Some(s) = self.sessions.get_mut(self.active) {
                     if self.r_on {
                         let (now, _) = crate::session::now_wall();
@@ -3040,10 +3243,16 @@ impl MonitorApp {
                         a.on = false;
                     }
                 }
+                self.redir_backup = None;
                 self.dlg_redir = false;
-                        ui.close_menu();
+                self.toast(if applied {
+                    "自动保存设置已应用到当前会话"
+                } else {
+                    "已保存为新建会话的默认值（当前没有会话）"
+                });
             }
             if ui.button("取消").clicked() {
+                self.restore_redir();
                 self.dlg_redir = false;
                         ui.close_menu();
             }
@@ -3056,12 +3265,20 @@ impl MonitorApp {
     }
 
     fn dlg_prefs_ui(&mut self, ui: &mut Ui) {
+        if self.sessions.is_empty() {
+            ui.label(RichText::new("当前没有会话：此设置会作为新建会话的默认值").color(C_REQ).small());
+        }
         ui.horizontal(|ui| {
-            ui.label("字符串输出长度");
+            ui.label("Modbus Values 列长度");
             ui.add(DragValue::new(&mut self.p_strlen).speed(1.0).range(8..=4096));
         });
+        ui.label(
+            RichText::new("仅作用于 Modbus 视图的 Values 列；Table/终端/Dump 的数据列不截断")
+                .weak()
+                .small(),
+        );
         ui.horizontal(|ui| {
-            ui.label("以指定时间区间合并\"读\"和\"写\"的数据(ms)：");
+            ui.label("合并相邻读/写数据的时间窗口(ms)：");
             ui.add(DragValue::new(&mut self.p_merge).speed(1.0).range(5..=1000));
             for v in [5u64, 10, 20, 50, 100, 200, 500] {
                 if ui.small_button(format!("{}", v)).clicked() {
@@ -3069,6 +3286,11 @@ impl MonitorApp {
                 }
             }
         });
+        ui.label(
+            RichText::new("作用于原始字节流；已按 Modbus 解析成帧的会话不受影响")
+                .weak()
+                .small(),
+        );
         ui.horizontal(|ui| {
             ui.label("Values 显示:");
             if ui.radio(!self.p_dec, "16进制").clicked() {
@@ -3078,31 +3300,47 @@ impl MonitorApp {
                 self.p_dec = true;
             }
         });
-        ui.checkbox(&mut self.p_esc, "非可视ASCII转义符显示\\x(否则?)");
-        ui.checkbox(&mut self.p_scroll, "滚屏显示");
+        ui.checkbox(&mut self.p_esc, "非可视控制符显示为 \\xNN（否则显示 ?）");
+        ui.checkbox(&mut self.p_scroll, "滚屏显示（自动跟随最新数据）");
+        ui.checkbox(&mut self.p_apply_all, "应用到全部会话");
         ui.separator();
         ui.horizontal(|ui| {
             if ui.button("保存").clicked() {
-                if let Some(s) = self.sessions.get_mut(self.active) {
+                let apply_all = self.p_apply_all;
+                let active = self.active;
+                let mut n = 0usize;
+                for (i, s) in self.sessions.iter_mut().enumerate() {
+                    // Only the active session unless 应用到全部会话 is ticked.
+                    if !apply_all && i != active {
+                        continue;
+                    }
                     s.merge_ms = self.p_merge;
                     s.string_len = self.p_strlen;
                     s.values_dec = self.p_dec;
                     s.ascii_escape = self.p_esc;
                     s.auto_scroll = self.p_scroll;
+                    n += 1;
                 }
+                // The dialog drafts double as the defaults for new sessions.
+                self.save_cfg();
+                self.prefs_backup = None;
                 self.dlg_prefs = false;
-                        ui.close_menu();
+                self.toast(if n == 0 {
+                    "已保存为新建会话的默认值（当前没有会话）".to_string()
+                } else if apply_all {
+                    format!("显示设置已应用到全部 {n} 个会话")
+                } else {
+                    "显示设置已应用到当前会话".to_string()
+                });
             }
             if ui.button("取消").clicked() {
+                self.restore_prefs();
                 self.dlg_prefs = false;
-                        ui.close_menu();
+            }
+            if ui.button("关闭").clicked() {
+                self.dlg_prefs = false;
             }
         });
-        ui.separator();
-        if ui.button("关闭").clicked() {
-            self.dlg_prefs = false;
-                        ui.close_menu();
-        }
     }
     /// True while any session is actively collecting. A passive (串口监听) channel
     /// counts as live even when idle, because a row can arrive at any moment.

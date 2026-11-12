@@ -60,7 +60,7 @@ impl Default for ViewToggles {
     }
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub enum ProtoType {
     None,
     Rtu,
@@ -295,6 +295,53 @@ pub fn now_wall() -> (u64, u32) {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
     (d.as_secs(), d.subsec_millis())
+}
+
+fn b01(v: bool) -> char {
+    if v {
+        '1'
+    } else {
+        '0'
+    }
+}
+
+/// Escape a field for the tab-separated archive format. Only the separator and the
+/// escape character need handling, which keeps archives human-readable.
+fn esc_field(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn unesc_field(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('t') => out.push('\t'),
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('\\') => out.push('\\'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
 }
 
 pub fn bytes_hex(data: &[u8]) -> String {
@@ -1053,6 +1100,201 @@ impl Session {
         self.stop.store(true, Ordering::Relaxed);
     }
 
+    /// Serialise the session to a reopenable archive (`.umses`).
+    ///
+    /// Format (UTF-8 text, tab separated, versioned by the header line):
+    ///
+    /// ```text
+    /// UMSEX 1
+    /// name      <session name, escaped>
+    /// proto     <none|rtu|ascii|tcp>
+    /// encoding  <0|1|2>
+    /// views     <table,terminal,dump,line,modbus>  (0/1 each)
+    /// chan      <kind> <name, escaped> <baud> <data> <parity> <stop>
+    /// row       <seq> <idx> <dir 0/1> <secs> <millis> <hex>
+    /// ```
+    ///
+    /// Rows keep their raw bytes only: `parsed` is derived, so recomputing it on load is
+    /// both cheaper and guaranteed consistent with the current parser.
+    pub fn save_archive(&self, path: &str) -> std::io::Result<()> {
+        let mut out = String::new();
+        out.push_str("UMSEX 1\n");
+        out.push_str(&format!("name\t{}\n", esc_field(&self.name)));
+        out.push_str(&format!("proto\t{}\n", match self.proto {
+            ProtoType::None => "none",
+            ProtoType::Rtu => "rtu",
+            ProtoType::Ascii => "ascii",
+            ProtoType::Tcp => "tcp",
+        }));
+        out.push_str(&format!("encoding\t{}\n", self.display_encoding.as_index()));
+        out.push_str(&format!(
+            "views\t{}{}{}{}{}\n",
+            b01(self.views.table),
+            b01(self.views.terminal),
+            b01(self.views.dump),
+            b01(self.views.line),
+            b01(self.views.modbus)
+        ));
+        for c in &self.channels {
+            let kind = match c.kind {
+                ChanKind::Serial => "serial",
+                ChanKind::TcpClient => "tcpclient",
+                ChanKind::TcpServer => "tcpserver",
+                ChanKind::Udp => "udp",
+                ChanKind::HookSerial => "hook",
+            };
+            out.push_str(&format!(
+                "chan\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                kind,
+                esc_field(&c.name),
+                c.baud,
+                c.data_bits,
+                c.parity,
+                c.stop_bits
+            ));
+        }
+        for r in &self.rows {
+            out.push_str(&format!(
+                "row\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                r.seq,
+                r.idx,
+                if r.dir_tx { 1 } else { 0 },
+                r.secs,
+                r.millis,
+                bytes_hex(&r.data).replace(' ', "")
+            ));
+        }
+        std::fs::write(path, out)
+    }
+
+    /// Load a session written by `save_archive`. Returns a paused session (nothing is
+    /// re-opened) so the user can browse history exactly as it was captured.
+    pub fn load_archive(path: &str) -> Result<Session, String> {
+        let text = std::fs::read_to_string(path).map_err(|e| format!("读取失败: {e}"))?;
+        let mut lines = text.lines();
+        let header = lines.next().unwrap_or("");
+        let mut it = header.split_whitespace();
+        if it.next() != Some("UMSEX") {
+            return Err("不是本程序的会话文件（缺少 UMSEX 头）".into());
+        }
+        let version: u32 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        if version != 1 {
+            return Err(format!("不支持的会话文件版本 {version}（本程序支持 1）"));
+        }
+        let mut name = String::from("导入的会话");
+        let mut proto = ProtoType::None;
+        let mut encoding = DisplayEncoding::Utf8;
+        let mut views = ViewToggles::default();
+        let mut channels: Vec<ChannelCfg> = Vec::new();
+        let mut rows_raw: Vec<(u64, usize, bool, u64, u32, Vec<u8>)> = Vec::new();
+
+        for line in lines {
+            if line.is_empty() {
+                continue;
+            }
+            let f: Vec<&str> = line.split('\t').collect();
+            match f.first().copied() {
+                Some("name") if f.len() >= 2 => name = unesc_field(f[1]),
+                Some("proto") if f.len() >= 2 => {
+                    proto = match f[1] {
+                        "rtu" => ProtoType::Rtu,
+                        "ascii" => ProtoType::Ascii,
+                        "tcp" => ProtoType::Tcp,
+                        _ => ProtoType::None,
+                    }
+                }
+                Some("encoding") if f.len() >= 2 => {
+                    encoding = DisplayEncoding::from_index(f[1].parse().unwrap_or(0))
+                }
+                Some("views") if f.len() >= 2 => {
+                    let v: Vec<char> = f[1].chars().collect();
+                    views = ViewToggles {
+                        table: v.first() != Some(&'0'),
+                        terminal: v.get(1) != Some(&'0'),
+                        dump: v.get(2) != Some(&'0'),
+                        line: v.get(3) != Some(&'0'),
+                        modbus: v.get(4) == Some(&'1'),
+                    }
+                }
+                Some("chan") if f.len() >= 7 => {
+                    let kind = match f[1] {
+                        "serial" => ChanKind::Serial,
+                        "tcpclient" => ChanKind::TcpClient,
+                        "tcpserver" => ChanKind::TcpServer,
+                        "udp" => ChanKind::Udp,
+                        _ => ChanKind::HookSerial,
+                    };
+                    channels.push(ChannelCfg {
+                        kind,
+                        name: unesc_field(f[2]),
+                        baud: f[3].parse().unwrap_or(9600),
+                        data_bits: f[4].parse().unwrap_or(8),
+                        parity: f[5].parse().unwrap_or(0),
+                        stop_bits: f[6].parse().unwrap_or(1),
+                    });
+                }
+                Some("row") if f.len() >= 7 => {
+                    let seq: u64 = f[1].parse().unwrap_or(0);
+                    let idx: usize = f[2].parse().unwrap_or(0);
+                    let dir_tx = f[3] == "1";
+                    let secs: u64 = f[4].parse().unwrap_or(0);
+                    let millis: u32 = f[5].parse().unwrap_or(0);
+                    let data = protocol::parse_hex(f[6]).unwrap_or_default();
+                    rows_raw.push((seq, idx, dir_tx, secs, millis, data));
+                }
+                // Unknown keys are ignored on purpose: forward compatibility.
+                _ => {}
+            }
+        }
+
+        let mut s = Session::new(name, channels, proto, views);
+        s.display_encoding = encoding;
+        s.running = false; // imported sessions are for browsing only
+        for (seq, idx, dir_tx, secs, millis, data) in rows_raw {
+            // Re-derive the parse from the bytes so the archive needs no parser version.
+            s.push_row_import(seq, idx, dir_tx, secs, millis, data);
+        }
+        Ok(s)
+    }
+
+    /// Insert a row read from an archive, preserving its original sequence number and
+    /// timestamp. Kept separate from `push_row` so importing never re-merges rows that
+    /// were already merged when captured, and never re-bumps live counters.
+    fn push_row_import(
+        &mut self,
+        seq: u64,
+        idx: usize,
+        dir_tx: bool,
+        secs: u64,
+        millis: u32,
+        data: Vec<u8>,
+    ) {
+        let parsed = match self.proto {
+            ProtoType::None => None,
+            ProtoType::Rtu => protocol::parse_rtu(&data, dir_tx),
+            ProtoType::Ascii => protocol::parse_ascii_text(&data, dir_tx),
+            ProtoType::Tcp => protocol::parse_mbap(&data, dir_tx).map(|(p, _)| p),
+        };
+        let kind = parsed
+            .as_ref()
+            .map(|p| p.kind)
+            .unwrap_or(if dir_tx { FrameKind::Req } else { FrameKind::Resp });
+        self.rows.push(Row {
+            seq,
+            idx,
+            dir_tx,
+            secs,
+            millis,
+            data,
+            parsed,
+            kind,
+            merged: true,
+            origin: RowOrigin::Channel,
+            control: None,
+        });
+        self.seq = self.seq.max(seq);
+    }
+
     pub fn clear(&mut self) {
         self.rows.clear();
         self.selected = None;
@@ -1167,4 +1409,154 @@ pub fn seed_demo(sess: &mut Session) {
         sess.rate.push((now2.0 - 60 + i, rx, (i * 13) % 20));
     }
     sess.running = true;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_path(tag: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "umses_test_{tag}_{}_{}.umses",
+            std::process::id(),
+            now_wall().0
+        ));
+        p
+    }
+
+    fn sample_session() -> Session {
+        let views = ViewToggles { table: true, terminal: true, dump: true, line: true, modbus: true };
+        let mut s = Session::new(
+            "测试 会话\twith tab".into(),
+            vec![
+                ChannelCfg {
+                    kind: ChanKind::HookSerial,
+                    name: "COM6".into(),
+                    baud: 0,
+                    data_bits: 8,
+                    parity: 0,
+                    stop_bits: 1,
+                },
+                ChannelCfg {
+                    kind: ChanKind::TcpClient,
+                    name: "127.0.0.1:502".into(),
+                    baud: 9600,
+                    data_bits: 8,
+                    parity: 1,
+                    stop_bits: 2,
+                },
+            ],
+            ProtoType::Rtu,
+            views,
+        );
+        s.display_encoding = DisplayEncoding::Gbk;
+        s.ingest(0, protocol::append_crc(&[0x01, 0x03, 0x00, 0x6B, 0x00, 0x03]), 1_700_000_000, 5, true);
+        s.ingest(0, protocol::append_crc(&[0x01, 0x03, 0x06, 0x02, 0x2B, 0x00, 0x00, 0x00, 0x64]), 1_700_000_001, 7, false);
+        // GBK "中文" as a raw payload, to prove bytes survive the roundtrip.
+        s.ingest(1, vec![0xD6, 0xD0, 0xCE, 0xC4], 1_700_000_002, 9, false);
+        s
+    }
+
+    #[test]
+    fn archive_roundtrip_preserves_rows_and_settings() {
+        let s = sample_session();
+        let path = temp_path("roundtrip");
+        s.save_archive(path.to_str().unwrap()).expect("save");
+
+        let l = Session::load_archive(path.to_str().unwrap()).expect("load");
+        assert_eq!(l.name, s.name);
+        assert_eq!(l.proto, s.proto);
+        assert_eq!(l.display_encoding, s.display_encoding);
+        assert_eq!(l.channels.len(), s.channels.len());
+        assert_eq!(l.channels[1].name, "127.0.0.1:502");
+        assert_eq!(l.channels[1].parity, 1);
+        assert_eq!(l.rows.len(), s.rows.len());
+        for (a, b) in l.rows.iter().zip(s.rows.iter()) {
+            assert_eq!(a.data, b.data, "payload must survive as bytes");
+            assert_eq!(a.seq, b.seq);
+            assert_eq!(a.secs, b.secs);
+            assert_eq!(a.millis, b.millis);
+            assert_eq!(a.dir_tx, b.dir_tx);
+            assert_eq!(a.idx, b.idx);
+        }
+        // Loaded sessions are for browsing: never running, never re-merged.
+        assert!(!l.running);
+        // Parsed frames are re-derived from bytes, so they must still be present.
+        assert!(l.rows.iter().any(|r| r.parsed.is_some()));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn archive_rejects_foreign_or_future_files() {
+        let p1 = temp_path("foreign");
+        std::fs::write(&p1, "hello\nworld\n").unwrap();
+        assert!(Session::load_archive(p1.to_str().unwrap()).is_err());
+        let _ = std::fs::remove_file(&p1);
+
+        let p2 = temp_path("future");
+        std::fs::write(&p2, "UMSEX 99\nname\tx\n").unwrap();
+        assert!(Session::load_archive(p2.to_str().unwrap()).is_err());
+        let _ = std::fs::remove_file(&p2);
+    }
+
+    #[test]
+    fn archive_roundtrip_tolerates_tabs_and_backslashes_in_names() {
+        let mut s = sample_session();
+        s.name = "a\\b\tc".into();
+        s.channels[0].name = "CO\\M\t6".into();
+        let path = temp_path("escaping");
+        s.save_archive(path.to_str().unwrap()).expect("save");
+        let l = Session::load_archive(path.to_str().unwrap()).expect("load");
+        assert_eq!(l.name, "a\\b\tc");
+        assert_eq!(l.channels[0].name, "CO\\M\t6");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn pause_semantics_are_honoured_by_rate_buckets() {
+        // bump_rate now stores bytes, not frame counts (the Line view is labelled B/s).
+        let mut s = sample_session();
+        let before = s.current_rate();
+        s.ingest(0, vec![0u8; 10], 1_700_000_100, 0, false);
+        let after = s.current_rate();
+        assert!(
+            after.0 >= before.0 + 10,
+            "RX bucket must grow by the payload size (was {} -> {})",
+            before.0,
+            after.0
+        );
+        let (peak_rx, _) = s.peak_rate();
+        assert!(peak_rx >= 10);
+    }
+
+    #[test]
+    fn filters_search_decoded_text() {
+        // Build the session with the raw (None) protocol so the payload lands as one
+        // row: under Modbus RTU the reassembler would hold a non-frame payload back.
+        let mut s = Session::new(
+            "filter test".into(),
+            vec![ChannelCfg {
+                kind: ChanKind::Serial,
+                name: "COM9".into(),
+                baud: 9600,
+                data_bits: 8,
+                parity: 0,
+                stop_bits: 1,
+            }],
+            ProtoType::None,
+            ViewToggles::default(),
+        );
+        s.merge_ms = 0;
+        s.display_encoding = DisplayEncoding::Gbk;
+        s.ingest(0, vec![0xD6, 0xD0, 0xCE, 0xC4], 100, 0, false); // GBK "中文"
+        assert_eq!(s.rows.len(), 1);
+
+        s.filters.text = "中文".into();
+        s.filters.text_on = true;
+        assert_eq!(s.visible_count(), 1, "GBK payload must be findable as 中文");
+
+        s.display_encoding = DisplayEncoding::Utf8;
+        assert_eq!(s.visible_count(), 0, "same bytes are not 中文 under UTF-8");
+    }
 }
