@@ -150,11 +150,11 @@ pub fn escape_decoded(text: &str, escape: bool) -> String {
             '\n' => s.push_str("\\n"),
             '\t' => s.push_str("\\t"),
             '\u{FFFD}' => {
-                if escape {
-                    s.push_str("\\xFD");
-                } else {
-                    s.push('?');
-                }
+                // This is "the bytes did not decode under the selected encoding", not a
+                // literal 0xFD byte. Emitting `\xFD` (as an earlier version did) was
+                // actively misleading next to the HEX column, so show the standard
+                // replacement glyph instead: it reads as "undecodable" at a glance.
+                s.push('\u{FFFD}');
             }
             c if is_printable(c) => s.push(c),
             c => {
@@ -227,6 +227,17 @@ mod tests {
     fn control_bytes_still_escape() {
         assert_eq!(escape_text(&[0x01, 0x03, b'A', b'\r'], true, DisplayEncoding::Utf8), "\\x01\\x03A\\r");
         assert_eq!(escape_text(&[0x01, 0x03, b'A', b'\r'], false, DisplayEncoding::Utf8), "??A\\r");
+    }
+
+    #[test]
+    fn undecodable_bytes_show_replacement_glyph_not_a_fake_byte() {
+        // 0xFF is not valid UTF-8. The old renderer printed `\xFD` here, which looks
+        // exactly like a real 0xFD byte next to the HEX column.
+        let out = escape_text(&[0xFF], true, DisplayEncoding::Utf8);
+        assert_eq!(out, "\u{FFFD}");
+        assert!(!out.contains("\\xFD"));
+        // Disabling escaping must not change the "this did not decode" signal either.
+        assert_eq!(escape_text(&[0xFF], false, DisplayEncoding::Utf8), "\u{FFFD}");
     }
 
     #[test]
