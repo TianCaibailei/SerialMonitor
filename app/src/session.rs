@@ -921,9 +921,25 @@ impl Session {
         }
         self.bump_rate(secs, dir_tx, row.data.len() as u64);
         self.rows.push(row);
-        if self.rows.len() > 1_000_000 {
-            let drop = self.rows.len() - 1_000_000;
-            self.rows.drain(0..drop);
+        self.enforce_row_limit();
+    }
+
+    /// Keep the row store bounded, dropping in batches.
+    ///
+    /// Both capture paths must use the *same* policy. The driver path used to drain a
+    /// single row per frame (`len - 1_000_000`), which is an O(n) memmove on every new
+    /// frame once the cap is reached — i.e. the busier the capture, the slower the
+    /// monitor. Dropping in a batch amortises that to one memmove per 100k rows.
+    fn enforce_row_limit(&mut self) {
+        const MAX_ROWS: usize = 1_000_000;
+        const KEEP_ROWS: usize = 900_000;
+        if self.rows.len() > MAX_ROWS {
+            let drop = self.rows.len().saturating_sub(KEEP_ROWS);
+            if drop > 0 {
+                self.rows.drain(..drop);
+            }
+            self.selected = None;
+            self.find_pos = 0;
         }
     }
 
@@ -997,6 +1013,25 @@ impl Session {
                         }
                         None => break,
                     }
+                }
+                // A Modbus-ASCII frame is terminated by CRLF, so a peer that never sends
+                // one would grow this buffer without bound and eventually exhaust memory.
+                // A real frame is at most ~2 * 256 + 6 bytes; anything larger cannot
+                // become a valid frame, so flush it as unparsed raw data instead of
+                // holding it forever.
+                const MAX_ASCII_BUF: usize = 64 * 1024;
+                if self
+                    .bufs
+                    .get(&idx)
+                    .is_some_and(|b| b.0.len() > MAX_ASCII_BUF)
+                {
+                    let e = self.bufs.get_mut(&idx).unwrap();
+                    let old = std::mem::take(&mut e.0);
+                    let (os, oms, odir) = (e.1, e.2, e.3);
+                    self.notices.push(format!(
+                        "通道{idx} 的 ASCII 帧超过 {MAX_ASCII_BUF} 字节仍无换行，已作为原始数据输出"
+                    ));
+                    self.push_row(old, idx, odir, os, oms, None);
                 }
             }
             ProtoType::Rtu => {
@@ -1103,12 +1138,7 @@ impl Session {
         self.rows.push(row);
         // grp_CaptureMax default: rbMaxLimit checked, cbb_CaptrueMax ItemIndex=2 of
         // 100000/500000/1000000/2000000/5000000 → 1,000,000 records (original DFM).
-        if self.rows.len() > 1_000_000 {
-            let drop = self.rows.len() - 900_000;
-            self.rows.drain(..drop);
-            self.selected = None;
-            self.find_pos = 0;
-        }
+        self.enforce_row_limit();
     }
 
     /// Record bytes into the per-second rate buckets.
@@ -1775,6 +1805,71 @@ mod tests {
             3,
             "completing the frame emits exactly one row"
         );
+    }
+
+    /// A peer that never sends the CRLF a Modbus-ASCII frame requires must not be able to
+    /// grow the reassembly buffer without bound (that is an out-of-memory path reachable
+    /// from a misbehaving or malicious device).
+    #[test]
+    fn modbus_ascii_buffer_is_capped() {
+        let mut s = plain_session(ProtoType::Ascii);
+        // 70 KiB with no newline: larger than any valid frame and past the 64 KiB cap.
+        let blob = vec![b'A'; 70 * 1024];
+        s.ingest(0, blob, 1000, 0, false);
+
+        let buffered = s.bufs.get(&0).map(|b| b.0.len()).unwrap_or(0);
+        assert!(
+            buffered <= 64 * 1024,
+            "buffer must be flushed at the cap, still holds {buffered} bytes"
+        );
+        assert_eq!(
+            s.rows.len(),
+            1,
+            "the over-long data is emitted as one raw row"
+        );
+        assert!(
+            s.notices.iter().any(|n| n.contains("无换行")),
+            "the user must be told why the data was not parsed"
+        );
+    }
+
+    /// Both capture paths must share one cap policy. The driver path used to drain a
+    /// single row per frame (`len - 1_000_000`), i.e. an O(n) memmove on every arrival
+    /// once the cap was reached — the busier the capture, the slower the monitor.
+    #[test]
+    fn row_limit_drops_in_a_batch_and_resets_view_state() {
+        let mut s = plain_session(ProtoType::None);
+        // Fill just past the cap directly (allocating 1M rows of 4 bytes is cheap enough
+        // to be worth testing the real boundary rather than a scaled-down copy).
+        s.rows = Vec::with_capacity(1_000_002);
+        for i in 0..1_000_001u64 {
+            s.rows.push(Row {
+                seq: i,
+                idx: 0,
+                dir_tx: false,
+                secs: 1,
+                millis: 0,
+                data: vec![0u8; 4],
+                parsed: None,
+                kind: FrameKind::Raw,
+                merged: true,
+                origin: RowOrigin::Channel,
+                control: None,
+            });
+        }
+        s.selected = Some(5);
+        s.find_pos = 7;
+
+        s.enforce_row_limit();
+
+        assert_eq!(
+            s.rows.len(),
+            900_000,
+            "must drop in a batch down to KEEP_ROWS"
+        );
+        assert_eq!(s.rows.last().unwrap().seq, 1_000_000, "newest row survives");
+        assert_eq!(s.selected, None, "selection must be cleared after pruning");
+        assert_eq!(s.find_pos, 0, "search position must be reset after pruning");
     }
 
     #[test]
