@@ -685,13 +685,18 @@ impl Session {
 
     pub fn poll(&mut self) {
         if !self.running {
-            // still drain so paused sessions don't explode the channel
+            // Still drain the channel so a paused session cannot grow it without bound,
+            // but do NOT count what we drop: "暂停中" used to keep incrementing Bytes
+            // (and counted every dropped RX chunk as received), which directly
+            // contradicted the "已暂停" label in the status bar.
             while let Ok(ev) = self.ev_rx.try_recv() {
-                if let Ev::Rx { idx, data, .. } = ev {
-                    self.bytes_rx += data.len() as u64;
-                    let _ = idx;
+                if let Ev::Closed { idx, why } = ev {
+                    self.notices.push(format!("通道{} 关闭: {}", idx, why));
                 }
             }
+            // Drop half-assembled protocol buffers too: replaying them after 恢复 would
+            // emit frames whose pieces were received while paused.
+            self.bufs.clear();
             return;
         }
         let mut n = 0;
@@ -775,21 +780,7 @@ impl Session {
                 autosave_line(&chan, &row, a, self.display_encoding);
             }
         }
-        match self.rate.last_mut() {
-            Some(e) if e.0 == secs => {
-                if dir_tx {
-                    e.2 += 1;
-                } else {
-                    e.1 += 1;
-                }
-            }
-            _ => {
-                self.rate.push((secs, if dir_tx { 0 } else { 1 }, if dir_tx { 1 } else { 0 }));
-                if self.rate.len() > 600 {
-                    self.rate.remove(0);
-                }
-            }
-        }
+        self.bump_rate(secs, dir_tx, row.data.len() as u64);
         self.rows.push(row);
         if self.rows.len() > 1_000_000 {
             let drop = self.rows.len() - 1_000_000;
@@ -951,23 +942,7 @@ impl Session {
                 autosave_line(&chan, &row, a, self.display_encoding);
             }
         }
-        // rate bucket
-        let sec = secs;
-        match self.rate.last_mut() {
-            Some(e) if e.0 == sec => {
-                if dir_tx {
-                    e.2 += 1;
-                } else {
-                    e.1 += 1;
-                }
-            }
-            _ => {
-                self.rate.push((sec, if dir_tx { 0 } else { 1 }, if dir_tx { 1 } else { 0 }));
-                if self.rate.len() > 180 {
-                    self.rate.remove(0);
-                }
-            }
-        }
+        self.bump_rate(secs, dir_tx, row.data.len() as u64);
         self.rows.push(row);
         // grp_CaptureMax default: rbMaxLimit checked, cbb_CaptrueMax ItemIndex=2 of
         // 100000/500000/1000000/2000000/5000000 → 1,000,000 records (original DFM).
@@ -977,6 +952,55 @@ impl Session {
             self.selected = None;
             self.find_pos = 0;
         }
+    }
+
+    /// Record bytes into the per-second rate buckets.
+    ///
+    /// This used to add `1` per row, which made the Line view — labelled "B/s" — plot a
+    /// frame count, and left the status bar with no throughput figure at all. Now each
+    /// bucket carries real bytes so the curve and the status bar agree.
+    fn bump_rate(&mut self, secs: u64, dir_tx: bool, bytes: u64) {
+        match self.rate.last_mut() {
+            Some(e) if e.0 == secs => {
+                if dir_tx {
+                    e.2 += bytes;
+                } else {
+                    e.1 += bytes;
+                }
+            }
+            _ => {
+                self.rate.push((
+                    secs,
+                    if dir_tx { 0 } else { bytes },
+                    if dir_tx { bytes } else { 0 },
+                ));
+                // Keep ~10 minutes of per-second history.
+                if self.rate.len() > 600 {
+                    let drop = self.rate.len() - 600;
+                    self.rate.drain(..drop);
+                }
+            }
+        }
+    }
+
+    /// Bytes per second over the most recent completed second bucket (RX, TX).
+    ///
+    /// The newest bucket is still filling, so it is reported separately as "current";
+    /// using it directly would make the number flicker to 0 at every second boundary.
+    pub fn current_rate(&self) -> (u64, u64) {
+        self.rate.last().map(|e| (e.1, e.2)).unwrap_or((0, 0))
+    }
+
+    /// Peak per-second rate over the retained window (RX, TX).
+    pub fn peak_rate(&self) -> (u64, u64) {
+        self.rate.iter().fold((0u64, 0u64), |(prx, ptx), e| {
+            (prx.max(e.1), ptx.max(e.2))
+        })
+    }
+
+    /// Total bytes for the two directions, regardless of capture path.
+    pub fn totals(&self) -> (u64, u64) {
+        (self.bytes_rx, self.bytes_tx)
     }
 
     pub fn visible_count(&self) -> usize {

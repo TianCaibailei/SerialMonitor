@@ -896,6 +896,11 @@ impl MonitorApp {
             if !self.sessions[sess_idx].port_allowed(&chan_port) {
                 continue;
             }
+            // 暂停门禁：驱动链路同样必须尊重 `running`，否则「暂停监控」只对界面
+            // 生效、数据继续入库并推高 Bytes（见 route_hook_data 的同类说明）。
+            if !self.sessions[sess_idx].running {
+                continue;
+            }
             // The driver now reports Unix milliseconds, which is exactly what fmt_time
             // expects. (An earlier build passed raw FILETIME through here and every row
             // showed 1970-01-01.)
@@ -1240,7 +1245,19 @@ impl MonitorApp {
             if let Some(s) = self.sessions.get(self.active) {
                 ui.label(format!("通道 {}", s.channels.len()));
                 ui.separator();
-                ui.label(format!("Bytes: ↑{} ↓{}", s.bytes_tx, s.bytes_rx));
+                let (tot_rx, tot_tx) = s.totals();
+                ui.label(format!("Bytes: ↑{} ↓{}", tot_tx, tot_rx));
+                ui.separator();
+                // Live throughput: the Line view was the only place claiming "B/s" and it
+                // plotted a frame count, so the status bar had no rate at all.
+                let (cur_rx, cur_tx) = s.current_rate();
+                let (pk_rx, pk_tx) = s.peak_rate();
+                ui.label(
+                    RichText::new(format!("速率 ↑{cur_tx}B/s ↓{cur_rx}B/s"))
+                        .color(C_TX)
+                        .strong(),
+                )
+                .on_hover_text(format!("峰值 ↑{pk_tx}B/s ↓{pk_rx}B/s（最近 10 分钟）"));
                 ui.separator();
                 ui.label(format!("行数 {}", s.visible_count()));
                 ui.separator();
@@ -1626,12 +1643,37 @@ impl MonitorApp {
 
     fn view_line(&mut self, ui: &mut Ui) {
         let Some(s) = self.sessions.get(self.active) else { return };
-        let rx: Vec<[f64; 2]> = s.rate.iter().enumerate().map(|(i, e)| [i as f64, e.1 as f64]).collect();
-        let tx: Vec<[f64; 2]> = s.rate.iter().enumerate().map(|(i, e)| [i as f64, e.2 as f64]).collect();
+        // Build a continuous per-second series ending at "now": gaps (seconds with no
+        // traffic) must show as zero rather than being compressed away, which is what
+        // made the old enumerate()-based x axis misleading.
+        let now = now_wall().0;
+        let window: u64 = 180;
+        let first = now.saturating_sub(window);
+        let mut rx: Vec<[f64; 2]> = Vec::with_capacity(window as usize + 1);
+        let mut tx: Vec<[f64; 2]> = Vec::with_capacity(window as usize + 1);
+        let buckets: std::collections::HashMap<u64, (u64, u64)> =
+            s.rate.iter().map(|e| (e.0, (e.1, e.2))).collect();
+        for sec in first..=now {
+            let (r, t) = buckets.get(&sec).copied().unwrap_or((0, 0));
+            // x = seconds before now, so the curve scrolls leftwards.
+            let x = (sec as f64) - (now as f64);
+            rx.push([x, r as f64]);
+            tx.push([x, t as f64]);
+        }
+        let (_, cur_tx) = s.current_rate();
+        let (_, pk_tx) = s.peak_rate();
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(format!("当前 ↑{cur_tx} B/s")).color(C_TX).strong());
+            ui.label(RichText::new(format!("峰值 ↑{pk_tx} B/s")).weak());
+            ui.separator();
+            ui.label(RichText::new("每点 = 1 秒内实际字节数，空闲秒补 0").weak().small());
+        });
         Plot::new("line_plot")
             .legend(Legend::default())
             .y_axis_label("B/s")
-            .x_axis_label("秒(最近180s)")
+            .x_axis_label("秒(最近 180s，0 = 现在)")
+            .include_x(-(window as f64))
+            .include_x(0.0)
             .show(ui, |plot| {
                 plot.line(Line::new(PlotPoints::from(rx)).name("接收 B/s").color(C_RX));
                 plot.line(Line::new(PlotPoints::from(tx)).name("发送 B/s").color(C_TX));
@@ -2593,20 +2635,24 @@ impl MonitorApp {
         // 这样两条路由分支用的是同一份白名单判断。
         let port = self.hook_ports.get(&(pid, handle)).cloned();
         if let Some(s) = self.sessions.iter_mut().find(|s| s.cap_pid == Some(pid)) {
-            if let Some(&idx) = s.cap_map.get(&handle) {
-                // 端口名取不到时只能放行：没有名字就无从判断，宁可多显示也不要静默丢数据。
-                let allowed = match &port {
-                    Some(p) => s.port_allowed(p),
-                    None => true,
-                };
-                if allowed {
-                    s.ingest(idx, data.clone(), secs, ms, tx);
+            // 暂停门禁：主链路也必须尊重 `running`，否则「暂停监控」对默认的被动监听
+            // 路径完全没有作用（数据照进、Bytes 照涨，而状态栏写着「已暂停」）。
+            if s.running {
+                if let Some(&idx) = s.cap_map.get(&handle) {
+                    // 端口名取不到时只能放行：没有名字就无从判断，宁可多显示也不要静默丢数据。
+                    let allowed = match &port {
+                        Some(p) => s.port_allowed(p),
+                        None => true,
+                    };
+                    if allowed {
+                        s.ingest(idx, data.clone(), secs, ms, tx);
+                    }
                 }
             }
         }
         if let Some(port) = port {
             for s in self.sessions.iter_mut() {
-                if s.cap_pid.is_some() {
+                if s.cap_pid.is_some() || !s.running {
                     continue;
                 }
                 if !s.port_allowed(&port) {
