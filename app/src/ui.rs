@@ -1923,6 +1923,11 @@ impl MonitorApp {
         let mut tb = TableBuilder::new(ui)
             .striped(true)
             .vscroll(true)
+            // Tables default to `Sense::hover()`, so cell responses never report a click.
+            // Without this, `row.response().clicked()` below is always false and NO row
+            // can be selected — which is exactly what happened when row-wide selection
+            // was first attempted.
+            .sense(egui::Sense::click())
             .stick_to_bottom(s.auto_scroll && scroll_idx.is_none());
         if let Some(pos) = scroll_idx {
             tb = tb.scroll_to_row(pos, Some(egui::Align::Center));
@@ -1955,30 +1960,35 @@ impl MonitorApp {
                 for &ri in &vis[start..] {
                     let r = &s.rows[ri];
                     let is_selected = s.selected == Some(ri);
-                    // The whole row is the click target, not just the 序号 cell. Using
-                    // the row's own response also means clicking anywhere in a very wide
-                    // payload column selects the row — which is what users expect from a
-                    // data table.
+                    // Row selection is built from **clickable cells**, one per column.
+                    //
+                    // `TableRow::response()` is the union of its cells' responses, and a
+                    // plain `ui.label` only senses hover — so `row.response().clicked()`
+                    // never fired and row selection was entirely broken. Making every
+                    // cell a `SelectableLabel` (which fills its cell and senses clicks)
+                    // gives a click target across the whole row, including short cells.
                     body.row(20.0, |mut row| {
-                        // Highlight the selected row across its full width.
-                        if is_selected {
-                            row.set_selected(true);
-                        }
+                        let mut hit = false;
                         row.col(|ui| {
-                            // Plain label: a SelectableLabel here would be a second,
-                            // smaller click target inside the row's own.
-                            let label = RichText::new(format!("{}", r.seq));
-                            if is_selected {
-                                ui.strong(label);
-                            } else {
-                                ui.label(label);
-                            }
+                            hit |= ui
+                                .add(SelectableLabel::new(
+                                    is_selected,
+                                    RichText::new(format!("{}", r.seq)),
+                                ))
+                                .clicked();
                         });
                         row.col(|ui| {
-                            ui.monospace(fmt_time(r.secs, r.millis));
+                            hit |= ui
+                                .add(SelectableLabel::new(
+                                    is_selected,
+                                    RichText::new(fmt_time(r.secs, r.millis)).monospace(),
+                                ))
+                                .clicked();
                         });
                         row.col(|ui| {
-                            ui.label(chan_label(s, r.idx));
+                            hit |= ui
+                                .add(SelectableLabel::new(is_selected, chan_label(s, r.idx)))
+                                .clicked();
                         });
                         row.col(|ui| {
                             let (t, c) = if r.dir_tx {
@@ -1986,7 +1996,9 @@ impl MonitorApp {
                             } else {
                                 ("读", C_RX)
                             };
-                            ui.colored_label(c, t);
+                            hit |= ui
+                                .add(SelectableLabel::new(is_selected, RichText::new(t).color(c)))
+                                .clicked();
                         });
                         row.col(|ui| {
                             // For driver-captured serial traffic the "function" column is
@@ -1994,22 +2006,24 @@ impl MonitorApp {
                             // set to Modbus RTU, in which case the parser reports function
                             // 00/"Unknown" for what is really just bytes. Show the actual
                             // meaning — direction and, for control records, the operation.
-                            if let Some(ci) = &r.control {
-                                ui.label(ci.summary());
+                            let text = if let Some(ci) = &r.control {
+                                ci.summary()
                             } else if let Some(p) = &r.parsed {
-                                ui.label(format!(
-                                    "{:02X} {}",
-                                    p.function,
-                                    protocol::fc_name(p.function)
-                                ));
+                                format!("{:02X} {}", p.function, protocol::fc_name(p.function))
                             } else if r.origin == RowOrigin::Driver {
-                                ui.label(if r.dir_tx { "串口写" } else { "串口读" });
+                                (if r.dir_tx { "串口写" } else { "串口读" }).to_string()
                             } else {
-                                ui.label(r.kind.name());
-                            }
+                                r.kind.name().to_string()
+                            };
+                            hit |= ui.add(SelectableLabel::new(is_selected, text)).clicked();
                         });
                         row.col(|ui| {
-                            ui.label(format!("{}", r.data.len()));
+                            hit |= ui
+                                .add(SelectableLabel::new(
+                                    is_selected,
+                                    format!("{}", r.data.len()),
+                                ))
+                                .clicked();
                         });
                         row.col(|ui| {
                             // sub_a893e0 long-payload rule: past 0x400 bytes the original
@@ -2034,7 +2048,12 @@ impl MonitorApp {
                             } else {
                                 C_RX
                             };
-                            ui.monospace(RichText::new(shown).color(color));
+                            hit |= ui
+                                .add(SelectableLabel::new(
+                                    is_selected,
+                                    RichText::new(shown).monospace().color(color),
+                                ))
+                                .clicked();
                         });
                         row.col(|ui| {
                             // Do NOT truncate by a fixed character count. `string_len` is a
@@ -2052,11 +2071,14 @@ impl MonitorApp {
                             } else {
                                 C_RX
                             };
-                            ui.colored_label(color, t);
+                            hit |= ui
+                                .add(SelectableLabel::new(
+                                    is_selected,
+                                    RichText::new(t).color(color),
+                                ))
+                                .clicked();
                         });
-                        // `TableRow::response()` spans the full row width, so a click in
-                        // any column (or the empty space after short content) selects it.
-                        if row.response().clicked() {
+                        if hit {
                             clicked = Some(ri);
                         }
                     });
