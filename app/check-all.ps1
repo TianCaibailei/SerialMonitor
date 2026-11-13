@@ -76,43 +76,11 @@ if ($SkipBuild) {
     cargo build --release --target i686-pc-windows-msvc -p universal_injector_x86
     if ($LASTEXITCODE -ne 0) { Fail "x86 注入器构建失败" }
 
-    function Get-PeMachine([string]$path) {
-        $fs = [System.IO.File]::OpenRead($path)
-        try {
-            $br = [System.IO.BinaryReader]::new($fs)
-            $fs.Position = 0x3C
-            $peOff = $br.ReadInt32()
-            $fs.Position = $peOff
-            if ($br.ReadUInt32() -ne 0x00004550) { throw "不是 PE 文件: $path" }
-            return $br.ReadUInt16()
-        } finally { $fs.Dispose() }
-    }
-    # 用绝对路径：PowerShell 的 Set-Location 不会同步 .NET 的当前目录，
-    # 而 Get-PeMachine 走的是 .NET 文件 API，相对路径会解析到错误的位置。
-    $root = $PSScriptRoot
-    $expect = [ordered]@{
-        'target\release\monitor_hook.dll'                                = 0x8664
-        'target\release\universal_monitor.exe'                           = 0x8664
-        'target\i686-pc-windows-msvc\release\monitor_hook.dll'           = 0x014C
-        'target\i686-pc-windows-msvc\release\universal_injector_x86.exe' = 0x014C
-    }
-    foreach ($k in $expect.Keys) {
-        $full = Join-Path $root $k
-        if (-not (Test-Path $full)) { Fail "缺少产物: $k"; continue }
-        $m = Get-PeMachine $full
-        if ($m -eq $expect[$k]) {
-            Ok ("{0} machine=0x{1:X4}" -f $k, $m)
-        } else {
-            Fail ("{0} machine=0x{1:X4}，期望 0x{2:X4}" -f $k, $m, $expect[$k])
-        }
-    }
+    # 架构校验委托给单独的脚本：CI 与本地必须执行同一份逻辑，
+    # 之前内联副本与 CI 不同步，导致"本地绿、CI 红"。
+    powershell -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'verify-pe-arch.ps1') -AppDir $PSScriptRoot
+    if ($LASTEXITCODE -ne 0) { Fail "PE 架构校验未通过" } else { Ok "产物架构正确" }
 }
-
-# ---------------------------------------------------------------- 5. repo hygiene
-Step "5/5 仓库卫生"
-# 仓库根 = 本脚本所在目录的上一级。用绝对路径，理由同上（.NET 不同步 PowerShell 的 cwd）。
-$repoRoot = Split-Path -Parent $PSScriptRoot
-Set-Location $repoRoot
 
 $docs = @('docs\README.md', 'docs\技术手册.md', 'CHANGELOG.md', 'LICENSE', 'SECURITY.md')
 $docsOk = $true

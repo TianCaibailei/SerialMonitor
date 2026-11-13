@@ -49,6 +49,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: app
+      - name: 记录工具链版本
+        # Lint sets change between Rust releases. Printing the version makes
+        # "passes locally, fails in CI" diagnosable from the log alone.
+        run: rustc --version && cargo --version
       - name: cargo clippy (deny warnings)
         working-directory: app
         # Only production code and unit tests are linted to `-D warnings`.
@@ -57,7 +61,10 @@ jobs:
         # probes (raw PE/registry/handle experiments) rather than shipping code; holding
         # them to production lint standards produces noise with no safety benefit. They
         # are still compiled and run by the `test` job below.
-        run: cargo clippy --workspace --lib --bins -- -D warnings
+        #
+        # `--message-format=short` keeps the log readable when a newer stable toolchain
+        # introduces a lint that did not exist when the code was written.
+        run: cargo clippy --workspace --lib --bins --message-format=short -- -D warnings
 
   test:
     name: 单元测试
@@ -110,40 +117,9 @@ jobs:
           cargo build --release --target i686-pc-windows-msvc -p universal_injector_x86
       - name: 校验 PE 架构（防止 64 位产物覆盖 32 位）
         shell: pwsh
-        run: |
-          # This check is the whole reason the x86 injector is a separate crate: a plain
-          # `cargo build` used to overwrite it with the host-architecture binary, and the
-          # failure surfaced only at runtime as "LoadLibraryW=0x7ffe...".
-          #
-          # Paths: an unqualified `cargo build` writes to target/release (host = x64 here),
-          # while an explicit --target writes to target/<triple>/release.
-          function Get-PeMachine([string]$path) {
-            $fs = [System.IO.File]::OpenRead($path)
-            try {
-              $br = New-Object System.IO.BinaryReader($fs)
-              $fs.Position = 0x3C
-              $peOff = $br.ReadInt32()
-              $fs.Position = $peOff
-              if ($br.ReadUInt32() -ne 0x00004550) { throw "不是 PE 文件: $path" }
-              return $br.ReadUInt16()
-            } finally { $fs.Dispose() }
-          }
-          $expect = [ordered]@{
-            'app\target\release\monitor_hook.dll'                                = 0x8664
-            'app\target\release\universal_monitor.exe'                           = 0x8664
-            'app\target\i686-pc-windows-msvc\release\monitor_hook.dll'           = 0x014C
-            'app\target\i686-pc-windows-msvc\release\universal_injector_x86.exe' = 0x014C
-          }
-          $fail = $false
-          foreach ($k in $expect.Keys) {
-            if (-not (Test-Path $k)) { Write-Error "缺少产物: $k"; $fail = $true; continue }
-            $m = Get-PeMachine $k
-            $ok = ($m -eq $expect[$k])
-            Write-Host ("{0,-68} machine=0x{1:X4} 期望=0x{2:X4} {3}" -f $k, $m, $expect[$k], $(if ($ok) {'OK'} else {'不符'}))
-            if (-not $ok) { $fail = $true }
-          }
-          if ($fail) { exit 1 }
-          Write-Host "PASS: 全部产物架构正确"
+        # The check lives in a script file so CI and local runs execute the exact same
+        # logic; an inline copy drifted from `app/check-all.ps1` and failed only on CI.
+        run: powershell -ExecutionPolicy Bypass -File app/verify-pe-arch.ps1 -AppDir app
 
   docs:
     name: 文档一致性
