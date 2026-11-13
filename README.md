@@ -1,5 +1,9 @@
 # 万能串口监控 · Universal Serial Monitor
 
+[![CI](https://github.com/TianCaibailei/SerialMonitor/actions/workflows/ci.yml/badge.svg)](https://github.com/TianCaibailei/SerialMonitor/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-lightgrey.svg)](#快速开始)
+
 一个 Windows 平台的**串口通信监视工具**。它被动观察其他程序与串口设备之间的字节流，
 完整记录、解析并支持事后回看——**全程不占用串口**，被监视的程序照常独占使用该端口。
 
@@ -127,7 +131,7 @@
 ### 2. 获取与编译
 
 ```powershell
-git clone <仓库地址> MonitorAnything
+git clone https://github.com/TianCaibailei/SerialMonitor.git MonitorAnything
 cd MonitorAnything\app
 cargo build --release
 ```
