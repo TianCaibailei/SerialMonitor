@@ -21,15 +21,36 @@ param(
     [ValidateSet('x64', 'x86', 'all')]
     [string]$Arch = 'all',
     [ValidateSet('win7', 'win10')]
-    [string]$Os = 'win7'
+    [string]$Os = 'win7',
+    # Optional explicit WDK/SDK locations; see the resolution order below.
+    [string]$WdkRoot,
+    [string]$SdkRoot
 )
 $ErrorActionPreference = 'Continue'
 
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 if (-not $Source) { $Source = Join-Path $root 'probe\probe.c' }
 
-$wdkRoot = 'E:\tools\wdk-nuget\extracted'
-$sdkRoot = 'E:\tools\wdk-nuget\sdk-extracted'
+# WDK / SDK locations.
+#
+# Resolution order (first hit wins), so the script works on someone else's machine:
+#   1. explicit parameters:            -WdkRoot <path> -SdkRoot <path>
+#   2. environment variables:          $env:WDK_ROOT / $env:WDK_SDK_ROOT
+#   3. alongside this repository:      <repo>\.wdk\extracted, <repo>\.wdk\sdk-extracted
+#   4. historical local layout:        E:\tools\wdk-nuget\extracted (+ sdk-extracted)
+#
+# See docs/WDK-NUGET-GUIDE.md for how to produce those directories with NuGet.
+function Find-WdkDir([string]$explicit, [string]$envName, [string]$repoRel, [string]$fallback) {
+    if ($explicit) { return $explicit }
+    $fromEnv = [Environment]::GetEnvironmentVariable($envName)
+    if ($fromEnv) { return $fromEnv }
+    $inRepo = Join-Path (Split-Path -Parent $root) $repoRel
+    if (Test-Path $inRepo) { return $inRepo }
+    return $fallback
+}
+
+$wdkRoot = Find-WdkDir $WdkRoot 'WDK_ROOT' '.wdk\extracted' 'E:\tools\wdk-nuget\extracted'
+$sdkRoot = Find-WdkDir $SdkRoot 'WDK_SDK_ROOT' '.wdk\sdk-extracted' 'E:\tools\wdk-nuget\sdk-extracted'
 $ver = '10.0.26100.0'
 
 $incKm = Join-Path $wdkRoot "c\Include\$ver\km"

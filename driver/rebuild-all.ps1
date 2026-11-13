@@ -21,7 +21,17 @@ $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $project = Split-Path -Parent $root
 $app = Join-Path $project 'app'
 $sys = Join-Path $root 'umserialfilter\umserialfilter.sys'
-$signtool = 'C:\Program Files (x86)\Windows Kits\10\bin\10.0.19041.0\x64\signtool.exe'
+# Locate signtool.exe: newest Windows Kits SDK wins. Hard-coding one SDK version
+# breaks on any machine that has a different SDK installed.
+$signtool = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin' -Directory -ErrorAction SilentlyContinue |
+    Sort-Object Name -Descending |
+    ForEach-Object { Join-Path $_.FullName 'x64\signtool.exe' } |
+    Where-Object { Test-Path $_ } |
+    Select-Object -First 1
+if (-not $signtool) {
+    $cmd = Get-Command signtool.exe -ErrorAction SilentlyContinue
+    if ($cmd) { $signtool = $cmd.Source }
+}
 $thumb = '89504FECC3504FB928B20D7034A82BF91F71423A'
 $readerDir = Join-Path $root 'umfilter_reader'
 $serviceName = 'UmSerialFilter'

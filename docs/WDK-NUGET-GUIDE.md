@@ -1,154 +1,136 @@
-# WDK NuGet 方式安装与驱动开发指南
+# 驱动编译环境（WDK）
 
-> 本机已验证：驱动编译成功（`probe.sys`，x64 NATIVE）· 2026-11-10
+本项目的内核过滤驱动用 **NuGet 包 + 独立编译脚本** 的方式构建，不依赖完整安装
+WDK MSI，也不要求 Visual Studio 的 WDK 集成。
 
-## 一、为什么用 NuGet 而不是官方安装器
-
-| 方式 | 实测结果 |
-|---|---|
-| `wdksetup.exe` 静默安装 | ❌ 反复卡死/退出码 -1（下载器链路抖动即放弃） |
-| `winget install Microsoft.Windows.WDK.10.0.26100` | ❌ 同样失败（底层还是 wdksetup） |
-| **NuGet 包** | ✅ **105.7 MB / 4 秒下载，编译成功** |
-
-原因：WDK 安装器并发下载 ~20 个 payload，任一个卡住就整体失败；
-而 NuGet 是单文件直连，速度可达 **20-25 MB/s**。
+本文说明这样做的原因、如何组织这套环境，以及另有哪条路线可供参考。
 
 ---
 
-## 二、方案 A：完全不用 VS 集成（已在本机跑通，最快）
+## 一、为什么选 NuGet 路线
 
-我已把两个 NuGet 包下载并解压到 E 盘：
+WDK 官方安装器（`wdksetup.exe`、`winget install Microsoft.Windows.WDK.*`）会并发下载
+约二十个 payload，任意一个网络抖动就会导致整体失败并回滚——在国内网络环境下这个
+失败率相当高，且失败后很难定位是哪一个包的问题。
 
-```
-E:\tools\wdk-nuget\extracted\        ← WDK (105.7 MB)
-    c\Include\10.0.26100.0\km\       ntddk.h, wdm.h, ntstrsafe.h...
-    c\Include\10.0.26100.0\shared\   ntdef.h, ntddser.h(部分)...
-    c\Lib\10.0.26100.0\km\x64\       ntoskrnl.lib, hal.lib, wmilib.lib, sercx\...
-E:\tools\wdk-nuget\sdk-extracted\    ← SDK C++ (49.8 MB)
-    c\ucrt\, c\um\, c\shared\        CRT 与用户态头文件
-```
+NuGet 包则是一个单独的 `.nupkg` 文件直连下载，可以断点续传、可以校验大小，
+解压即得头文件与库。本项目采用这条路线。
 
-**直接用这个脚本编译驱动**：
+| 路线 | 特点 | 适用 |
+|---|---|---|
+| **NuGet 包（本项目采用）** | 单文件下载、解压即用、无需 MSI | 只想编译驱动，不装完整 WDK |
+| WDK MSI / winget | 官方标准、含 WDK 集成工具与调试器 | 需要完整开发环境（WinDbg、驱动模板等） |
+| Visual Studio + WDK 扩展 | IDE 集成、图形化构建 | 长期做驱动开发、需要调试集成 |
+
+后两条路线本项目**没有实践**，仅在此列出供参考。若你已经在 VS 中配置好 WDK，
+可以直接用 MSBuild 编译 `driver/umserialfilter/umserialfilter.vcxproj`（如有）
+或自行调用 `cl.exe`，不必使用下文的脚本。
+
+---
+
+## 二、组织编译环境
+
+### 1. 下载两个 NuGet 包
+
+需要的包（版本可自选，本项目使用 `10.0.26100.0`）：
+
+- `Microsoft.Windows.WDK.x64`（或 `.arm64`）— 内核头文件与库
+- `Microsoft.Windows.SDK.CPP` — 用户态 CRT 与共享头文件
+
+从 [nuget.org](https://www.nuget.org/) 下载，或使用命令行：
 
 ```powershell
-cd E:\Documents\MonitorAnything\MonitorAnything\driver
-powershell -File build-driver.ps1 -Source probe\probe.c
+# 以任意目录为工作区
+$dir = 'C:\wdk-nuget'
+New-Item -ItemType Directory -Force $dir | Out-Null
+cd $dir
+
+Invoke-WebRequest -Uri 'https://www.nuget.org/api/v2/package/Microsoft.Windows.WDK.x64/10.0.26100.0' -OutFile 'wdk.nupkg'
+Invoke-WebRequest -Uri 'https://www.nuget.org/api/v2/package/Microsoft.Windows.SDK.CPP/10.0.26100.0' -OutFile 'sdk.nupkg'
 ```
 
-已验证输出：
-```
-PASS: 驱动编译成功 probe.sys (5,120 字节)
-PE 机器 = 0x8664 (x64)   子系统 = 1 (NATIVE)
+> `.nupkg` 就是 zip。把扩展名改成 `.zip` 解压，或用 `Expand-Archive`。
+
+### 2. 解压到约定目录
+
+```powershell
+Expand-Archive wdk.nupkg -DestinationPath extracted
+Expand-Archive sdk.nupkg -DestinationPath sdk-extracted
 ```
 
-**不需要装 WDK MSI，也不需要 VS 驱动工作负载。**
+解压后的结构大致为：
+
+```
+extracted\
+  c\Include\10.0.26100.0\km\        ntddk.h, wdm.h, ntstrsafe.h ...
+  c\Include\10.0.26100.0\shared\    ntdef.h, ntddser.h ...
+  c\Lib\10.0.26100.0\km\x64\        ntoskrnl.lib, hal.lib, wdmsec.lib ...
+sdk-extracted\
+  c\ucrt\  c\um\  c\shared\         CRT 与用户态头文件
+```
+
+### 3. 告诉构建脚本去哪里找
+
+`driver/build-driver.ps1` 按以下顺序解析路径，**第一个命中者生效**：
+
+| 顺序 | 位置 | 说明 |
+|---|---|---|
+| 1 | `-WdkRoot <path> -SdkRoot <path>` | 命令行参数，最明确 |
+| 2 | 环境变量 `WDK_ROOT` / `WDK_SDK_ROOT` | 适合固定在机器上 |
+| 3 | `<仓库>\.wdk\extracted` / `<仓库>\.wdk\sdk-extracted` | 随仓库放置，便于多人协作 |
+| 4 | `E:\tools\wdk-nuget\...` | 早期本地布局，仅为兼容保留 |
+
+推荐用环境变量，一次配置长期有效：
+
+```powershell
+setx WDK_ROOT     "C:\wdk-nuget\extracted"
+setx WDK_SDK_ROOT "C:\wdk-nuget\sdk-extracted"
+# 新开的终端才生效
+```
+
+### 4. 还需要 Visual Studio C++ 工具链
+
+脚本通过 `vswhere.exe` 定位已安装的 VS，调用对应的 `vcvars64.bat` / `vcvars32.bat`
+来获得 `cl.exe` 与链接器。只需安装 **“使用 C++ 的桌面开发”** 工作负载，
+不需要 WDK 扩展。
 
 ---
 
-## 三、方案 B：用 VS 2022 + NuGet（你提到的方式）
+## 三、编译
 
-按微软文档，这个流程需要 **VS 2026**。你的是 **VS 2022 (17.14)**，
-26100 的 NuGet 包在 VS 2022 上**未经官方验证**，但可以尝试：
+```powershell
+cd MonitorAnything\driver
 
-### 步骤
+# x64 + x86，Windows 7 作为 API 下限
+powershell -ExecutionPolicy Bypass -File build-driver.ps1
 
-1. **安装 VS 工作负载**（VS Installer → 修改）
-   - 勾选 **"使用 C++ 的桌面开发"**
-   - 在"单个组件"中搜索并勾选（搜索框输入 `64 latest` 快速定位）：
-     - `C++ Spectre-mitigated libraries for x64/x86 (Latest MSVC)`
-     - `C++ ATL with Spectre mitigations for x64/x86 (Latest MSVC)`
-   - 也可勾选 **"Windows 驱动程序开发"** 工作负载（如果可见）
+# 只编 x64
+powershell -ExecutionPolicy Bypass -File build-driver.ps1 -Arch x64
 
-2. **创建驱动项目**
-   - VS → 新建项目 → 搜索 `Kernel Mode Driver (KMDF)`
-   - 如果没有该模板，说明 WDK MSI 未安装，模板不可用 → **建议直接用方案 A**
+# 以 Windows 10 为下限（可用更新的 API，但无法在 Win7 上加载）
+powershell -ExecutionPolicy Bypass -File build-driver.ps1 -Os win10
+```
 
-3. **添加 NuGet 包**
-   - 右键解决方案 → **管理 NuGet 程序包**
-   - 包源选 `nuget.org`
-   - 搜索 `WDK`，安装 **`Microsoft.Windows.WDK.x64`** 版本 `10.0.26100.6584`
-   - 它会自动带上依赖 `Microsoft.Windows.SDK.cpp.x64`
+产物：`driver/umserialfilter/umserialfilter.sys`（或 `_x64.sys`）。
 
-4. **编译**
-   - 重新生成解决方案，输出 `.sys`
+### 关于操作系统下限
 
-### 注意事项
+`NTDDI_VERSION` / `WIN32_WINNT` 决定头文件暴露哪些 API。本项目默认以 Windows 7 SP1
+为下限，这样同一个二进制在 Win7 到 Win11 上都能加载。如果你只面向 Win10+，
+用 `-Os win10` 可以选择更新实现细节。
 
-- **NuGet 方式不提供 VS 项目模板**，需要 `WDK MSI` 才有 `Kernel Mode Driver (KMDF)` 模板
-- 若模板缺失，可以手工建 C++ 空项目 + 添加 NuGet 包 + 手动设置编译选项
-  （编译选项见下节）
-- `dotnet` 命令行方式不适用于 WDK
+### 关于 x86 内核库
+
+NuGet 的 WDK 包**只包含 x64 内核库**，没有 x86 的 `ntoskrnl.lib`。脚本检测到缺失时
+会明确提示并跳过 x86，不会产出坏文件。若确实需要 32 位驱动，请改用完整 WDK MSI。
+
+> 32 位**用户态**产物（钩子与注入器）不受此限制，用 `app/build-all.ps1`
+> 交叉编译即可，与驱动无关。
 
 ---
 
-## 四、已调通的编译参数（可直接复用）
+## 四、装好之后
 
-### 编译（cl.exe）
-
-```
-/nologo /c /kernel /GS- /Gz /Zp8 /W4 /WX-
-/D_WIN64 /D_AMD64_ /D_M_AMD64=100
-/DNTDDI_VERSION=0x0A00000C /D_WIN32_WINNT=0x0A00
-/I <wdk>\c\Include\10.0.26100.0\km
-/I <wdk>\c\Include\10.0.26100.0\shared
-/I <sdk>\c\ucrt /I <sdk>\c\um /I <sdk>\c\shared
-```
-
-**关键点**：
-- `_AMD64_` 和 `_M_AMD64=100` **必须定义**，否则 `ntdef.h` 报
-  `#error "No Target Architecture"`
-- `/kernel` 选择内核代码生成；`/GS-` 禁用栈保护（内核无 CRT）
-
-### 链接（link.exe）
-
-```
-/nologo /DRIVER /SUBSYSTEM:NATIVE /ENTRY:GsDriverEntry /MACHINE:X64
-/OUT:xxx.sys
-/LIBPATH:<wdk>\c\Lib\10.0.26100.0\km\x64
-ntoskrnl.lib hal.lib wmilib.lib BufferOverflowK.lib ntstrsafe.lib
-```
-
-`GsDriverEntry` 由 `BufferOverflowK.lib` 提供，它会调用你的 `DriverEntry`。
-
----
-
-## 五、驱动加载（下一步，需要你操作）
-
-编译出 `.sys` 只是第一步。**加载驱动需要**：
-
-1. **开启测试签名**（管理员 PowerShell）
-   ```powershell
-   bcdedit /set testsigning on
-   ```
-   **然后重启电脑**
-
-2. **创建服务并启动**（管理员 PowerShell）
-   ```powershell
-   sc create UmSerialFilter type= kernel binPath= "E:\...\driver.sys"
-   sc start UmSerialFilter
-   ```
-
-3. 验证
-   ```powershell
-   sc query UmSerialFilter
-   ```
-
-> ⚠️ 未签名的驱动无法在默认配置的 Windows 11 上加载（会报
-> `577 签名验证失败`）。测试签名模式是开发阶段的唯一选择。
-
----
-
-## 六、当前进度与建议
-
-| 项目 | 状态 |
-|---|---|
-| WDK 头文件/库 | ✅ 已就绪（NuGet，E 盘） |
-| 驱动编译工具链 | ✅ 已验证（probe.sys 编译成功） |
-| 串口过滤驱动本体 | ⏳ 待开发 |
-| 测试签名 | ❌ 未开启（需你操作 + 重启） |
-| 驱动加载 | ❌ 待测试签名后 |
-
-**建议顺序**：
-1. 你先决定：**开测试签名**（需重启）还是**继续用用户态方案**
-2. 若开测试签名，我可以立即开发串口过滤驱动并用 `sc create` 加载测试
-3. 若暂不开，当前用户态方案已可用（先附加再打开串口）
+编译只是第一步。驱动还需要签名与安装才能加载，且需要测试签名环境
+（关闭安全启动、开启测试模式）。完整流程见
+[安装与签名指南.md](安装与签名指南.md)。
