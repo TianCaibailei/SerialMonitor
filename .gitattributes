@@ -1,0 +1,25 @@
+# Normalize line endings so a checkout on any machine produces the same files.
+#
+# Rust and Markdown are text; the driver sources are too. Without this, a Windows
+# checkout converts everything to CRLF and every commit shows spurious whole-file diffs.
+* text=auto eol=lf
+
+# Scripts stay LF: PowerShell (5.1 and 7.x) parses LF-only .ps1 files correctly, and
+# keeping one convention avoids whole-file diffs whenever someone edits on a different OS.
+*.ps1 text eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binary assets: never touch them.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.ico binary
+*.sys binary
+*.dll binary
+*.exe binary
+*.pfx binary
+*.cer binary
+
+# Keep the changelog and licence as-is for tooling that reads them.
+CHANGELOG.md merge=union
