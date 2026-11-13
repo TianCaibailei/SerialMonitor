@@ -107,18 +107,20 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: app
-      - name: 构建主程序与 64 位 hook
+      - name: 构建全部产物
         working-directory: app
-        run: cargo build --release
-      - name: 构建 32 位 hook 与注入器
-        working-directory: app
-        run: |
-          cargo build --release --target i686-pc-windows-msvc -p monitor_hook
-          cargo build --release --target i686-pc-windows-msvc -p universal_injector_x86
-      - name: 校验 PE 架构（防止 64 位产物覆盖 32 位）
         shell: pwsh
-        # The check lives in a script file so CI and local runs execute the exact same
-        # logic; an inline copy drifted from `app/check-all.ps1` and failed only on CI.
+        # Use the project's own script instead of hand-written cargo commands.
+        #
+        # build-all.ps1 does two things the naive command sequence misses:
+        #   1. it cross-compiles the 32-bit hook and injector to target/<triple>/release, then
+        #   2. it copies them into target/release under their deployed names
+        #      (monitor_hook_x86.dll, universal_injector_x86.exe).
+        # Without step 2, target/release/universal_injector_x86.exe is the HOST (x64)
+        # build — which is exactly the trap the script exists to prevent.
+        run: powershell -ExecutionPolicy Bypass -File build-all.ps1
+      - name: 校验 PE 架构
+        shell: pwsh
         run: powershell -ExecutionPolicy Bypass -File app/verify-pe-arch.ps1 -AppDir app
 
   docs:

@@ -20,7 +20,9 @@ Write-Output '=== 2. 构建 32 位 hook DLL ==='
 if ($LASTEXITCODE -ne 0) { throw "32 位 hook 构建失败" }
 
 Write-Output '=== 3. 构建 32 位注入器 ==='
-& cargo build --release --bin universal_injector_x86 --target i686-pc-windows-msvc 2>$null | Out-Null
+# The injector lives in its own crate (so the host build cannot overwrite it), which
+# means it must be selected with -p; `--bin` would not resolve inside the root package.
+& cargo build --release -p universal_injector_x86 --target i686-pc-windows-msvc 2>$null | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "32 位注入器构建失败" }
 
 Write-Output '=== 4. 部署正确的架构文件 ==='

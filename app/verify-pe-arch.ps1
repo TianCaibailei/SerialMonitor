@@ -57,6 +57,22 @@ $expectations = @(
 
 $failures = 0
 Write-Output "Verifying: $AppDir"
+Write-Output "  OS: $([System.Environment]::OSVersion.VersionString)"
+Write-Output "  PS: $($PSVersionTable.PSVersion)"
+Write-Output "  CWD: $(Get-Location)"
+Write-Output ''
+
+# Diagnostics: when a file is missing, show what IS under target/ so a CI-only path
+# mismatch is diagnosable from the log alone (the runner has no interactive access).
+$releaseDir = Join-Path $AppDir 'target\release'
+if (Test-Path $releaseDir) {
+    $found = Get-ChildItem $releaseDir -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Extension -in '.exe', '.dll' } |
+        Select-Object -ExpandProperty Name
+    Write-Output ("  target\release contains: " + ($(if ($found) { $found -join ', ' } else { '(no exe/dll)' })))
+} else {
+    Write-Output '  target\release does NOT exist'
+}
 Write-Output ''
 
 foreach ($e in $expectations) {
