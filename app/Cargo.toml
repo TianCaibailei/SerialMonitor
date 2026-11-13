@@ -11,12 +11,13 @@ egui_plot = "0.28"
 serialport = "4.2"
 encoding_rs = "0.8"
 rfd = "0.17"
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
 
 [profile.release]
 opt-level = 2
 # The injected hook DLL must not depend on dbghelp.dll (Rust's default backtrace
 # support pulls it in). dbghelp is present system-wide, but a 32-bit target can resolve
-# it only through SysWOW64, and a failed load there makes LoadLibrary return NULL 閳?# measured as the reason 32-bit injection failed. abort keeps the DLL dependency-free.
+# it only through SysWOW64, and a failed load there makes LoadLibrary return NULL 闁?# measured as the reason 32-bit injection failed. abort keeps the DLL dependency-free.
 panic = "abort"
 
 [workspace]
@@ -26,8 +27,8 @@ members = ["hook", "x86_injector"]
 #
 # CI runs `cargo clippy -- -D warnings`, so anything not allowed here fails the build.
 # The allows below are **style-only** suggestions that conflict with this codebase's
-# established idioms around FFI and packet layouts. Everything else 閳?real bugs,
-# suspicious casts, error-handling mistakes 閳?still fails the gate.
+# established idioms around FFI and packet layouts. Everything else 闁?real bugs,
+# suspicious casts, error-handling mistakes 闁?still fails the gate.
 #
 # Do not add an allow to silence a genuine problem; fix the code instead.
 [workspace.lints.clippy]

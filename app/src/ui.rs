@@ -249,6 +249,10 @@ pub struct MonitorApp {
     pub pending_clipboard: Option<String>,
     /// Path of the most recent successful export (shown in the status toast).
     pub last_saved_path: Option<String>,
+    /// 微信二维码纹理（编译期嵌入，首次打开「关于」窗口时解码并缓存）。
+    pub about_qr: Option<egui::TextureHandle>,
+    /// 是否已尝试解码二维码，避免每帧重试。
+    pub about_qr_tried: bool,
 }
 
 fn b(v: bool) -> &'static str {
@@ -277,6 +281,22 @@ fn json_str(s: &str) -> String {
     }
     out.push('"');
     out
+}
+
+/// 微信二维码，编译期嵌入到可执行文件里。
+///
+/// 用 `include_bytes!` 而不是运行时读文件：程序被拷到任意目录（甚至 U 盘）都能显示
+/// 二维码，也不会出现「找不到 wechat_logo.jpg」这种退化。代价只是 exe 大 ~100 KB。
+static WECHAT_QR_JPG: &[u8] = include_bytes!("../assets/wechat_logo.jpg");
+
+/// 把嵌入的 JPEG 解码成 egui 纹理（只在打开「关于」窗口时做一次）。
+fn load_wechat_qr(ctx: &egui::Context) -> Option<egui::TextureHandle> {
+    let img = image::load_from_memory_with_format(WECHAT_QR_JPG, image::ImageFormat::Jpeg)
+        .ok()?
+        .to_rgba8();
+    let (w, h) = img.dimensions();
+    let color = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], img.as_raw());
+    Some(ctx.load_texture("wechat_qr", color, egui::TextureOptions::LINEAR))
 }
 
 /// Pick a session name that does not collide with any existing one.
@@ -519,6 +539,8 @@ impl MonitorApp {
             dlg_confirm_exit: false,
             pending_clipboard: None,
             last_saved_path: None,
+            about_qr: None,
+            about_qr_tried: false,
         };
         app.load_cfg();
         if screenshot.is_some() {
@@ -561,6 +583,11 @@ impl MonitorApp {
             // 的排版（这是现在唯一的端口过滤入口，两条捕获路径共用）。
             if std::env::var("UM_SHOW_FILTER").is_ok() {
                 app.dlg_filter = true;
+            }
+            // UM_SHOW_ABOUT 用于截图验证「关于」窗口（内容较密，需要目视确认排版
+            // 与二维码是否正常渲染）。
+            if std::env::var("UM_SHOW_ABOUT").is_ok() {
+                app.dlg_about = true;
             }
         }
         app
@@ -1325,7 +1352,133 @@ impl MonitorApp {
         }
     }
 
-    /// Save the active session as a reopenable archive.
+    /// 「关于」窗口内容。
+    ///
+    /// 描述必须与软件实际能力一致：这是一个**串口**监视工具，不提供 TCP/UDP 抓包
+    /// （通道类型里有 TCP/UDP 是为了观察自带网口的串口设备服务器，但本程序不做网络
+    /// 嗅探）。抓取方式有注入与内核驱动两条，用户按环境选择。
+    fn dlg_about_ui(&mut self, ui: &mut Ui) {
+        ui.vertical_centered(|ui| {
+            ui.add_space(4.0);
+            ui.heading("万能串口监控");
+            ui.label(RichText::new("版本 1.0.0").weak());
+        });
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(6.0);
+
+        ui.label(RichText::new("功能定位").strong());
+        ui.label("串口通信监视工具：被动观察串口收发，不占用端口、不干扰业务程序。");
+        ui.label(
+            RichText::new(
+                "说明：本软件针对串口监视设计，不提供 TCP/UDP 网络抓包能力。\
+                 通道类型中的 TCP/UDP 仅用于对接自带网口的串口服务器，不是网络嗅探器。",
+            )
+            .small(),
+        );
+
+        ui.add_space(6.0);
+        ui.label(RichText::new("两种抓取方式（按需选择）").strong());
+        egui::Grid::new("about_modes")
+            .num_columns(2)
+            .spacing([10.0, 4.0])
+            .show(ui, |ui| {
+                ui.label(RichText::new("注入模式").strong());
+                ui.label(
+                    "向使用串口的程序注入钩子，无需管理员权限。\
+                     覆盖被注入的那个进程，零配置即开即用。",
+                );
+                ui.end_row();
+                ui.label(RichText::new("驱动模式").strong());
+                ui.label(
+                    "内核过滤驱动镜像 IRP，覆盖全系统所有进程。\
+                     需要管理员权限与测试签名，装一次即可长期使用。",
+                );
+                ui.end_row();
+            });
+        ui.label(
+            RichText::new("两种方式都不打开串口设备，因此业务程序仍独占该端口。")
+                .small()
+                .weak(),
+        );
+
+        ui.add_space(6.0);
+        ui.label(RichText::new("功能一览").strong());
+        for line in [
+            "五种视图：Table / 终端 / Dump / Line 曲线 / Modbus 解析",
+            "Modbus RTU / ASCII / TCP 帧解析，CRC / LRC 校验",
+            "显示编码：UTF-8 / GBK / UTF-16LE，支持中文内容与检索",
+            "会话存档（.umses）可保存并重新打开回看",
+            "导出日志、项目信息（JSON）、复制为 CSV",
+        ] {
+            ui.label(format!("· {line}"));
+        }
+
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(6.0);
+
+        ui.label(RichText::new("作者：杨利军").strong());
+        ui.label("版权所有 © 2026 杨利军，保留所有权利。");
+        ui.horizontal(|ui| {
+            ui.label("联系方式：");
+            ui.hyperlink_to("ylj135cool@163.com", "mailto:ylj135cool@163.com");
+        });
+        ui.label(
+            RichText::new("原创实现，不含任何第三方程序的代码、图标或品牌资源。")
+                .small()
+                .weak(),
+        );
+
+        ui.add_space(8.0);
+        // 微信二维码：懒加载一次，找不到文件时给出可操作的提示而不是留一片空白。
+        if self.about_qr.is_none() && !self.about_qr_tried {
+            self.about_qr_tried = true;
+            // 二维码是编译期嵌入的资源，解码只做一次并缓存成纹理。
+            self.about_qr = load_wechat_qr(ui.ctx());
+        }
+        match &self.about_qr {
+            Some(tex) => {
+                ui.vertical_centered(|ui| {
+                    ui.label(RichText::new("微信：ylj135cool（扫码添加）").strong());
+                    ui.add_space(4.0);
+                    ui.add(
+                        egui::Image::new(egui::load::SizedTexture::new(
+                            tex,
+                            egui::vec2(150.0, 150.0),
+                        ))
+                        .fit_to_exact_size(egui::vec2(150.0, 150.0))
+                        .rounding(4.0),
+                    );
+                });
+            }
+            None => {
+                // 图片是编译期嵌入的，走到这里说明解码失败（极不可能），
+                // 因此不应该再提示用户「去找文件」。
+                ui.label(
+                    RichText::new("（二维码图片解码失败，请联系作者获取）")
+                        .small()
+                        .weak(),
+                );
+            }
+        }
+
+        ui.add_space(10.0);
+        ui.separator();
+        ui.horizontal(|ui| {
+            if ui.button("关闭").clicked() {
+                self.dlg_about = false;
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("复制邮箱").clicked() {
+                    self.pending_clipboard = Some("ylj135cool@163.com".to_string());
+                    self.toast("邮箱已复制到剪贴板");
+                }
+            });
+        });
+    }
+
+    /// Save the active session as a reopenable archive (asks the user where first).
     fn save_archive_active(&mut self) {
         let Some(bytes) = self
             .sessions
@@ -2922,13 +3075,10 @@ impl MonitorApp {
             Window::new("关于")
                 .collapsible(false)
                 .resizable(false)
+                .default_width(420.0)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
-                    ui.heading("万能串口监控 v1.0");
-                    ui.separator();
-                    ui.label("串口 / TCP / UDP / Modbus 通信监控");
-                    ui.label("五视图: Table / 终端 / Dump / Line曲线 / Modbus");
-                    ui.label("内置 23 请求 + 43 响应 Modbus 预设");
-                    ui.label("原创实现，不含任何第三方程序的品牌资源");
+                    self.dlg_about_ui(ui);
                 });
         }
         if self.dlg_attach {
