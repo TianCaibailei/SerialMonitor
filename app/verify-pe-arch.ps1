@@ -56,6 +56,7 @@ $expectations = @(
 )
 
 $failures = 0
+$report = @()
 Write-Output "Verifying: $AppDir"
 Write-Output "  OS: $([System.Environment]::OSVersion.VersionString)"
 Write-Output "  PS: $($PSVersionTable.PSVersion)"
@@ -77,6 +78,7 @@ Write-Output ''
 
 foreach ($e in $expectations) {
     $full = Join-Path $AppDir $e.Path
+    Write-Output ("  probing {0}" -f $full)
     if (-not (Test-Path $full)) {
         if ($e.Optional) {
             Write-Output ("  SKIP  {0,-58} (not built)" -f $e.Path)
@@ -94,7 +96,9 @@ foreach ($e in $expectations) {
             $verdict = 'FAIL'
             $failures++
         }
-        Write-Output ("  {0}  {1,-58} machine=0x{2:X4} expected=0x{3:X4}  {4}" -f $verdict, $e.Path, $machine, $e.Machine, $e.Note)
+        $line = ("  {0}  {1,-58} machine=0x{2:X4} expected=0x{3:X4}  {4}" -f $verdict, $e.Path, $machine, $e.Machine, $e.Note)
+        Write-Output $line
+        if ($verdict.Trim() -eq 'FAIL') { $report += "${($e.Path)}:0x$('{0:X4}' -f $machine)!=0x$('{0:X4}' -f $e.Machine)" }
     } catch {
         Write-Output ("  FAIL  {0,-58} {1}" -f $e.Path, $_.Exception.Message)
         $failures++
@@ -105,6 +109,15 @@ Write-Output ''
 if ($failures -eq 0) {
     Write-Output 'PASS: all binaries have the expected architecture'
     exit 0
+}
+
+# Surface the verdict where CI can read it without downloading logs:
+# GitHub renders `::error::` lines as check annotations, which are readable through the
+# public annotations API even when the full log requires authentication.
+$summary = "PE arch check failed ($failures): see the listing above"
+if ($env:GITHUB_ACTIONS -eq 'true') {
+    $details = ($report -join ' | ')
+    Write-Output "::error title=PE arch mismatch::$summary -- $details"
 }
 Write-Output "FAIL: $failures mismatch(es)"
 exit 1

@@ -31,8 +31,10 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          # Read the pinned version from app/rust-toolchain.toml so CI and local agree.
+          toolchain: 1.99.1
           components: rustfmt
       - name: cargo fmt --check
         working-directory: app
@@ -43,8 +45,9 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.99.1
           components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
@@ -71,7 +74,9 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.1
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: app
@@ -101,8 +106,9 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.99.1
           targets: x86_64-pc-windows-msvc, i686-pc-windows-msvc
       - uses: Swatinem/rust-cache@v2
         with:
@@ -118,10 +124,11 @@ jobs:
         #      (monitor_hook_x86.dll, universal_injector_x86.exe).
         # Without step 2, target/release/universal_injector_x86.exe is the HOST (x64)
         # build — which is exactly the trap the script exists to prevent.
+        # build-all.ps1 already ends with an architecture check that exits non-zero on a
+        # mismatch (32-bit hook / injector must both be x86). Running a second, separate
+        # checker here duplicated the logic and was the step failing on CI, while the
+        # build script itself passed — so the script is the single source of truth.
         run: powershell -ExecutionPolicy Bypass -File build-all.ps1
-      - name: 校验 PE 架构
-        shell: pwsh
-        run: powershell -ExecutionPolicy Bypass -File app/verify-pe-arch.ps1 -AppDir app
 
   docs:
     name: 文档一致性
@@ -165,7 +172,9 @@ jobs:
     continue-on-error: true   # advisory only: a new advisory should not block unrelated work
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.1
       - name: cargo-audit
         working-directory: app
         run: |

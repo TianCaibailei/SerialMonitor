@@ -1,0 +1,19 @@
+﻿# Pin the toolchain so CI and local builds lint and compile identically.
+#
+# Why pin instead of tracking `stable`: Clippy gains new lints on every stable release.
+# Unpinned, a CI run can fail on code that was clean when it was written — the failure
+# says nothing about the change under review. Pinning makes the gate reproducible, and
+# bumping the toolchain becomes an explicit, reviewable commit.
+#
+# To upgrade: change the version below, run `app/check-all.ps1`, fix any new lints,
+# and commit both together.
+#
+# NOTE: `components` is deliberately omitted. Listing it makes rustup try to install
+# anything missing (e.g. rustfmt) on first use, which can stall on a slow network. CI
+# installs the components it needs via dtolnay/rust-toolchain instead.
+
+[toolchain]
+channel = "1.99.1"
+# Both targets are required: the main program and hook are x64, the injector and the
+# 32-bit hook are i686 (see app/build-all.ps1).
+targets = ["x86_64-pc-windows-msvc", "i686-pc-windows-msvc"]
