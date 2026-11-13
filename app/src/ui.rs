@@ -247,6 +247,8 @@ pub struct MonitorApp {
     /// Text queued for the clipboard; written by `update` once the frame is done, so the
     /// copy never fights an active `&mut self` borrow inside a widget closure.
     pub pending_clipboard: Option<String>,
+    /// Path of the most recent successful export (shown in the status toast).
+    pub last_saved_path: Option<String>,
 }
 
 fn b(v: bool) -> &'static str {
@@ -277,6 +279,23 @@ fn json_str(s: &str) -> String {
     out
 }
 
+/// Pick a session name that does not collide with any existing one.
+///
+/// Opening the same archive twice used to produce two tabs with identical names, which
+/// also made the generated export file names ambiguous.
+fn unique_name_against(wanted: &str, existing: &[&str]) -> String {
+    if !existing.contains(&wanted) {
+        return wanted.to_string();
+    }
+    for n in 2..1000 {
+        let candidate = format!("{wanted} ({n})");
+        if !existing.contains(&candidate.as_str()) {
+            return candidate;
+        }
+    }
+    format!("{wanted} ({})", existing.len() + 1)
+}
+
 /// RFC 4180 CSV field: quote when the value contains a delimiter, quote or newline.
 fn csv_field(s: &str) -> String {
     if s.contains([',', '"', '\n', '\r']) {
@@ -304,6 +323,23 @@ mod export_tests {
         // CJK is valid JSON when the document is written as UTF-8; escaping it would
         // make the file harder for humans to read.
         assert_eq!(json_str("串口监控"), "\"串口监控\"");
+    }
+
+    /// Opening the same archive twice must not create two identically named tabs.
+    #[test]
+    fn opened_session_names_never_collide() {
+        use super::unique_name_against;
+        assert_eq!(unique_name_against("会话1", &[]), "会话1");
+        assert_eq!(unique_name_against("会话1", &["会话1"]), "会话1 (2)");
+        assert_eq!(
+            unique_name_against("会话1", &["会话1", "会话1 (2)"]),
+            "会话1 (3)"
+        );
+        // Unrelated names must not perturb the choice.
+        assert_eq!(
+            unique_name_against("COM6 监听", &["会话1", "会话2"]),
+            "COM6 监听"
+        );
     }
 
     #[test]
@@ -482,6 +518,7 @@ impl MonitorApp {
             redir_backup: None,
             dlg_confirm_exit: false,
             pending_clipboard: None,
+            last_saved_path: None,
         };
         app.load_cfg();
         if screenshot.is_some() {
@@ -1137,30 +1174,23 @@ impl MonitorApp {
     /// overwriting an earlier export (the old fixed `session_N.log` did).
     fn save_active(&mut self) {
         let Some(s) = self.sessions.get(self.active) else {
+            self.toast("没有可导出的会话");
             return;
         };
         let enc = DisplayEncoding::from_index(self.save_enc);
-        let (secs, _) = now_wall();
-        let safe_name = s
-            .name
-            .chars()
-            .map(|c| {
-                if c.is_alphanumeric() || c == '-' || c == '_' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect::<String>();
-        let path = format!("session_{}_{secs}.log", safe_name);
-        match s.save_log(&path, enc) {
-            Ok(()) => self.toast(format!(
-                "已导出 {}（文件编码 {}，文本按 {} 解码）",
-                path,
-                enc.label(),
-                s.display_encoding.label()
-            )),
-            Err(e) => self.toast(format!("保存失败: {}", e)),
+        let note = format!(
+            "文件编码 {}，文本按 {} 解码",
+            enc.label(),
+            s.display_encoding.label()
+        );
+        // Render first, then ask where to put it: the dialog must not run while a
+        // session borrow is alive, and the user may still cancel.
+        let text = s.render_log(enc);
+        let saved = self.ask_save_path("导出日志", "log", "日志文件 (*.log)", move |p| {
+            std::fs::write(p, text_codec::encode(&text, enc)).map_err(|e| e.to_string())
+        });
+        if let Some(p) = saved {
+            self.toast(format!("已导出 {p}（{note}）"));
         }
     }
 
@@ -1229,14 +1259,13 @@ impl MonitorApp {
         }
     }
 
-    /// Save the active session as a reopenable archive.
-    fn save_archive_active(&mut self) {
-        let Some(s) = self.sessions.get(self.active) else {
-            return;
-        };
-        let (secs, _) = now_wall();
-        let safe: String = s
-            .name
+    /// Default file name for an export: session name + timestamp, sanitised for paths.
+    fn export_default_name(&self, ext: &str) -> String {
+        let safe: String = self
+            .sessions
+            .get(self.active)
+            .map(|s| s.name.as_str())
+            .unwrap_or("session")
             .chars()
             .map(|c| {
                 if c.is_alphanumeric() || c == '-' || c == '_' {
@@ -1246,13 +1275,75 @@ impl MonitorApp {
                 }
             })
             .collect();
-        let path = format!("session_{safe}_{secs}.umses");
-        match s.save_archive(&path) {
+        let (secs, _) = now_wall();
+        format!("{safe}_{secs}.{ext}")
+    }
+
+    /// Ask the user where to save, then run `write` with the chosen path.
+    ///
+    /// Every export used to write to a fixed name in the current directory, so the user
+    /// had no say in location or name. The dialog is started with that generated name
+    /// pre-filled, which keeps the old speed for anyone who just presses Enter.
+    ///
+    /// Returns the path actually written, or `None` if the user cancelled or it failed.
+    fn ask_save_path<F>(
+        &mut self,
+        title: &str,
+        ext: &str,
+        filter_label: &str,
+        write: F,
+    ) -> Option<String>
+    where
+        F: FnOnce(&str) -> Result<(), String>,
+    {
+        let default = self.export_default_name(ext);
+        let picked = rfd::FileDialog::new()
+            .set_title(title)
+            .add_filter(filter_label, &[ext])
+            .add_filter("所有文件", &["*"])
+            .set_file_name(&default)
+            .save_file();
+        let Some(mut path) = picked else {
+            self.toast("已取消");
+            return None;
+        };
+        // `save_file` can return a path without the extension if the user typed one
+        // without it; add it so the file is recognisable next time.
+        if path.extension().is_none() {
+            path.set_extension(ext);
+        }
+        let p = path.to_string_lossy().to_string();
+        match write(&p) {
             Ok(()) => {
-                self.push_recent_archive(&path);
-                self.toast(format!("会话已保存：{path}（可用「打开会话」回看）"));
+                self.last_saved_path = Some(p.clone());
+                Some(p)
             }
-            Err(e) => self.toast(format!("保存会话失败: {e}")),
+            Err(e) => {
+                self.toast(format!("保存失败: {e}"));
+                None
+            }
+        }
+    }
+
+    /// Save the active session as a reopenable archive.
+    fn save_archive_active(&mut self) {
+        let Some(bytes) = self
+            .sessions
+            .get(self.active)
+            .map(|s| s.serialize_archive())
+        else {
+            self.toast("没有可导出的会话");
+            return;
+        };
+        let saved = self.ask_save_path(
+            "保存会话",
+            "umses",
+            "会话存档 (*.umses)",
+            move |p| std::fs::write(p, bytes.as_bytes()).map_err(|e| e.to_string()),
+        );
+        if let Some(p) = saved {
+            self.push_recent_archive(&p);
+            self.toast(format!("会话已保存：{p}（可用「打开会话」回看）"));
         }
     }
 
@@ -1260,29 +1351,47 @@ impl MonitorApp {
         self.recent_archives.retain(|p| p != path);
         self.recent_archives.insert(0, path.to_string());
         self.recent_archives.truncate(8);
+        self.save_cfg();
     }
 
-    /// Open an archive. Without a native file dialog in the dependency set, the most
-    /// recently saved/opened files are offered directly — which is also the fastest path
-    /// for the common "save, then look at it again" workflow.
-    fn open_archive_recent(&mut self) {
-        if self.recent_archives.is_empty() {
-            self.toast("还没有可打开的会话文件：请先「保存会话」");
-            return;
+    /// Give a newly opened session a name that cannot collide with an existing tab.
+    ///
+    /// Loading an archive kept the name stored inside the file, so opening the same file
+    /// twice (or opening a file whose session was also still open) produced two tabs both
+    /// called "会话1" — which also made export file names ambiguous.
+    fn unique_session_name(&self, wanted: &str) -> String {
+        let existing: Vec<&str> = self.sessions.iter().map(|s| s.name.as_str()).collect();
+        unique_name_against(wanted, &existing)
+    }
+
+    /// Open an archive chosen by the user.
+    fn open_archive_dialog(&mut self) {
+        let start_dir = self
+            .recent_archives
+            .first()
+            .and_then(|p| std::path::Path::new(p).parent().map(|d| d.to_path_buf()));
+        let mut dlg = rfd::FileDialog::new()
+            .set_title("打开会话")
+            .add_filter("会话存档 (*.umses)", &["umses"])
+            .add_filter("所有文件", &["*"]);
+        if let Some(dir) = start_dir {
+            dlg = dlg.set_directory(dir);
         }
-        let path = self.recent_archives[0].clone();
-        match Session::load_archive(&path) {
-            Ok(s) => {
+        let Some(path) = dlg.pick_file() else {
+            return;
+        };
+        let p = path.to_string_lossy().to_string();
+        match Session::load_archive(&p) {
+            Ok(mut s) => {
+                s.name = self.unique_session_name(&s.name);
+                let shown = s.name.clone();
                 self.sessions.push(s);
                 self.active = self.sessions.len() - 1;
                 self.view_sel = 0;
-                self.push_recent_archive(&path);
-                self.toast(format!("已打开 {path}（只读回看，未占用任何端口）"));
+                self.push_recent_archive(&p);
+                self.toast(format!("已打开「{shown}」（只读回看，未占用端口）"));
             }
-            Err(e) => {
-                self.recent_archives.retain(|p| p != &path);
-                self.toast(format!("打开失败: {e}"));
-            }
+            Err(e) => self.toast(format!("打开失败: {e}")),
         }
     }
 
@@ -1408,7 +1517,7 @@ impl MonitorApp {
                         ui.close_menu();
                     }
                     if ui.button("打开会话（.umses）…").clicked() {
-                        self.open_archive_recent();
+                        self.open_archive_dialog();
                         ui.close_menu();
                     }
                     ui.separator();
@@ -1845,14 +1954,24 @@ impl MonitorApp {
             .body(|mut body| {
                 for &ri in &vis[start..] {
                     let r = &s.rows[ri];
+                    let is_selected = s.selected == Some(ri);
+                    // The whole row is the click target, not just the 序号 cell. Using
+                    // the row's own response also means clicking anywhere in a very wide
+                    // payload column selects the row — which is what users expect from a
+                    // data table.
                     body.row(20.0, |mut row| {
+                        // Highlight the selected row across its full width.
+                        if is_selected {
+                            row.set_selected(true);
+                        }
                         row.col(|ui| {
+                            // Plain label: a SelectableLabel here would be a second,
+                            // smaller click target inside the row's own.
                             let label = RichText::new(format!("{}", r.seq));
-                            if ui
-                                .add(SelectableLabel::new(s.selected == Some(ri), label))
-                                .clicked()
-                            {
-                                clicked = Some(ri);
+                            if is_selected {
+                                ui.strong(label);
+                            } else {
+                                ui.label(label);
                             }
                         });
                         row.col(|ui| {
@@ -1935,6 +2054,11 @@ impl MonitorApp {
                             };
                             ui.colored_label(color, t);
                         });
+                        // `TableRow::response()` spans the full row width, so a click in
+                        // any column (or the empty space after short content) selects it.
+                        if row.response().clicked() {
+                            clicked = Some(ri);
+                        }
                     });
                 }
             });
@@ -2506,19 +2630,6 @@ impl MonitorApp {
             return;
         };
         let (secs, _) = now_wall();
-        let safe: String = s
-            .name
-            .chars()
-            .map(|c| {
-                if c.is_alphanumeric() || c == '-' || c == '_' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        let path = format!("project_info_{safe}_{secs}.json");
-
         let (tot_rx, tot_tx) = s.totals();
         let (cur_rx, cur_tx) = s.current_rate();
         let (pk_rx, pk_tx) = s.peak_rate();
@@ -2629,9 +2740,17 @@ impl MonitorApp {
                 v.iter().map(|x| x.as_str()).collect::<Vec<_>>().join(",")
             })
         );
-        match std::fs::write(&path, json.as_bytes()) {
-            Ok(()) => self.toast(format!("项目信息已导出：{path}")),
-            Err(e) => self.toast(format!("导出失败: {e}")),
+        // `s` is still borrowed by the JSON construction above, so end the borrow before
+        // opening a modal dialog that takes &mut self.
+        let _ = s;
+        let saved = self.ask_save_path(
+            "导出项目信息",
+            "json",
+            "项目信息 (*.json)",
+            move |p| std::fs::write(p, json.as_bytes()).map_err(|e| e.to_string()),
+        );
+        if let Some(p) = saved {
+            self.toast(format!("项目信息已导出：{p}"));
         }
     }
 

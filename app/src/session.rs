@@ -1218,7 +1218,21 @@ impl Session {
     ///
     /// Rows keep their raw bytes only: `parsed` is derived, so recomputing it on load is
     /// both cheaper and guaranteed consistent with the current parser.
+    /// Convenience wrapper around [`serialize_archive`] that writes to `path`.
+    ///
+    /// The UI now renders first and asks the user where to save (`serialize_archive`),
+    /// but this stays as the direct-to-file entry point used by tests and by any caller
+    /// that already knows the destination.
+    #[allow(dead_code)]
     pub fn save_archive(&self, path: &str) -> std::io::Result<()> {
+        std::fs::write(path, self.serialize_archive())
+    }
+
+    /// Render the archive format to a string.
+    ///
+    /// Split out from `save_archive` so the UI can ask the user **where** to save before
+    /// touching the filesystem (it needs the bytes to hand to the chosen path).
+    pub fn serialize_archive(&self) -> String {
         let mut out = String::new();
         out.push_str("UMSEX 1\n");
         out.push_str(&format!("name\t{}\n", esc_field(&self.name)));
@@ -1269,7 +1283,7 @@ impl Session {
                 bytes_hex(&r.data).replace(' ', "")
             ));
         }
-        std::fs::write(path, out)
+        out
     }
 
     /// Load a session written by `save_archive`. Returns a paused session (nothing is
@@ -1410,7 +1424,20 @@ impl Session {
     /// `enc` selects the **file** encoding; the text column always uses the session's
     /// display encoding so exported Chinese is readable (the old version exported only
     /// HEX, so switching encoding had no effect on the captured content at all).
+    /// Convenience wrapper: render then write with the given file encoding.
+    ///
+    /// The UI renders first and asks where to save (`render_log`), but this remains the
+    /// direct-to-file entry point for tests and known destinations.
+    #[allow(dead_code)]
     pub fn save_log(&self, path: &str, enc: DisplayEncoding) -> std::io::Result<()> {
+        std::fs::write(path, text_codec::encode(&self.render_log(enc), enc))
+    }
+
+    /// Render the human-readable log text (HEX + decoded text columns).
+    ///
+    /// Split from `save_log` so the UI can render first, then ask the user where to put
+    /// the file — the dialog must not run while a session borrow is alive.
+    pub fn render_log(&self, _enc: DisplayEncoding) -> String {
         let dec = self.display_encoding;
         let mut out = String::from("# 万能监控日志 v2\n");
         out.push_str("# 列: 时间\t通道\t方向\tHEX\t文本(按显示编码解码)\n");
@@ -1430,7 +1457,7 @@ impl Session {
                 text
             ));
         }
-        std::fs::write(path, text_codec::encode(&out, enc))
+        out
     }
 }
 
