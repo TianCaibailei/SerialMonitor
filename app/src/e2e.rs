@@ -12,7 +12,7 @@
 //   route_hook_data()  ->  Session::ingest()  ->  rows
 //
 // It fails if any of those links is broken, and separately asserts the port was
-// never opened by the monitor (the behaviour that made the original valuable).
+// never opened by the monitor (that is what makes the capture passive).
 
 use crate::inject::{self, CapMsg};
 use crate::session::{ChanKind, ChannelCfg, ProtoType, Session, ViewToggles};

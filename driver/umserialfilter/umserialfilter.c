@@ -1,16 +1,16 @@
-// UmSerialFilter 閳?passive serial-port traffic capture (upper filter, no port ownership).
+// UmSerialFilter — passive serial-port traffic capture (upper filter, no port ownership).
 //
 // WHY THIS EXISTS
 // ---------------
 // The user-mode approach (inject a DLL and patch the target's IAT) has a hard limit:
 // it only sees calls made *after* injection, while a serial tool typically opens its
-// port within milliseconds of starting. A kernel filter has no such race 閳?it sits on
+// port within milliseconds of starting. A kernel filter has no such race — it sits on
 // the device stack, so every IRP from every process passes through it from the moment
 // the filter loads.
 //
-// This reproduces the capability of the reference product (ComDrv12x64.sys), whose
-// binary shows exactly this shape: IoGetDeviceObjectPointer,
-// IoCreateDevice + IoAttachDeviceToDeviceStack, IoBuildAsynchronousFsdRequest.
+// The mechanism is the standard Windows device-stack filter pattern:
+// IoGetDeviceObjectPointer, IoCreateDevice + IoAttachDeviceToDeviceStack, and a
+// completion routine on the data IRPs.
 //
 // DESIGN
 // ------
@@ -240,8 +240,8 @@ static UNICODE_STRING g_SymLink;
 // interface arrival notifications lets the driver attach the moment a serial device
 // appears, which is what "install once, monitor everything" requires.
 //
-// The reference product does the same through its device-arrival path (its
-// sub_11308 attach routine is called from a PnP notification, not only at startup).
+// The device-arrival path below achieves the same result (its
+// attach routine is also called from a PnP notification, not only at startup).
 static PVOID g_NotificationEntry = NULL;
 
 // One pre-allocated filter slot must be reserved for each arrival, so the callback never
@@ -689,7 +689,7 @@ static NTSTATUS UmFilterPower(PDEVICE_OBJECT DeviceObject, PIRP Irp);
 // THE BUG THIS FIXES
 // ------------------
 // Windows gives every device of a driver the SAME MajorFunction table, so the filter
-// devices and the control device necessarily share entry points. The original code put
+// devices and the control device necessarily share entry points. An earlier version put
 // the control handlers there for every device, so IRP_MJ_CREATE on a serial port was
 // answered by UmControlCreate 閳?completing the open immediately 閳?and the real serial
 // driver never saw it. Consequences: every COM port looked occupied ("Incorrect
@@ -781,18 +781,15 @@ static NTSTATUS UmFilterPower(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 // Attaching to serial device stacks
 // ---------------------------------------------------------------------------
 //
-// HOW THE REFERENCE PRODUCT FINDS PORTS
-// -------------------------------------
-// Decompiling ComDrv12x64.sys shows it does NOT use a hard-coded device list. It calls
-// ZwOpenDirectoryObject(L"\\Device"), obtains the directory object with
-// ObReferenceObjectByHandle, then walks the directory's object hash and recursively
-// descends subdirectories, matching device names against the serial namespaces. That is
-// why it catches every vendor's port (usbser, Prolific, Silicon Labs, ELTIMA, com0com,
-// and plain \Device\SerialN) without shipping a list.
+// WHY ENUMERATION INSTEAD OF A PORT LIST
+// --------------------------------------
+// A hard-coded list of COM names cannot cover every driver: ports come from usbser,
+// Prolific, Silicon Labs, ELTIMA virtual pairs, com0com, and plain \Device\SerialN.
+// Enumerating the device namespace catches all of them without shipping a list.
 //
-// This driver uses the equivalent, documented route: enumerate \Device via
-// ZwQueryDirectoryObject. It returns every child object of the directory, including the
-// serial devices, so the same coverage is achieved without touching kernel internals.
+// This driver enumerates \Device with ZwQueryDirectoryObject: it returns every child
+// object of the directory, including the serial devices, using only documented kernel
+// APIs.
 
 // ZwQueryDirectoryObject returns an array of these. The definition lives in
 // ntifs.h/ntddk.h depending on the SDK, and it is not exposed by the WDK NuGet headers
@@ -804,34 +801,33 @@ typedef struct _UM_DIRECTORY_INFORMATION {
 
 // === UM_DISCOVERY_V2 ===
 // ---------------------------------------------------------------------------
-// Device discovery 鈥?replicating the reference driver's approach
+// Device discovery
 // ---------------------------------------------------------------------------
 //
-// THE REFERENCE DRIVER'S RULES (recovered from ComDrv12x64.sys, sub_127b0 / sub_1140c):
+// THE MATCHING RULES:
 //
-//   1. It walks \Device and matches NAMESPACE PREFIXES, not arbitrary substrings:
-//      the only patterns it compares are "Serial" and "VSerial" (0x13440 / 0x13460),
-//      against the object name at OBJ_HEADER+0x78.
+//   1. Walk \Device and match NAMESPACE PREFIXES, not arbitrary substrings:
+//      only "Serial" and "VSerial" are accepted.
 //
-//   2. It validates every pointer with MmIsAddressValid before dereferencing (0x127f5,
-//      0x12807), so a racing removal cannot make it walk freed memory.
+//   2. Every pointer is validated before dereferencing, so a racing device removal
+//      cannot make the driver walk freed memory.
 //
-//   3. On a hit it returns the NAME, and the caller (sub_1140c) re-opens that name with
+//   3. On a hit the NAME is returned, and the caller re-opens that name with
 //      IoGetDeviceObjectPointer. Discovery and attachment are therefore separate, and
 //      nothing is attached that was not opened by name.
 //
-// WHY THIS MATTERS 鈥?the reason for the two bugchecks:
-//   Our old code matched substrings ("vcp", "vser"). Those fragments also occur in device
-//   names belonging to VPN, virtualisation and DLP products. Attaching a filter above such
-//   a device splices our dispatch into that driver's IRP chain; it then receives IRPs whose
-//   stack locations we rewrote and bugchecks inside its own module. That is exactly what
-//   happened (fault reported in DocPrismX64.sys).
+// WHY PREFIX MATCHING, NOT SUBSTRINGS:
+//   An earlier version matched substrings ("vcp", "vser"). Those fragments also occur in
+//   device names belonging to VPN, virtualisation and DLP products. Attaching a filter
+//   above such a device splices this dispatch into that driver's IRP chain; it then
+//   receives IRPs whose stack locations were rewritten and bugchecks inside its own
+//   module. That is exactly what happened (fault reported in DocPrismX64.sys).
 //
 // SO: prefix match + device-type check + never retain an unvalidated object pointer.
 
-// A name that the reference driver would consider a serial port namespace root.
+// A name accepted as a serial port namespace root.
 //
-// Only two forms are accepted, matching what the reference driver compares:
+// Only two forms are accepted:
 //   "Serial"  (serial.sys / serenum.sys roots, e.g. \Device\Serial0)
 //   "VSerial" (virtual serial adapters, e.g. \Device\VSerial8_2)
 // Everything else is left alone, no matter what other vendors name their devices.
@@ -902,7 +898,7 @@ static BOOLEAN UmIsSerialNamespacePrefix(PCUNICODE_STRING Name)
 //   3. a serial namespace prefix in the name,
 //   4. not our own control device.
 //
-// The reference driver relies on (3) alone because it only ever opens names it built
+// This driver must not rely on (3) alone: it opens names discovered at runtime
 // itself. We add (2) as a second, independent signal: the device type is set by the driver
 // that owns the object and cannot be spoofed by naming a device "Serial...".
 static BOOLEAN UmIsSafeSerialTarget(PDEVICE_OBJECT Target, PCUNICODE_STRING Name)
@@ -961,7 +957,7 @@ static NTSTATUS UmAttachOne(PDEVICE_OBJECT target, ULONG index, PWSTR name)
     // PDO owns. Passing target->Characteristics through verbatim made IoCreateDevice fail
     // with STATUS_INVALID_PARAMETER for stacks that set FILE_REMOVABLE_MEDIA /
     // FILE_DEVICE_IS_MOUNTABLE_DEVICE, and the failure was silent (attach just returned 0).
-    // ORDER MATTERS 鈥?this replicates the reference driver sub_11308 exactly:
+    // ORDER MATTERS — attach before publishing the control device:
     //   0x1133e  IoCreateDevice(...)
     //   0x1134c  copy DO_BUFFERED_IO from the lower device
     //   0x11359  copy DO_DIRECT_IO from the lower device
@@ -1022,7 +1018,7 @@ static NTSTATUS UmAttachOne(PDEVICE_OBJECT target, ULONG index, PWSTR name)
 // ---------------------------------------------------------------------------
 //
 // Windows gives every device object of a driver the SAME MajorFunction table, so the
-// filter devices and the control device necessarily share entry points. The original code
+// filter devices and the control device necessarily share entry points. An earlier version
 // installed the control-device handlers for every device, which meant IRP_MJ_CREATE on a
 // serial port was answered by UmControlCreate (completing it immediately) instead of being
 // forwarded 閳?that is what made every COM port unusable while the driver was loaded.
@@ -1039,7 +1035,7 @@ static BOOLEAN UmIsControlDevice(PDEVICE_OBJECT DeviceObject)
 
 // Enumerate \Device and attach to every child that looks like a serial port.
 //
-// This mirrors what the reference driver accomplishes by walking the directory object's
+// Equivalent result to walking the directory object's
 // hash table; ZwQueryDirectoryObject is the supported API for the same information.
 static ULONG UmAttachAllPorts(VOID)
 {
@@ -1099,7 +1095,7 @@ static ULONG UmAttachAllPorts(VOID)
             if (entry->Name.Buffer == NULL || entry->Name.Length == 0) {
                 break;
             }
-            // Namespace-prefix match only, exactly like the reference driver. Substring
+            // Namespace-prefix match only. Substring
             // matching (the old behaviour) selected unrelated devices and crashed the
             // machine by splicing our filter into their IRP chains.
             if (!UmIsSerialNamespacePrefix(&entry->Name)) {
@@ -1140,7 +1136,7 @@ static ULONG UmAttachAllPorts(VOID)
 
                 {
                     PDEVICE_OBJECT devObj = NULL;
-                    // Open exactly the way the reference driver does (sub_1140c):
+                    // Open the device by its discovered name:
                     //
                     //     IoGetDeviceObjectPointer(name, 0x1f01ff, &fileObj, &devObj)
                     //     if (success) { ObDereferenceObject(fileObj); ... }
@@ -1148,7 +1144,7 @@ static ULONG UmAttachAllPorts(VOID)
                     // The name is one we built ourselves from a namespace-prefix match, and
                     // UmIsSafeSerialTarget() re-validates the result, so this cannot reach a
                     // foreign device. Dropping the file object immediately is what the
-                    // reference driver does: the device object keeps its own reference for as
+                    // This driver does: the device object keeps its own reference for as
                     // long as the stack exists, and we hold one explicitly below.
                     PFILE_OBJECT fileObj = NULL;
                     NTSTATUS openStatus = IoGetDeviceObjectPointer(
@@ -1382,7 +1378,7 @@ static NTSTATUS UmHotplugAttachLink(PUNICODE_STRING link)
     LONG index;
     PWSTR nameCopy;
 
-    // Open the same way the reference driver does (sub_1140c), then drop the file object:
+    // Open by name, then drop the file object:
     // the device object keeps its own reference for as long as the stack exists.
     //
     // ObReferenceObjectByName is deliberately NOT used: the WDK NuGet headers do not
@@ -1571,7 +1567,7 @@ static NTSTATUS UmControlClose(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 // A filter driver MUST forward this. Windows delivers CLEANUP before CLOSE, and the
 // serial driver uses it to abort pending reads and release port resources. Without the
 // forward, an application that closes its port leaves stale state behind 閳?which shows up
-// as "the port is still busy" on the next open. The reference driver handles CLEANUP in
+// as "the port is still busy" on the next open. CLEANUP is handled in
 // the same branch as CLOSE for exactly this reason.
 static NTSTATUS UmControlCleanup(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 {
@@ -1826,7 +1822,7 @@ static VOID UmDriverUnload(PDRIVER_OBJECT DriverObject)
 //     direct reference fails to link (LNK2019),
 //   * the API is absent on very old builds, where falling back is better than refusing to
 //     load at all.
-// This is the same technique the reference driver uses (its sub_22008 resolves the
+// This resolves the
 // symbol via MmGetSystemRoutineAddress).
 typedef NTSTATUS (NTAPI *UM_PFN_CREATE_DEVICE_SECURE)(
     PDRIVER_OBJECT DriverObject,
@@ -1885,7 +1881,7 @@ static NTSTATUS UmCreateControlDevice(
 // A monitor that can read every serial byte is exactly the kind of device an attacker
 // would like to open, so the control device must not be world-accessible.
 //
-// The reference product handles this with a security descriptor built from the SDDL
+// The control device is protected with a security descriptor built from the SDDL
 // string "D:P(A;;GA;;;WD)" 閳?GA to Everyone, i.e. no protection at all (verified in its
 // binary). That weakness is deliberately NOT copied here. This driver uses two layers:
 //

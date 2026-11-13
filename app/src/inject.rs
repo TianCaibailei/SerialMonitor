@@ -1,6 +1,7 @@
-// inject.rs — user-space interception front end (substitutes the original's
-// kernel driver ComDrv12x/ParDrv3x: sub_a874f0 service mgr, sub_a8b020 deployer,
-// sub_a89f70 device open, sub_a89d60 ioctl pump chain, all in app/MECHANICS.md).
+// inject.rs — user-space interception front end.
+//
+// This is the zero-privilege capture path: instead of a kernel driver, it injects a hook
+// DLL into the process that owns the serial port. See docs/技术手册.md for the design.
 //
 // Two halves:
 //  1. Capture server: 4 instances of the named pipe \\.\pipe\monitor_capture in

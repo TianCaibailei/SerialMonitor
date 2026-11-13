@@ -22,23 +22,27 @@ SOFTWARE.
 
 ---
 
-## Scope and compliance notes
+## Scope and originality
 
-This project is a **clean-room reimplementation of observable behaviour**, written to
-interoperate with standard serial / Modbus devices. It is not affiliated with, endorsed
-by, or derived from the source code of any commercial serial-monitor product.
+This is an **original implementation** of a serial-port monitoring tool, written to
+interoperate with standard serial devices and the public Modbus specification.
 
-* No code, icons, strings or other assets were copied from third-party software.
-* Protocol behaviour (Modbus RTU/ASCII/TCP) follows the public Modbus specification.
-* The UI layout was studied from publicly observable behaviour for interoperability and
-  usability parity; all implementation is original.
+* All source code, UI, strings and assets in this repository were created for this
+  project. No third-party code, icons or text were copied.
+* Protocol behaviour (Modbus RTU / ASCII / TCP) implements the publicly documented
+  Modbus protocol, including its published CRC-16/LRC checksums.
+* The Windows techniques used (IAT and inline function hooking, device-stack filter
+  drivers, IRP completion routines, device namespace enumeration) are documented by
+  Microsoft in the Win32 and WDK documentation and are common to any serial tool.
 
-Names of third-party products are used only for factual reference (e.g. describing a
-file format they produce) and remain the trademarks of their respective owners.
+This project is not affiliated with, sponsored by, or endorsed by any other software
+vendor. Any product names that appear in build scripts or documentation do so only to
+identify file formats or OS components, and remain the trademarks of their owners.
 
-If you intend to redistribute a **built binary** that includes the kernel driver, your
-own code-signing certificate is required; the test certificate used locally must not be
-shipped (see `.gitignore` and `docs/签名与认证方案.md`).
+If you intend to redistribute a **built binary** that includes the kernel driver, you
+need your own code-signing certificate. The test certificate used during local
+development is deliberately not included in this repository (see `.gitignore` and
+`SECURITY.md`).
 
 ## Security
 

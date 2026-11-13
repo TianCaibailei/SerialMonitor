@@ -2,11 +2,9 @@
 //
 // PURPOSE
 // -------
-// The original CommMonitor intercepts serial traffic in a signed kernel filter
-// driver (ComDrv12x64.sys) that attaches to the serial device stack with
-// IoAttachDeviceToDeviceStack and mirrors every IRP. We cannot ship a kernel driver
-// here (no test-signing on the target machine, code-signing enforcement on Win11
-// x64), so this DLL reproduces the same *capability* from user space:
+// This DLL is the zero-privilege capture path: it mirrors serial traffic from user space,
+// without installing a kernel driver (which would need test-signing and administrator
+// rights). The behaviour it guarantees:
 //
 //   * it never opens the serial port itself, so the monitored program keeps full,
 //     exclusive ownership of it — the whole point of a passive monitor;

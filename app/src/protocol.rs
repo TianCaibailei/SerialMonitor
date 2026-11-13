@@ -1,13 +1,13 @@
-// Protocol layer: CRC-16/MODBUS, LRC, frame parsing (RTU / ASCII / TCP-MBAP) and the
-// Modbus sample corpus recovered from the reference product.
+// Protocol layer: CRC-16/MODBUS, LRC, frame parsing (RTU / ASCII / TCP-MBAP) and a
+// Modbus sample corpus.
 //
 // NOTE on the frame *builders* (`append_crc` / `wrap_mbap` / `build_frame`) and the preset
 // corpus below: this program is a **monitor** and never transmits on the bus it observes,
 // so nothing in the UI calls them anymore. They are kept deliberately because they are the
-// reference half of every round-trip test — a parser is only trustworthy if a frame built
-// from the spec is parsed back to the same values — and because the presets are recovered
-// evidence of the original's protocol behaviour. The module-level `allow(dead_code)` in
-// main.rs marks that intent.
+// counterpart of every round-trip test — a parser is only trustworthy if a frame built
+// from the Modbus specification is parsed back to the same values — and because the
+// presets are useful sample data for exercising the parser. The module-level
+// `allow(dead_code)` in main.rs marks that intent.
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FrameKind {
@@ -44,8 +44,9 @@ pub struct ModbusParsed {
 }
 
 /// Standard CRC-16/MODBUS: poly 0xA001 (reflected 0x8005), init 0xFFFF.
-/// The original computes this per-bit (no lookup table embedded — byte scan ev_33b2cf2c),
-/// and its preset rows carry crctype 77 / crcBit 0.
+///
+/// Computed bit by bit rather than from a lookup table: it is only run per frame on the
+/// parse path, so a 512-byte table would cost more in cache than it saves.
 pub fn crc16_modbus(data: &[u8]) -> u16 {
     let mut crc: u16 = 0xFFFF;
     for &b in data {
@@ -304,7 +305,7 @@ pub struct Preset {
     pub data: &'static str,
 }
 
-/// Rows copied from modbus/modbus-request.bdp (23 presets).
+/// Modbus request sample frames (23 entries), for exercising the parser.
 pub const REQUEST_PRESETS: &[Preset] = &[
     Preset {
         name: "01 (0x01) Read Coils-req",
@@ -400,10 +401,10 @@ pub const REQUEST_PRESETS: &[Preset] = &[
     },
 ];
 
-/// Response presets recovered from the original's modbus/modbus-response.bdp.
+/// Modbus response sample frames, for exercising the parser.
 ///
-/// The count is **38**, not the 43 claimed by earlier comments/docs — the table is the
-/// authority and `preset_counts_match_code` keeps it honest.
+/// The count is **38**; `preset_counts_match_code` keeps the number honest so docs cannot
+/// drift away from the table again.
 pub const RESPONSE_PRESETS: &[Preset] = &[
     Preset {
         name: "01 (0x01) Read Coils-resp",

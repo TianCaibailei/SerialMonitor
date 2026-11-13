@@ -50,3 +50,22 @@ usage.json
 
 # Alternate cargo target dir used when the deployed DLLs are locked by live processes
 app/target-build/
+
+# ---------------------------------------------------------------------------
+# 技术分析材料 — 绝不出现在本仓库内
+# ---------------------------------------------------------------------------
+#
+# 开发早期为理解串口监控原理所做的技术分析（第三方产品的观察记录、逆向笔记、
+# 驱动结构整理等）保存在仓库**之外**的 technical-analysis/ 目录，见 docs/README.md。
+# 这些材料引用第三方产品的名称与内部结构，不适合随开源代码分发。
+#
+# 下面这些规则是防线：即使有人误把材料拷进仓库，也不会被提交。
+technical-analysis/
+docs/technical-analysis/
+docs/archive/
+docs/逆向*.md
+docs/参考*.md
+*逆向*.md
+*复刻*.md
+*参考驱动*.md
+

@@ -49,8 +49,8 @@ fn short_dev(path: &str) -> String {
     path.rsplit('\\').next().unwrap_or(path).to_string()
 }
 
-/// Channel display name. Unresolved ids render as `UNKNOWN(<id>)`, matching the
-/// original's port-name fallback (CommMonitor sub_841a50; fmt "UNKNOWN(%d)" @0x841b74).
+/// Channel display name. Unresolved ids render as `UNKNOWN(<id>)` so a row whose channel
+/// could not be resolved is still identifiable instead of showing a blank cell.
 fn chan_label(s: &Session, idx: usize) -> String {
     match s.channels.get(idx) {
         Some(c) => c.name.clone(),
@@ -79,9 +79,9 @@ const SPLITS: [&str; 3] = [
 ];
 // Order matters: index 0 is the DEFAULT when the New Monitor dialog opens.
 //
-// A serial monitor exists to watch OTHER software's traffic, so the passive
-// (hook) mode is the default and owning the port is the explicit exception. The
-// original CommMonitor behaves the same way: its driver never opens the device.
+// A serial monitor exists to watch OTHER software's traffic, so the passive (hook) mode
+// is the default and owning the port is the explicit exception: the passive path never
+// opens the device, so the monitored program keeps exclusive ownership of it.
 const CHAN_KINDS: [&str; 5] = [
     "串口监听(不占用)",
     "TCP客户端",
@@ -1076,8 +1076,8 @@ impl MonitorApp {
         for rec in batch {
             // 端口过滤：唯一来源是「过滤设置 → 监视端口」（`Session::port_watch`）。
             //
-            // 驱动按设计挂接全部串口并上报一切（与参考产品一致，也让用户不必重新挂接
-            // 就能切端口），所以"只看我关心的端口"必须由这一侧完成。注入路径在
+            // 驱动按设计挂接全部串口并上报一切（这样用户不必重新挂接就能切端口），
+            // 所以"只看我关心的端口"必须由这一侧完成。注入路径在
             // route_hook_data 里用同一份白名单筛选，两条路径行为一致。
             //
             // 名字必须取自 channel_port_name：它和建通道用的是同一个函数，都优先返回
@@ -2179,8 +2179,10 @@ impl MonitorApp {
                                 .clicked();
                         });
                         row.col(|ui| {
-                            // sub_a893e0 long-payload rule: past 0x400 bytes the original
-                            // switches decode paths — mirror that as the hex-column cap.
+                            // Cap the Hex column for very long payloads: rendering a
+                            // multi-kilobyte hex string on every frame makes the table
+                            // crawl, and the full bytes are still available in the detail
+                            // pane and in the exports.
                             const HEX_CAP: usize = 0x400;
                             let shown: String = if r.data.len() > HEX_CAP {
                                 format!(
@@ -2209,10 +2211,10 @@ impl MonitorApp {
                                 .clicked();
                         });
                         row.col(|ui| {
-                            // Do NOT truncate by a fixed character count. `string_len` is a
-                            // display preference from the original UI (16 by default) and
-                            // clipping here silently cut most payloads in half —
-                            // "Welcome to UartAssist 23" became "Welcome to UartA".
+                            // Do NOT truncate by a fixed character count. `string_len` is
+                            // the Modbus-values display preference and has nothing to do
+                            // with this column; clipping here used to cut most payloads in
+                            // half — "Welcome to UartAssist 23" became "Welcome to UartA".
                             // The column scrolls/clips visually if it is too narrow, which
                             // is the right behaviour: the data is still there.
                             let t = escape_text(&r.data, s.ascii_escape, enc);

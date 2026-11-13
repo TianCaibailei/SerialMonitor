@@ -445,8 +445,13 @@ impl Session {
             bufs: HashMap::new(),
             filters: Filters::default(),
             autosave: None,
-            merge_ms: 250, // edt_se_DumpMerge TRzSpinEdit default Value=250 ms (Min 5/Max 1000/Increment 5, DFM @0xcc9c36); btnApplyClick sub_ab15a0 stores to TDumpViewSetting+0x1c fDumpMergeTime, chk_DumpMerge ON → +0x19
-            string_len: 16, // cbb_OutPutCharLen DFM default (items 2/4/8/10/12/16/32)
+            // 250 ms is a pragmatic default: long enough to keep a request/response pair
+            // together on slow links, short enough that distinct frames do not merge.
+            // Exposed to the user as 「合并相邻读/写数据的时间窗口」 (5..=1000 ms).
+            merge_ms: 250,
+            // Values column truncation for the Modbus view; the data columns in the other
+            // views are never truncated by it.
+            string_len: 16,
             values_dec: false,
             ascii_escape: true,
             display_encoding: DisplayEncoding::Utf8,
@@ -1136,8 +1141,7 @@ impl Session {
         }
         self.bump_rate(secs, dir_tx, row.data.len() as u64);
         self.rows.push(row);
-        // grp_CaptureMax default: rbMaxLimit checked, cbb_CaptrueMax ItemIndex=2 of
-        // 100000/500000/1000000/2000000/5000000 → 1,000,000 records (original DFM).
+        // Bounded memory: drop in batches once the store is full (see enforce_row_limit).
         self.enforce_row_limit();
     }
 
